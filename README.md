@@ -9,12 +9,18 @@ This repo is deliberately code-only: no protocol spec, no project
 background, no vendor tooling. Full documentation and project context are
 being shared with the team by email — this is the thing to actually run.
 
+See **[MANUAL.md](MANUAL.md)** for the full user manual: a section per
+tool below (simple explanation first, technical detail after), plus a
+step-by-step guide to structuring a local SQL layer around a poller.
+
 ## What's here
 
 - **`saspy/`** — the client itself: CRC-16, BCD/binary field codecs, frame
-  building/parsing, a wakeup-bit-aware serial transport, and a `SASClient`
-  covering general poll plus the long polls listed below.
-- **`tests/`** — 40 tests, all against fake serial ports; run them with
+  building/parsing, a wakeup-bit-aware serial transport, a `SASClient`
+  covering general poll plus the long polls listed below, and a
+  `.ini`-based gateway config (`saspy/config.py`) so connection details
+  don't need to be hardcoded.
+- **`tests/`** — 55 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -24,6 +30,15 @@ being shared with the team by email — this is the thing to actually run.
   ```
   python3 examples/connectivity_check.py /dev/ttyUSB0 --address 1
   ```
+- **`examples/commission_gateway.py`** — run this once when a gateway is
+  attached to a new EGM: scans ports/addresses, confirms a find by
+  querying the machine's SAS version and serial number, and writes a
+  `gateway.ini` the other tools can load. Optional — a config file can
+  always be hand-written.
+- **`examples/sql_poll_logger.py`** — polls a machine on a timer and logs
+  results (and failures, separately) to a local SQLite database. A
+  runnable starting point for stress-testing over time or prototyping a
+  persistence layer — see MANUAL.md §6 for the schema and reasoning.
 - **`legacy/`** — an earlier Python 2 implementation, kept for reference.
   **It has known, confirmed bugs** (wrong byte offsets, a fabricated
   field on a fund-transfer command, crashes on certain inputs) — don't
