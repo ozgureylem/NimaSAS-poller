@@ -11,6 +11,7 @@ from .exceptions import (
     SASChecksumError,
     SASEncodingError,
     SASError,
+    SASPortCapabilityError,
     SASTimeoutError,
 )
 from .transport import SASTransport
@@ -23,4 +24,5 @@ __all__ = [
     "SASChecksumError",
     "SASAddressMismatchError",
     "SASEncodingError",
+    "SASPortCapabilityError",
 ]

@@ -122,6 +122,23 @@ def test_send_gaming_machine_id_game_options_byte_order():
     assert info.game_options == 0x1234
 
 
+def test_send_sas_version_and_serial():
+    version = b"602"
+    serial = b"TROP-0042"
+    body = bytes([ADDRESS, 0x54, 3 + len(serial)]) + version + serial
+    info = make_client(body).send_sas_version_and_serial()
+    assert info.sas_version == "602"
+    assert info.serial_number == "TROP-0042"
+
+
+def test_send_sas_version_and_serial_empty_serial():
+    version = b"601"
+    body = bytes([ADDRESS, 0x54, 3]) + version
+    info = make_client(body).send_sas_version_and_serial()
+    assert info.sas_version == "601"
+    assert info.serial_number == ""
+
+
 def test_send_enabled_features_validation_style_precedence_bug_fixed():
     """features1 = 0b01000001: bit0 (jackpot_multiplier) set, bits 5-6 = 0b10
     (secure enhanced = 2). The legacy expression `data[3]&0b01100000>>5`

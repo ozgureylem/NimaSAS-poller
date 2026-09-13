@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from saspy.exceptions import SASTimeoutError
+from saspy.exceptions import SASPortCapabilityError, SASTimeoutError
 from saspy.transport import PARITY_MARK, PARITY_SPACE, SASTransport
 
 
@@ -34,6 +34,34 @@ class FakeSerial:
 
     def reset_input_buffer(self) -> None:
         pass
+
+
+class ParityRejectingSerial(FakeSerial):
+    """Simulates a port/driver that rejects mark/space parity — e.g. a USB-
+    serial adapter without CMSPAR support, or (as found in practice) a
+    virtual pty, which has no physical UART framing for parity to exist on
+    at all.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    @property
+    def parity(self):
+        return self._parity
+
+    @parity.setter
+    def parity(self, value):
+        if value == PARITY_MARK:
+            raise OSError(22, "Invalid argument")
+        self._parity = value
+
+
+def test_write_with_wakeup_wraps_parity_failure():
+    fake = ParityRejectingSerial()
+    transport = SASTransport(fake)
+    with pytest.raises(SASPortCapabilityError):
+        transport.write_with_wakeup(bytes([0x81]))
 
 
 def test_write_with_wakeup_sets_mark_parity_on_first_byte_only():

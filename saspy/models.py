@@ -13,6 +13,14 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class SASVersionInfo:
+    """Response to long poll 0x54 (Table 7.15)."""
+
+    sas_version: str
+    serial_number: str
+
+
+@dataclass(frozen=True)
 class BasicMeters:
     """Response to long poll 0x0F (Table 7.2a)."""
 

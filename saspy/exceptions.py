@@ -46,3 +46,14 @@ class SASEncodingError(SASError):
     Raised instead of the legacy behavior of silently truncating a value
     that doesn't fit in the requested number of BCD bytes.
     """
+
+
+class SASPortCapabilityError(SASError):
+    """The underlying serial port/driver rejected something the wakeup-bit
+    scheme needs (typically setting mark/space parity).
+
+    Not every USB-serial adapter reliably supports mark/space parity, and
+    virtual ttys (ptys) never do — there's no physical UART framing for a
+    parity bit to exist on. Raised instead of letting the underlying
+    termios/pyserial exception crash the caller uncaught.
+    """

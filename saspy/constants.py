@@ -38,6 +38,8 @@ class LongPoll(enum.IntEnum):
     SEND_TOTAL_DOLLAR_VALUE_OF_BILLS = 0x20
     ROM_SIGNATURE_VERIFICATION = 0x21  # Table 6.2a/6.2b
 
+    SEND_SAS_VERSION_AND_SERIAL = 0x54  # Table 7.15
+
     SEND_PENDING_CASHOUT_INFO = 0x57  # placeholder name kept for continuity
     SEND_VALIDATION_NUMBER = 0x58  # Table 15.9b/15.9c ("Receive validation number")
 
@@ -79,6 +81,7 @@ LONG_POLL_TYPES: dict[LongPoll, PollType] = {
     LongPoll.SEND_GAMING_MACHINE_ID: PollType.R,
     LongPoll.SEND_TOTAL_DOLLAR_VALUE_OF_BILLS: PollType.R,
     LongPoll.ROM_SIGNATURE_VERIFICATION: PollType.S,
+    LongPoll.SEND_SAS_VERSION_AND_SERIAL: PollType.R,
     LongPoll.SEND_PENDING_CASHOUT_INFO: PollType.R,
     LongPoll.SEND_VALIDATION_NUMBER: PollType.S,
     LongPoll.SEND_TICKET_VALIDATION_DATA: PollType.R,

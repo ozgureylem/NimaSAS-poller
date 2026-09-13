@@ -97,6 +97,23 @@ class SASClient:
             base_percentage=payload[17:21].decode("ascii"),
         )
 
+    # -- SAS version and serial number (0x54, Table 7.15) --------------------
+
+    def send_sas_version_and_serial(self) -> models.SASVersionInfo:
+        """The closest thing SAS has to an actual "what version are you"
+        query — useful for commissioning against a fleet that isn't all on
+        the same SAS revision (see the commissioning tool in this repo).
+        """
+        poll = LongPoll.SEND_SAS_VERSION_AND_SERIAL
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        payload = self._strip(raw)
+        length = payload[1]
+        return models.SASVersionInfo(
+            sas_version=payload[2:5].decode("ascii"),
+            serial_number=payload[5:2 + length].decode("ascii"),
+        )
+
     # -- Enabled features (0xA0, Table 7.14a-e) -----------------------------
 
     def send_enabled_features(self, game_number: int = 0) -> models.EnabledFeatures:

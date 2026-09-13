@@ -44,7 +44,7 @@ import threading
 import time
 from typing import Protocol
 
-from .exceptions import SASTimeoutError
+from .exceptions import SASPortCapabilityError, SASTimeoutError
 
 
 class SerialLike(Protocol):
@@ -79,11 +79,20 @@ class SASTransport:
         """Write ``frame``, setting the wakeup bit only on the first byte."""
         if not frame:
             return
-        self._serial.parity = PARITY_MARK
-        self._serial.write(frame[:1])
-        if len(frame) > 1:
-            self._serial.parity = PARITY_SPACE
-            self._serial.write(frame[1:])
+        try:
+            self._serial.parity = PARITY_MARK
+            self._serial.write(frame[:1])
+            if len(frame) > 1:
+                self._serial.parity = PARITY_SPACE
+                self._serial.write(frame[1:])
+        except Exception as e:
+            # Not every USB-serial adapter honors mark/space parity, and a
+            # virtual pty never does (see the module docstring) — surface
+            # this as a typed, catchable failure rather than letting a raw
+            # termios/pyserial exception crash the caller.
+            raise SASPortCapabilityError(
+                f"port does not support the wakeup-bit parity scheme: {e}"
+            ) from e
 
     def _read_exact(self, count: int, deadline: float) -> bytes:
         buf = bytearray()
