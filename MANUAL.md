@@ -269,9 +269,21 @@ succeeding.
 
 This tool polls a machine on a repeating timer and writes what it reads
 into a local SQLite database file, so instead of a single snapshot you
-get a running history — useful for stress testing (does the connection
-survive hours of continuous polling?), for basic monitoring, or as a
-starting point for a real logging/sync service.
+get a current value plus a running history — useful for monitoring, for
+stress testing (does the connection survive hours of continuous
+polling?), or as a starting point for a real logging/sync service.
+
+It has two history modes, picked with `--mode`:
+
+- **`ring`** (the default) — a single always-current-value row, plus a
+  history table capped at a fixed size (oldest rows evicted) and
+  written on its own, slower schedule. This is the shape to deploy on
+  real gateway hardware, and the reasoning for why is worth reading —
+  see §6.7.
+- **`append`** — the original behavior: every poll writes a new,
+  never-deleted history row. Right for a lab machine or a stress-test
+  run on ordinary disk, where you want every sample and don't care
+  about write volume.
 
 ### 4.2 Basic use
 
@@ -281,16 +293,16 @@ python3 examples/sql_poll_logger.py gateway.ini
 
 This reads connection details from `gateway.ini` (the file
 `commission_gateway.py` writes — see §3.4), polls the meters every 5
-seconds, and writes them into `gateway.sqlite3` in the current
-directory. Press Ctrl-C to stop.
+seconds, and writes to `gateway.sqlite3` in the current directory using
+the default `ring` mode (history capped at 200 rows, written at most
+once a minute). Press Ctrl-C to stop.
 
 ```
-python3 examples/sql_poll_logger.py gateway.ini --db /var/log/nimasas/lab1.sqlite3 --interval 2 --cycles 500
+python3 examples/sql_poll_logger.py gateway.ini --mode append --db /var/log/nimasas/lab1.sqlite3 --interval 2 --cycles 500
 ```
 
-Polls every 2 seconds, writes to a specific database path, and stops
-automatically after 500 cycles — useful for an unattended, bounded
-stress-test run.
+A lab/stress-test run: logs every single poll (uncapped), polling every
+2 seconds, and stops automatically after 500 cycles.
 
 ### 4.3 All flags
 
@@ -298,24 +310,47 @@ stress-test run.
 |---|---|---|
 | `config` (positional) | — | Path to a gateway `.ini` file (see §3.4). |
 | `--db` | `gateway.sqlite3` | SQLite file to write to. Created automatically if it doesn't exist. |
-| `--interval` | `5.0` | Seconds to sleep between poll cycles. |
+| `--interval` | `5.0` | Seconds to sleep between poll cycles (how often the machine is asked). |
 | `--cycles` | `0` | Stop after this many cycles. `0` means run until Ctrl-C. |
+| `--mode` | `ring` | `ring` (capped history, decoupled cadence — the deploy default) or `append` (uncapped, every poll — lab/stress use). |
+| `--history-cap` | `200` | Max rows kept in the history table in `ring` mode. Ignored in `append` mode. |
+| `--history-interval` | `60.0` | Minimum seconds between history writes in `ring` mode, outside a burst (see §4.4). Ignored in `append` mode — how often the *value* is checked (`--interval`) is not how often history is *recorded*. |
+| `--burst-count` | `10` | Consecutive polls logged at full resolution, ignoring `--history-interval`, right after a meter decrease or a failed poll. |
 
 ### 4.4 What's actually happening (technical)
 
 On startup, it loads the config with
 `saspy.config.connect_from_config()` (opens the port, builds a
-`SASTransport` and `SASClient` in one step) and creates two tables if
+`SASTransport` and `SASClient` in one step) and creates three tables if
 they don't already exist — see §6.3 for the schema and why it's shaped
 this way. Each cycle calls `client.send_meters_10_through_15()`
-(long poll `0x0F`); on success the six meter values are inserted into
-`meter_snapshots`, on a `SASError` the exception's type and message are
-inserted into `poll_errors` instead, and either way the loop continues
-after `--interval` seconds. This is deliberate: one bad exchange —
-a timeout, a checksum failure, anything — never stops the run. For
-stress testing specifically, the failures are often the interesting
-data, and a logger that dies on the first transient error defeats the
-purpose.
+(long poll `0x0F`).
+
+On success, `meters_current` (always exactly one row) is overwritten
+with the latest values, unconditionally, every cycle. Whether that
+cycle *also* writes a new row to `meters_history` depends on the mode:
+
+- In `append` mode, always.
+- In `ring` mode, only if: this is the first poll ever, or
+  `--history-interval` seconds have passed since the last history
+  write, or a **burst** is active.
+
+A burst starts when a meter value goes down since the last successful
+poll (SAS meters are cumulative counters — a decrease usually means
+something worth a closer look, like a meter rollover or a reset), or
+when a poll fails outright, or when a caller embedding
+`poll_and_log()` directly (rather than running this as a script) passes
+`anomaly=True` from its own logic. Once started, a burst writes the
+next `--burst-count` successful polls to history at full resolution —
+one per cycle, cadence ignored — before returning to the normal
+interval. This is deliberate: that's where the diagnostic value
+actually is, and it's cheap precisely because it's rare.
+
+On a `SASError`, the exception's type and message are inserted into
+`poll_errors` instead (this table's shape and behavior are unchanged
+from before — see §6.3), and the loop continues after `--interval`
+seconds either way. One bad exchange — a timeout, a checksum failure,
+anything — never stops the run.
 
 ### 4.5 Troubleshooting
 
@@ -328,10 +363,16 @@ purpose.
   `connectivity_check.py` against the same port/address to isolate
   whether this is a `sql_poll_logger.py` problem or a wiring problem —
   it usually isn't the former.
-- **Database file grows large during a long stress run**: expected —
-  this script never deletes rows. For a long-running lab test, either
-  plan disk space accordingly or add your own periodic cleanup; see the
-  forward-looking note in §6.6.
+- **`meters_history` looks sparse compared to how often it's polling**:
+  expected, in `ring` mode — history is written on its own
+  `--history-interval` cadence, not every poll. `meters_current` is
+  still fresh every cycle; check that first if you want the latest
+  value, not `meters_history`.
+- **Database file grows large during a long `append`-mode stress run**:
+  expected — that mode never deletes rows by design. Either plan disk
+  space accordingly or switch to `ring` mode, which won't grow past
+  `--history-cap` rows in its history table (`meters_current` is always
+  one row in either mode). See §6.7 for why this distinction exists.
 
 ---
 
@@ -496,7 +537,18 @@ A few decisions worth making deliberately, illustrated by
 `sql_poll_logger.py`'s schema:
 
 ```sql
-CREATE TABLE IF NOT EXISTS meter_snapshots (
+CREATE TABLE IF NOT EXISTS meters_current (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    polled_at TEXT NOT NULL,
+    total_cancelled_credits INTEGER,
+    total_coin_in INTEGER,
+    total_coin_out INTEGER,
+    total_drop INTEGER,
+    total_jackpot INTEGER,
+    games_played INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS meters_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     polled_at TEXT NOT NULL,
     total_cancelled_credits INTEGER,
@@ -504,8 +556,7 @@ CREATE TABLE IF NOT EXISTS meter_snapshots (
     total_coin_out INTEGER,
     total_drop INTEGER,
     total_jackpot INTEGER,
-    games_played INTEGER,
-    synced_at TEXT
+    games_played INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS poll_errors (
@@ -517,42 +568,75 @@ CREATE TABLE IF NOT EXISTS poll_errors (
 );
 ```
 
-- **Append-only, never update-in-place.** Every successful poll becomes
-  a new row, even if the values are identical to the last one. Meters
-  in SAS are cumulative counters, so a plain time series of raw reads
-  is both the simplest schema and the most useful one — you can always
-  compute deltas or "last known value" from it later, but you can't
-  recover history from a table that only ever overwrites itself.
+- **Split "current" from "history."** Almost every consumer of this
+  data only ever wants the latest value — a dashboard tile, a health
+  check, an operator screen. Forcing that consumer to run
+  `ORDER BY polled_at DESC LIMIT 1` over a growing log table is solving
+  an easy problem the hard way. `meters_current` is a single row
+  (`id` is constrained to always be `1`; each poll does an
+  `INSERT OR REPLACE`), so reading "the current value" is the cheapest
+  query SQLite can do. `meters_history` exists separately, purely for
+  "what happened over time" questions — trend, diagnostics, audit.
+- **Bound the history table, and decouple how often it's written from
+  how often the machine is polled.** In `ring` mode,
+  `meters_history` is capped at a fixed row count (oldest evicted —
+  see the ring-buffer delete below) and written on its own timer, not
+  every poll cycle. Polling every few seconds does not have to mean
+  writing every few seconds — those are two different concerns
+  (freshness of the current value vs. depth/resolution of the
+  history), and conflating them either polls too slowly or writes too
+  often. §6.7 explains why this specific split matters for this
+  project's hardware.
+- **Capture bursts of full resolution around anomalies, not all the
+  time.** A meter decrease, a failed poll, or an explicit signal from
+  calling code — these are exactly the moments a coarse, decoupled
+  cadence would otherwise blur together, and exactly the moments worth
+  seeing at full resolution. Reacting to them with a short burst of
+  every-poll writes (see `sql_poll_logger.py`'s `burst_count`) gets the
+  diagnostic value of dense logging without paying for it continuously.
 - **Separate the error log from the data table.** `poll_errors` exists
   so a failed poll never has to be encoded as, say, a row of nulls in
-  `meter_snapshots` — a null in a meters row would be genuinely
-  ambiguous (did the machine report zero, or did the poll fail?).
-  Keeping failures in their own table with the exception type and
-  message keeps `meter_snapshots` clean and makes "how often is this
-  failing, and how" its own easy query.
-- **Store a timestamp you generate, not one the trust the machine to
+  a meters table — a null there would be genuinely ambiguous (did the
+  machine report zero, or did the poll fail?). Keeping failures in
+  their own table with the exception type and message keeps the meters
+  tables clean and makes "how often is this failing, and how" its own
+  easy query.
+- **Store a timestamp you generate, not one you trust the machine to
   give you.** `polled_at`/`occurred_at` are set by the poller
   (`utc_now()`, UTC, ISO 8601) at the moment of the exchange, not
   parsed out of the SAS response — this is when you need to know it
   happened, and it's consistent even against machines that don't
   report their own clock.
-- **Leave a documented "not yet handled" column for future
-  consumers.** `synced_at` starts `NULL` on every row and this script
-  never sets it — see §6.6.
+- **Only the event stream drains; meter history never does.**
+  `poll_errors` is this example's event stream, and in the wider
+  project a drain/sync process is what eventually acknowledges and
+  clears events like it (see §6.6 for the `synced_at` pattern that
+  applies there). `meters_current` and `meters_history` deliberately
+  carry no `synced_at` column at all — they're a local diagnostic
+  buffer, not a queue, and there's nothing for a sync column to mean
+  on a table that's read in place and never drained.
 
 ### 6.4 Running and verifying it
 
 ```
 python3 examples/sql_poll_logger.py gateway.ini --cycles 3
-sqlite3 gateway.sqlite3 "SELECT * FROM meter_snapshots;"
+sqlite3 gateway.sqlite3 "SELECT * FROM meters_current;"
+sqlite3 gateway.sqlite3 "SELECT * FROM meters_history;"
 sqlite3 gateway.sqlite3 "SELECT * FROM poll_errors;"
 ```
 
 `--cycles 3` gives you a short, bounded run to confirm rows are landing
-correctly before committing to a long unattended run. If you don't
-have the `sqlite3` CLI installed, `python3 -c "import sqlite3;
-print(sqlite3.connect('gateway.sqlite3').execute('SELECT * FROM
-meter_snapshots').fetchall())"` works just as well.
+correctly before committing to a long unattended run. `meters_current`
+should show exactly one row after this. In the default `ring` mode,
+`meters_history` will also show just one row from a short run like
+this — the first poll always writes a baseline, and the next write
+isn't due for another `--history-interval` seconds (60 by default), so
+three cycles a few seconds apart isn't enough to see a second one. Add
+`--mode append` to this command (or lower `--history-interval`) if you
+want to confirm every poll is landing a history row while you're
+testing. If you don't have the `sqlite3` CLI installed,
+`python3 -c "import sqlite3; print(sqlite3.connect('gateway.sqlite3').execute('SELECT * FROM meters_current').fetchall())"`
+works just as well.
 
 ### 6.5 Adapting this for stress testing across multiple gateways/environments
 
@@ -571,7 +655,7 @@ shared database directly — keeping each poller's writes local avoids
 needing any network/locking coordination between them just to log
 data.
 
-### 6.6 A note on designing for eventual central sync
+### 6.6 A note on designing for eventual central sync — and what should never drain
 
 At some point, data in these per-gateway SQLite files needs to get to
 a central place — a server, a shared database, wherever the wider
@@ -579,16 +663,72 @@ project's architecture consumes it. This manual deliberately doesn't
 specify that architecture: it's covered in the project's own internal
 planning documents, which are being shared with the team separately.
 
-What's worth knowing here, generically, is why `synced_at` is in the
-schema at all: it gives any future sync process a cheap, obvious
-query — `WHERE synced_at IS NULL` — to find rows nobody has
-acknowledged yet, without the local poller needing to know anything
-about how or where syncing happens, what transport it uses, or how
-often it runs. That separation of concerns (the poller's only job is
-"poll reliably and log everything, including failures"; a sync
-process's only job is "move rows somewhere and mark them synced") is
-the one piece of forward-looking design in this example worth carrying
-into whatever you build next.
+What's worth knowing here, generically, is the shape of the pattern:
+a table that's actually a queue of things to acknowledge — this
+example's `poll_errors` is one; the wider project's own event stream is
+another — can carry a `synced_at` column, left `NULL` until a sync
+process marks a row handled. That gives any future sync process a
+cheap, obvious query (`WHERE synced_at IS NULL`) to find unacknowledged
+rows, without the local poller needing to know anything about how or
+where syncing happens, what transport it uses, or how often it runs.
+That separation of concerns — the poller's only job is "poll reliably
+and log everything, including failures"; a sync process's only job is
+"move rows somewhere and mark them synced" — is the one piece of
+forward-looking design here worth carrying into whatever you build
+next.
+
+That pattern belongs to the event stream specifically, and *only* the
+event stream. It's deliberately not on `meters_current` or
+`meters_history` (§6.3): meter data is a local diagnostic buffer read
+in place, not a queue of things waiting to be collected and cleared
+elsewhere — it never drains, so a `synced_at` column on it wouldn't
+have anything true to mean. Reaching for the same "add a sync column"
+instinct on every table is the mistake to avoid here; whether a table
+needs one depends on whether anything downstream is actually supposed
+to acknowledge and clear its rows.
+
+### 6.7 Why meter history is a ring buffer, not a log, in production
+
+The append-everything version of this pattern (`--mode append`) is
+exactly right for a lab machine or a bounded stress-test run: you want
+every sample, the disk is ordinary SSD or a dev machine's own storage,
+and the run has a known end. It stops being right the moment the
+target is a production deployment on constrained hardware — which,
+concretely, is what a lot of this project's gateway fleet actually is.
+
+A meaningful share of the gateways this software will run on are
+retained 32-bit units booting and running from flash storage, not SSD.
+The concern there is not disk space — it's **write endurance**. Flash
+storage wears out after a bounded number of write cycles per cell, and
+an unbounded per-poll `INSERT` — one new row every few seconds,
+forever — hits that wear limit well before it hits any capacity limit.
+SQLite's write-ahead log (WAL) mode makes this worse, not better: each
+logical write typically touches more physical flash than the row
+itself would suggest, since WAL journals the change before it's
+checkpointed into the main database file.
+
+Two changes together remove this: a **capped ring buffer** for
+`meters_history` (a fixed number of rows, oldest evicted — so the table
+never grows, and total lifetime writes are bounded by the poll count
+divided by however sparse the write cadence is, not by how long the
+gateway has been running) and a **write cadence decoupled from the
+poll rate** (so "poll every 5 seconds" doesn't imply "write every 5
+seconds" — `meters_current` still updates every cycle, cheaply, since
+it's always exactly one row being overwritten in place, but
+`meters_history` writes only every `--history-interval` seconds by
+default). The burst mechanism (§6.3, §4.4) is what keeps this from
+losing the moments that actually matter: an anomaly forces a short run
+of full-resolution writes exactly when the extra wear is worth paying
+for, rather than paying for it on every single poll regardless of
+whether anything interesting happened.
+
+If you're setting this up for a lab or stress-testing run on normal
+disk, `--mode append` is still there, unchanged, and still the more
+useful choice for that job — this isn't "ring mode is correct and
+append mode is a bug," it's two different jobs with two different
+right answers, and the tool picks the production-shaped one as its
+default because that's the deployment more of this fleet will actually
+see.
 
 ---
 
