@@ -15,6 +15,7 @@ from examples.sql_poll_logger import (
     PollState,
     _db_file_size_bytes,
     _insert_ticket_out_record,
+    _pool_age_hours,
     _safe_commit,
     backfill_ticket_out_history,
     poll_and_log,
@@ -98,11 +99,18 @@ def make_cashout_info(**overrides) -> PendingCashoutInfo:
     return PendingCashoutInfo(**base)
 
 
-def seed_pool(conn, *numbers, validation_system_id=1):
+def seed_pool(conn, *numbers, validation_system_id=1, issued_at=None):
+    """``issued_at=None`` (the default) leaves it NULL — matching a
+    hand-inserted real number with no batch info, and deliberately
+    excluded from _pool_age_hours() rather than treated as brand new or
+    infinitely old. Pass an ISO 8601 string to backdate a row for a
+    pool-age test.
+    """
     for n in numbers:
         conn.execute(
-            "INSERT INTO validation_pool (validation_number, validation_system_id, status) VALUES (?, ?, 'available')",
-            (n, validation_system_id),
+            "INSERT INTO validation_pool (validation_number, validation_system_id, status, issued_at) "
+            "VALUES (?, ?, 'available', ?)",
+            (n, validation_system_id, issued_at),
         )
     conn.commit()
 
@@ -732,6 +740,11 @@ def test_history_config_rejects_invalid_mode():
 
 
 def test_general_poll_failure_is_logged_and_meters_still_polled():
+    """general_poll_retries=1 (retrying disabled) is the degenerate case
+    that matches this tool's pre-D-09 behavior exactly: one attempt, one
+    poll_errors row named plain "general_poll" (no attempt-count suffix).
+    See the retry-specific tests below for the >1 case.
+    """
     conn = make_db()
     clock = FakeClock()
     state = PollState()
@@ -740,10 +753,70 @@ def test_general_poll_failure_is_logged_and_meters_still_polled():
         [make_meters(total_coin_in=42)],
         exception_script=[SASTimeoutError("no response")],
     )
-    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, general_poll_retries=1)
     errors = conn.execute("SELECT poll_name, error_type FROM poll_errors").fetchall()
-    assert errors == [("general_poll", "SASTimeoutError")]
+    assert errors == [("general_poll(attempt 1/1)", "SASTimeoutError")]
     assert current_coin_in(conn) == 42
+
+
+# --- general poll retry (Decisions Annex D-09): immediate re-poll, capped --
+
+
+def test_general_poll_retries_immediately_and_recovers_within_the_cap():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters(total_coin_in=7)],
+        exception_script=[SASTimeoutError("try 1"), SASTimeoutError("try 2"), ExceptionCode.NONE],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, general_poll_retries=3)
+    errors = conn.execute("SELECT poll_name, error_type FROM poll_errors ORDER BY id").fetchall()
+    assert errors == [
+        ("general_poll(attempt 1/3)", "SASTimeoutError"),
+        ("general_poll(attempt 2/3)", "SASTimeoutError"),
+    ]
+    # the eventual success (3rd attempt) is not itself an error row, and meters still polled
+    assert current_coin_in(conn) == 7
+
+
+def test_general_poll_retries_exhausted_logs_every_attempt_and_still_polls_meters():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters(total_coin_in=9)],
+        exception_script=[SASTimeoutError("try 1"), SASTimeoutError("try 2"), SASTimeoutError("try 3")],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, general_poll_retries=3)
+    errors = conn.execute("SELECT poll_name, error_type FROM poll_errors ORDER BY id").fetchall()
+    assert errors == [
+        ("general_poll(attempt 1/3)", "SASTimeoutError"),
+        ("general_poll(attempt 2/3)", "SASTimeoutError"),
+        ("general_poll(attempt 3/3)", "SASTimeoutError"),
+    ]
+    # a general-poll failure (even exhausted) never blocks the meter poll -- unchanged pre-D-09 behavior
+    assert current_coin_in(conn) == 9
+
+
+def test_general_poll_default_retries_is_three():
+    """No general_poll_retries argument given: DEFAULT_GENERAL_POLL_RETRIES
+    (3) applies, matching the module's own documented default.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[SASTimeoutError("try 1"), SASTimeoutError("try 2"), SASTimeoutError("try 3")],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)  # default general_poll_retries
+    errors = conn.execute("SELECT poll_name FROM poll_errors").fetchall()
+    assert len(errors) == 3
+    assert all(name == f"general_poll(attempt {i}/3)" for i, (name,) in enumerate(errors, start=1))
 
 
 # --- ticket-in capture (exception 0x67) -------------------------------------
@@ -1104,6 +1177,102 @@ def test_seed_validation_pool_zero_is_a_no_op():
     conn = make_db()
     assert seed_validation_pool(conn, 0) == 0
     assert conn.execute("SELECT COUNT(*) FROM validation_pool").fetchone()[0] == 0
+
+
+def test_seed_validation_pool_sets_issued_at_from_now_fn():
+    conn = make_db()
+    counter = iter(range(1, 100))
+    seed_validation_pool(conn, 3, random_fn=lambda bits: next(counter), now_fn=lambda: "2026-09-01T00:00:00+00:00")
+    rows = conn.execute("SELECT issued_at FROM validation_pool").fetchall()
+    assert all(r == ("2026-09-01T00:00:00+00:00",) for r in rows)
+
+
+# --- validation_pool age alert (Decisions Annex D-16) -----------------------
+
+
+def test_pool_age_hours_none_when_pool_has_no_available_rows():
+    conn = make_db()
+    assert _pool_age_hours(conn, "2026-09-14T12:00:00+00:00") is None
+
+
+def test_pool_age_hours_ignores_rows_with_no_issued_at():
+    conn = make_db()
+    seed_pool(conn, 1)  # issued_at defaults to NULL
+    assert _pool_age_hours(conn, "2026-09-14T12:00:00+00:00") is None
+
+
+def test_pool_age_hours_measures_the_oldest_available_row():
+    conn = make_db()
+    seed_pool(conn, 1, issued_at="2026-09-13T00:00:00+00:00")  # 24h before "now" below
+    seed_pool(conn, 2, issued_at="2026-09-14T06:00:00+00:00")  # 6h before -- not the oldest
+    age = _pool_age_hours(conn, "2026-09-14T00:00:00+00:00")
+    assert age == pytest.approx(24.0)
+
+
+def test_pool_age_alert_fires_at_or_above_threshold(capsys):
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    seed_pool(conn, 1, issued_at="2026-09-13T00:00:00+00:00")  # exactly 36h before "now" via now_fn below
+    client = ScriptedClient([make_meters()])
+    poll_and_log(
+        client, conn, state, history, monotonic_fn=clock,
+        now_fn=lambda: "2026-09-14T12:00:00+00:00", pool_age_alert_hours=36.0,
+    )
+    out = capsys.readouterr().out
+    assert "ALERT: validation_pool's oldest available number is 36.0h old" in out
+    rows = conn.execute("SELECT poll_name, error_type FROM poll_errors WHERE error_type = 'PoolStale'").fetchall()
+    assert rows == [("validation_pool", "PoolStale")]
+
+
+def test_pool_age_alert_does_not_fire_below_threshold(capsys):
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    seed_pool(conn, 1, issued_at="2026-09-14T00:00:00+00:00")  # 12h before "now" -- well under 36h
+    client = ScriptedClient([make_meters()])
+    poll_and_log(
+        client, conn, state, history, monotonic_fn=clock,
+        now_fn=lambda: "2026-09-14T12:00:00+00:00", pool_age_alert_hours=36.0,
+    )
+    assert "ALERT: validation_pool" not in capsys.readouterr().out
+    assert conn.execute("SELECT COUNT(*) FROM poll_errors WHERE error_type = 'PoolStale'").fetchone()[0] == 0
+
+
+def test_pool_age_alert_never_blocks_dispensing():
+    """A stale pool is a health signal, not a validity check (D-16) --
+    cashout requests must still be answered normally from the same pool
+    that just triggered the alert.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    seed_pool(conn, 555, issued_at="2026-09-01T00:00:00+00:00")  # very stale
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.SYSTEM_VALIDATION_REQUEST],
+        cashout_info_script=[make_cashout_info(amount_cents=2500)],
+        validation_number_script=[0x00],
+    )
+    poll_and_log(
+        client, conn, state, history, monotonic_fn=clock,
+        now_fn=lambda: "2026-09-14T12:00:00+00:00", pool_age_alert_hours=36.0,
+    )
+    assert conn.execute("SELECT status FROM validation_pool WHERE validation_number = 555").fetchone() == ("assigned",)
+
+
+def test_pool_age_alert_zero_disables_it(capsys):
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    seed_pool(conn, 1, issued_at="2020-01-01T00:00:00+00:00")  # ancient
+    client = ScriptedClient([make_meters()])
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, pool_age_alert_hours=0)
+    assert "ALERT: validation_pool" not in capsys.readouterr().out
 
 
 # --- synced_at: ticket tables are drain-eligible, meters never are ---------

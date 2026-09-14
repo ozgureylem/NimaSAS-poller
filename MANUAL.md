@@ -326,7 +326,17 @@ hand-inserted real numbers) — no server round-trip, which is exactly
 the split your own project's Technical v3 §5.4/§5.8 describes: cashout
 is gateway-authority, redemption isn't. See §4.4 for the full mechanism
 and §6.3 for why this direction gets a spend-from pool while ticket-in
-only ever gets a read-only log.
+only ever gets a read-only log. Every cycle also checks the pool's
+*age* (`--pool-age-alert-hours`, default 36 — Decisions Annex D-16): a
+pool that stale is raised as an active, repeated alert, never used to
+block dispensing — age isn't an integrity signal, it's a sign that
+nothing is topping this gateway's pool up.
+
+**General-poll reliability** (Decisions Annex D-09): a failed general
+poll is re-polled immediately, up to `--general-poll-retries` (default
+3) consecutive attempts, rather than waiting out the rest of
+`--interval` — SAS delivers one pending exception per poll, and an
+undrained one is silently overwritten by the next with no trail at all.
 
 Two asymmetries worth knowing before you rely on this. First: ticket-
 *out* history has a real buffer on the machine, so the startup read
@@ -375,6 +385,8 @@ A lab/stress-test run: logs every single poll (uncapped), polling every
 | `--seed-validation-pool N` | `0` | Top up `validation_pool` to at least `N` `available` rows with random 16-digit test numbers. `0` means don't seed — do this if you're hand-inserting real numbers instead. |
 | `--db-size-warning-mb MB` | `0` | Print a warning every cycle the database file is at or above this size — an early signal, not a substitute for the loud failure a full partition already produces on its own (see §4.4). `0` disables it. |
 | `--skip-full-meter-sweep` | off | Skip the ~39 individual single-meter long polls each cycle (their columns are left `NULL`); every other meter poll (core, ticket, `0x18`/`0x19`/`0x1C`/`0x1E`/`0x2D`/`0x4F`) still runs. Lighter per-cycle wire traffic for hardware where the full sweep isn't affordable — see §4.4. |
+| `--general-poll-retries N` | `3` | Consecutive immediate re-poll attempts on a failed general poll before waiting for the next `--interval` cycle (Decisions Annex D-09). `1` disables retrying. |
+| `--pool-age-alert-hours HOURS` | `36.0` | Print an active, repeated `ALERT:` line (and log a `PoolStale` row) every cycle the oldest available `validation_pool` number is at or above this age (Decisions Annex D-16). Never blocks dispensing. `0` or negative disables it. |
 
 ### 4.4 What's actually happening (technical)
 
@@ -389,11 +401,37 @@ non-destructive at a specific index — it doesn't disturb the "unread"
 state the live capture below depends on. Every non-empty record found
 is stored in `ticket_out_history`.
 
-Each cycle then does two things, in order:
+Each cycle then does three things, in order:
+
+**0. A validation_pool age check.** Independent of whether a cashout is
+even pending this cycle — see step 1's `0x57` handling below for the
+pool itself — every cycle checks how old the oldest still-`available`
+row is. At or above `--pool-age-alert-hours` (default 36, per the
+project's own Decisions Annex D-16) it prints an unmissable `ALERT:`
+line and writes a `PoolStale` row to `poll_errors`, repeated every
+cycle the condition holds — the same treatment as `--db-size-warning-mb`
+above, not a quiet log entry. This **never blocks dispensing**: age
+isn't an integrity signal (an old validation number is exactly as valid
+as a new one), and D-16 is explicit that an age-based block would
+recreate — on a slower clock — the correlated, outage-time TITO disable
+the local pool exists to prevent in the first place. A pool this stale
+almost always means either nothing is being dispensed, or nothing is
+topping this gateway's pool up.
 
 **1. A general poll.** This is the same `general_poll()` that
 `connectivity_check.py` uses to check whether a machine is live, except
-here its return value — the exception code — is actually acted on:
+here its return value — the exception code — is actually acted on. On a
+`SASError`, it's re-polled **immediately** — not deferred to the next
+`--interval` cycle — for up to `--general-poll-retries` (default 3)
+consecutive attempts, each failure logged as its own `poll_errors` row
+(`general_poll(attempt N/M)`). This is the project's own Decisions
+Annex D-09: SAS delivers exactly one pending exception per poll, and if
+the host doesn't drain it fast enough the next exception silently
+overwrites it — "the mirror of ghost redemption," a real event that
+leaves no trail at all. Setting `--general-poll-retries 1` disables the
+extra attempts and restores the plain one-shot behavior. Once a poll
+succeeds (first attempt or a later one), its exception code is
+dispatched exactly as before:
 
 - Exception `0x67` (ticket inserted) → read the ticket's validation
   data (long poll `0x70`) and insert it into `ticket_in_events`.
@@ -439,8 +477,8 @@ here its return value — the exception code — is actually acted on:
 - Any other exception code, including `0x00` (nothing pending), is
   ignored by this tool.
 
-A `SASError` on the general poll itself is logged to `poll_errors` and
-the cycle moves on to meters anyway — it doesn't block anything.
+If every retry attempt fails, the cycle moves on to meters anyway — a
+general-poll failure, retried or exhausted, never blocks anything else.
 
 **Every write goes through `_safe_commit()`**, not a bare `conn.commit()`
 — if the commit fails (almost always `SQLITE_FULL`, the partition
@@ -552,6 +590,22 @@ them stale/`NULL`.
   whole sweep (leaving its columns `NULL`) while keeping every other
   meter poll working normally; that's the practical fix if this
   machine simply doesn't speak all of them.
+- **`poll_errors` shows repeated `general_poll(attempt N/M)` rows**:
+  expected on a flaky link — each consecutive immediate retry (up to
+  `--general-poll-retries`) is logged individually, numbered, so you
+  can see the retry sequence rather than one opaque failure. If `M`
+  attempts fail every cycle, that's a real, persistent link problem
+  (loose cable, wrong address, a machine that's actually down), not a
+  transient one — `connectivity_check.py` is the next step, same as
+  above.
+- **A console line starts with `ALERT: validation_pool's oldest
+  available number is ...`**: the pool hasn't been topped up in
+  `--pool-age-alert-hours` (default 36h) — in this reference tool, that
+  almost always means `--seed-validation-pool` was only run once and
+  the pool has simply been consumed by test cashouts since. Re-seed it,
+  or lower `--pool-age-alert-hours` if 36h doesn't suit a fast lab
+  test cycle. This never blocks dispensing on its own (Decisions Annex
+  D-16) — it's a health signal, not a validity check.
 - **Database file grows large during a long `append`-mode stress run**:
   expected — that mode never deletes rows by design. Either plan disk
   space accordingly or switch to `ring` mode, which won't grow past
@@ -831,10 +885,18 @@ CREATE TABLE IF NOT EXISTS validation_pool (
     validation_number INTEGER PRIMARY KEY,
     validation_system_id INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'available',
+    issued_at TEXT,
     assigned_at TEXT,
     assigned_amount_cents INTEGER
 );
 ```
+
+`issued_at` is set by `seed_validation_pool()` to when a row entered the
+pool — this reference tool's stand-in for a real server recording when
+it minted a batch. It's what the pool-age check (§4.4, Decisions Annex
+D-16) reads; a hand-inserted real number with no batch info recorded
+leaves it `NULL`, which the age check treats as unknown rather than
+brand-new or infinitely old.
 
 - **Split "current" from "history."** Almost every consumer of this
   data only ever wants the latest value — a dashboard tile, a health

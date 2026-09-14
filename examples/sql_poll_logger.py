@@ -20,17 +20,27 @@ fast enough — see the SAS spec's exception-queue behavior, §2.2.1).
 
 What each cycle does, in order:
 
-1. A general poll. If it returns exception 0x67 (ticket inserted), read
-   the ticket's validation data (LP 70) and log it to ticket_in_events —
-   read-only; see "What this does NOT do" below. If it returns 0x3D or
-   0x3E (a ticket-out record is ready), drain every currently-unread
-   ticket-out record (LP 4D, function code 0x00) into ticket_out_history.
-   If it returns 0x57 (system validation request — the machine is ready
-   to print a cashout ticket and is waiting to be told what validation
-   number to use), answer it locally from validation_pool: read the
-   pending cashout amount (LP 57), take the next available number from
-   the pool, and answer with it (LP 58) — see "Gateway-local cashout
-   validation" below.
+0. A validation_pool age check (see "Gateway-local cashout validation"
+   below and --pool-age-alert-hours) — cheap, always run, independent of
+   whether a cashout is even pending this cycle, since a stale pool is a
+   condition that can otherwise go unnoticed until someone actually
+   tries to spend from it.
+1. A general poll, re-polled immediately (not deferred to the next
+   --interval cycle) up to --general-poll-retries consecutive attempts
+   on failure — see _general_poll_with_retry()'s docstring for why: SAS
+   delivers one pending exception per poll, and an undrained one can be
+   silently overwritten by the next, with no trail at all. If it returns
+   exception 0x67 (ticket inserted), read the ticket's validation data
+   (LP 70) and log it to ticket_in_events — read-only; see "What this
+   does NOT do" below. If it returns 0x3D or 0x3E (a ticket-out record
+   is ready), drain every currently-unread ticket-out record (LP 4D,
+   function code 0x00) into ticket_out_history. If it returns 0x57
+   (system validation request — the machine is ready to print a cashout
+   ticket and is waiting to be told what validation number to use),
+   answer it locally from validation_pool: read the pending cashout
+   amount (LP 57), take the next available number from the pool, and
+   answer with it (LP 58) — see "Gateway-local cashout validation"
+   below.
 2. Meters — deliberately as many as this client can reach in one cycle,
    all in the same row, on the same cadence/ring-history/rollover logic
    (see the HistoryConfig docstring and MANUAL.md §4/§6): the six core
@@ -82,6 +92,23 @@ network — that's real gateway<->server protocol machinery, out of scope
 for a SAS wire-protocol reference client). If the pool runs out,
 the cashout is left unanswered and the machine's own 10-second timeout
 handles it, logged as a PoolExhausted row in poll_errors.
+
+Separately from exhaustion, every cycle also checks how old the oldest
+still-available number is (--pool-age-alert-hours, default 36 — per the
+project's own Decisions Annex D-16) and raises an active, repeated
+alert (a PoolStale row, plus an unmissable console line) if it's stale
+— not because an old number is less valid (it isn't: age carries no
+integrity meaning here, provenance is a signing concern this reference
+tool doesn't implement, and consumption state is unaffected by age),
+but because a pool that old almost always means either nothing is
+being dispensed or nothing is topping this gateway up. This never
+blocks dispensing on its own — see D-16's own reasoning for why an
+age-based block would recreate, on a slower clock, exactly the
+correlated-outage-time TITO disable the local pool exists to prevent.
+Real order-gap detection (D-16's sharper signal, catching consumption
+skipping or going non-contiguous) needs the actual server-issued
+sequential/batch numbering named above as out of scope, so it isn't
+attempted here either — age is the one signal available without it.
 
 What this does NOT do: authorize or redeem tickets *coming in*. A
 ticket-in event is read and logged (amount, validation data) but this
@@ -386,6 +413,7 @@ CREATE TABLE IF NOT EXISTS validation_pool (
     validation_number INTEGER PRIMARY KEY,
     validation_system_id INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'available',
+    issued_at TEXT,
     assigned_at TEXT,
     assigned_amount_cents INTEGER
 );
@@ -445,14 +473,20 @@ CREATE TABLE IF NOT EXISTS validation_pool (
 # validation_pool is different in kind from every other table here: it's
 # not something this tool observes, it's something this tool spends
 # from. A row starts 'available' (seeded by --seed-validation-pool, or
-# hand-inserted with real numbers) and moves to 'assigned' the moment
-# the machine acknowledges it (status 0x00 on LP 58) — never reused,
-# and never removed, so validation_pool doubles as its own audit trail
-# of what this gateway has ever handed out.
+# hand-inserted with real numbers, with issued_at set to when it entered
+# the pool) and moves to 'assigned' the moment the machine acknowledges
+# it (status 0x00 on LP 58) — never reused, and never removed, so
+# validation_pool doubles as its own audit trail of what this gateway
+# has ever handed out. issued_at backs the pool-age check below (the
+# Decisions Annex's D-16): a real server tracks when it minted a batch,
+# and issued_at is this lab stand-in's equivalent for locally-seeded
+# numbers — see _pool_age_hours() and --pool-age-alert-hours.
 
 DEFAULT_HISTORY_CAP = 200
 DEFAULT_HISTORY_INTERVAL = 60.0
 DEFAULT_BURST_COUNT = 10
+DEFAULT_GENERAL_POLL_RETRIES = 3
+DEFAULT_POOL_AGE_ALERT_HOURS = 36.0
 
 
 @dataclass
@@ -611,28 +645,36 @@ def seed_validation_pool(
     *,
     validation_system_id: int = DEFAULT_VALIDATION_SYSTEM_ID,
     random_fn=random.getrandbits,
+    now_fn=utc_now,
 ) -> int:
     """Top up validation_pool to at least ``target_available`` 'available'
     rows, generating random 16-digit numbers (not real server-issued
     ones — see the module docstring). Safe to call every run: it only
     adds what's missing, and a random collision with an existing number
     just retries. Returns how many rows were actually added.
+
+    Each new row's ``issued_at`` is set to ``now_fn()`` — this lab
+    stand-in's equivalent of a real server recording when it minted a
+    batch, which _pool_age_hours() reads to back the pool-age check
+    (Decisions Annex D-16).
     """
     if target_available <= 0:
         return 0
+    now = now_fn()
     existing = conn.execute("SELECT COUNT(*) FROM validation_pool WHERE status = 'available'").fetchone()[0]
     added = 0
     while existing + added < target_available:
         candidate = random_fn(53) % 10**16
         try:
             conn.execute(
-                "INSERT INTO validation_pool (validation_number, validation_system_id, status) VALUES (?, ?, 'available')",
-                (candidate, validation_system_id),
+                "INSERT INTO validation_pool (validation_number, validation_system_id, status, issued_at) "
+                "VALUES (?, ?, 'available', ?)",
+                (candidate, validation_system_id, now),
             )
         except sqlite3.IntegrityError:
             continue  # collided with an existing validation_number (primary key) — try another
         added += 1
-    _safe_commit(conn, utc_now())
+    _safe_commit(conn, now)
     return added
 
 
@@ -692,6 +734,54 @@ def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
         # 0x80 not in cashout, 0x81 improper validation rejected (Table 15.8b) — the number was never
         # actually consumed, so leave it 'available' for the next attempt rather than burning it.
         print(f"[{now}] validation number rejected by machine (status=0x{status:02X}); left available for reuse")
+
+
+def _pool_age_hours(conn: sqlite3.Connection, now: str) -> float | None:
+    """Hours since the oldest still-'available' row entered the pool, or
+    None if the pool currently has no available rows at all (that's
+    PoolExhausted's condition, a different one — see _handle_cashout_request()).
+    A NULL issued_at (a hand-inserted real number with no batch info
+    recorded) is treated as unknown age, not zero or infinite — excluded
+    from the MIN() rather than guessed at.
+    """
+    row = conn.execute(
+        "SELECT MIN(issued_at) FROM validation_pool WHERE status = 'available' AND issued_at IS NOT NULL"
+    ).fetchone()
+    oldest = row[0] if row else None
+    if oldest is None:
+        return None
+    return (datetime.datetime.fromisoformat(now) - datetime.datetime.fromisoformat(oldest)).total_seconds() / 3600.0
+
+
+def _check_pool_age(conn: sqlite3.Connection, now: str, *, max_age_hours: float) -> None:
+    """Per the Decisions Annex D-16: a pool older than ~36 hours is
+    "genuinely abnormal... either the machine has dispensed nothing in a
+    day and a half, or the gateway has been unable to reach the server
+    to take a top-up" — raised as an active, repeated alert (the same
+    treatment as the existing --db-size-warning-mb check below), never
+    used to block dispensing. Age is not an integrity signal (an old
+    validation number is exactly as valid as a new one — see D-15/D-16),
+    so this is a health signal for a technician, not a validity check;
+    nothing here ever refuses or withholds a number on account of age.
+    Real order-gap detection (D-16's "sharper signal") needs the actual
+    server-issued sequential/batch numbering this reference tool
+    deliberately doesn't implement (see the module docstring's note on
+    pool_epoch/batch_uuid) — out of scope here for the same reason.
+    """
+    if max_age_hours <= 0:
+        return
+    age = _pool_age_hours(conn, now)
+    if age is not None and age >= max_age_hours:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+            (now, "validation_pool", "PoolStale", f"oldest available number is {age:.1f}h old (>= {max_age_hours}h)"),
+        )
+        _safe_commit(conn, now)
+        print(
+            f"[{now}] ALERT: validation_pool's oldest available number is {age:.1f}h old, at or above "
+            f"--pool-age-alert-hours {max_age_hours} — likely no top-up reaching this gateway, or the "
+            "machine isn't dispensing. Not a validity problem and not blocking dispensing (see D-16)."
+        )
 
 
 def _capture_ticket_in(client, conn: sqlite3.Connection, now: str) -> None:
@@ -800,6 +890,40 @@ def _poll_all_meters(client, *, full_sweep: bool = True) -> dict:
     return values
 
 
+def _general_poll_with_retry(client, conn: sqlite3.Connection, now: str, *, max_attempts: int) -> tuple[int, int]:
+    """SAS delivers exactly one pending exception per poll (§2.2.1); if
+    the host doesn't drain it before the next one arrives, the earlier
+    exception is overwritten with no trail at all — a real event, gone,
+    undetectable afterwards. Per the Decisions Annex D-09, "the mirror
+    of ghost redemption": a failed or garbled general poll is therefore
+    re-polled immediately here, not deferred to the next --interval
+    cycle, for up to ``max_attempts`` consecutive tries — capped so one
+    unresponsive machine can't consume the whole cycle budget chasing a
+    dead link (D-09's own reasoning is about a round-robin across many
+    machines; this tool only ever talks to one, but the underlying
+    exception-overwrite risk is identical).
+
+    Returns (exception_code, attempt_number) on success. Raises the
+    final SASError if every attempt fails. Every failed attempt is
+    logged to poll_errors individually, numbered, so a flaky link shows
+    up as a distinguishable run of attempts rather than one opaque
+    failure.
+    """
+    last_error: SASError | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.general_poll(), attempt
+        except SASError as e:
+            last_error = e
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+                (now, f"general_poll(attempt {attempt}/{max_attempts})", type(e).__name__, str(e)),
+            )
+            _safe_commit(conn, now)
+    assert last_error is not None  # max_attempts >= 1 is enforced by argparse/callers
+    raise last_error
+
+
 def poll_and_log(
     client,
     conn: sqlite3.Connection,
@@ -813,9 +937,14 @@ def poll_and_log(
     db_size_fn=_db_file_size_bytes,
     full_meter_sweep: bool = True,
     interval: float | None = None,
+    general_poll_retries: int = DEFAULT_GENERAL_POLL_RETRIES,
+    pool_age_alert_hours: float = DEFAULT_POOL_AGE_ALERT_HOURS,
 ) -> None:
-    """Run one full cycle: a general poll (dispatching to ticket-in/
-    ticket-out capture on the relevant exception codes), then the full
+    """Run one full cycle: a general poll (retried immediately, up to
+    ``general_poll_retries`` consecutive attempts, on failure — see
+    _general_poll_with_retry()'s docstring for why — dispatching to
+    ticket-in/ticket-out capture on the relevant exception codes), a
+    validation_pool age check (see _check_pool_age()), then the full
     meter poll (see _poll_all_meters()) — refreshing meters_current every
     cycle, and writing to meters_history according to ``history``'s
     mode/cadence/cap, or immediately (for the next ``history.burst_count``
@@ -826,6 +955,8 @@ def poll_and_log(
     the database file is at or above that size — an early signal ahead
     of an actual full-partition write failure, not a substitute for
     _safe_commit()'s own fault reporting when one happens anyway.
+    ``pool_age_alert_hours`` (0 or negative = disabled) is the same kind
+    of early, repeated, non-blocking signal for validation_pool.
 
     Every cycle's log line reports how long the meter poll itself took
     and how many long-poll exchanges that was (``meter_poll=X.XXXs/N
@@ -850,16 +981,18 @@ def poll_and_log(
                 "This tool never deletes ticket/event rows to free space; see the module docstring."
             )
 
+    _check_pool_age(conn, now, max_age_hours=pool_age_alert_hours)
+
     try:
-        exception_code = client.general_poll()
+        exception_code, attempt = _general_poll_with_retry(client, conn, now, max_attempts=general_poll_retries)
     except SASError as e:
-        conn.execute(
-            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
-            (now, "general_poll", type(e).__name__, str(e)),
+        print(
+            f"[{now}] general poll failed after {general_poll_retries} consecutive attempt(s): "
+            f"{type(e).__name__}: {e}"
         )
-        _safe_commit(conn, now)
-        print(f"[{now}] general poll failed: {type(e).__name__}: {e}")
     else:
+        if attempt > 1:
+            print(f"[{now}] general poll recovered on attempt {attempt}/{general_poll_retries}")
         if exception_code == ExceptionCode.TICKET_INSERTED:
             _capture_ticket_in(client, conn, now)
         elif exception_code in (ExceptionCode.CASH_OUT_TICKET_PRINTED, ExceptionCode.HANDPAY_VALIDATED):
@@ -1013,6 +1146,27 @@ def main() -> int:
         "much extra polling isn't affordable. The six core meters, eight ticket meters, and the "
         "other grouped meter polls (LP 0x18/0x19/0x1C/0x1E/0x2D/0x4F) still run either way.",
     )
+    parser.add_argument(
+        "--general-poll-retries",
+        type=int,
+        default=DEFAULT_GENERAL_POLL_RETRIES,
+        metavar="N",
+        help="consecutive immediate re-poll attempts on a failed general poll, before waiting for the "
+        "next --interval cycle (default: %(default)s). A queued SAS exception can be silently "
+        "overwritten by the next one before it's ever read if the host doesn't drain fast enough "
+        "(Decisions Annex D-09) — this re-polls right away rather than losing that cycle. N=1 disables retrying.",
+    )
+    parser.add_argument(
+        "--pool-age-alert-hours",
+        type=float,
+        default=DEFAULT_POOL_AGE_ALERT_HOURS,
+        metavar="HOURS",
+        help="print an active, repeated alert (and log a PoolStale row to poll_errors) every cycle the "
+        "oldest available validation_pool number is at or above this age (default: %(default)s, per "
+        "Decisions Annex D-16). Age is not an integrity signal and this never blocks dispensing -- "
+        "it's a health signal that a top-up isn't reaching this gateway, or the machine isn't dispensing. "
+        "0 or negative disables it.",
+    )
     args = parser.parse_args()
 
     history = HistoryConfig(
@@ -1065,6 +1219,8 @@ def main() -> int:
                 db_size_warning_mb=args.db_size_warning_mb,
                 full_meter_sweep=not args.skip_full_meter_sweep,
                 interval=args.interval,
+                general_poll_retries=args.general_poll_retries,
+                pool_age_alert_hours=args.pool_age_alert_hours,
             )
             time.sleep(args.interval)
     except KeyboardInterrupt:
