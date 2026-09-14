@@ -32,8 +32,13 @@ What each cycle does, in order:
    silently overwritten by the next, with no trail at all. If it returns
    exception 0x67 (ticket inserted), read the ticket's validation data
    (LP 70) and log it to ticket_in_events — read-only; see "What this
-   does NOT do" below. If it returns 0x3D or 0x3E (a ticket-out record
-   is ready), drain every currently-unread ticket-out record (LP 4D,
+   does NOT do" below. If it returns 0x68 (ticket transfer complete —
+   the redemption cycle finished, stacked or rejected, not which),
+   read the completion status (the safe, read-only LP 71/FF status
+   query) and log it to ticket_in_completions — see "What this does
+   NOT do" below for how this stays read-only too. If it returns 0x3D
+   or 0x3E (a ticket-out record is ready), drain every currently-unread
+   ticket-out record (LP 4D,
    function code 0x00) into ticket_out_history. If it returns 0x57
    (system validation request — the machine is ready to print a cashout
    ticket and is waiting to be told what validation number to use),
@@ -127,10 +132,15 @@ Annex on this), and a reference poller has no way to make that decision
 correctly. Left unredeemed, the machine safely returns the ticket to
 the player after its own 30-second timeout (spec-guaranteed), so
 running this against a real machine does not risk paying out
-incorrectly — it just means this tool's ticket_in_events table records
-that a ticket came in, not what happened to it. This is a different
-direction from cashout validation above, not a contradiction of it —
-see §5.4 vs. §5.8 in the docstring paragraph above.
+incorrectly. ticket_in_events records that a ticket came in;
+ticket_in_completions (exception 0x68) separately records how that
+cycle ended — stacked or rejected, via the same safe, read-only status
+query (redeem_ticket_status(), LP 71/FF) redeem_ticket() itself is
+never used for — but "safe to observe" and "safe to decide" stay
+different things throughout: this tool still never authorizes, rejects,
+or influences a ticket-in outcome, only reads what already happened.
+This is a different direction from cashout validation above, not a
+contradiction of it — see §5.4 vs. §5.8 in the docstring paragraph above.
 
 What this does NOT recover: ticket-IN history before this tool started,
 or before the SAS 6.02 spec's own record — because there isn't any. LP
@@ -441,6 +451,16 @@ CREATE TABLE IF NOT EXISTS ticket_in_events (
     synced_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS ticket_in_completions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    machine_status INTEGER,
+    amount_cents INTEGER,
+    parsing_code INTEGER,
+    validation_data_hex TEXT,
+    synced_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS validation_pool (
     validation_number INTEGER PRIMARY KEY,
     validation_system_id INTEGER NOT NULL,
@@ -490,17 +510,27 @@ CREATE TABLE IF NOT EXISTS validation_pool (
 # Neither meters table carries a synced_at column — they're a local
 # diagnostic buffer, not a queue, and there's nothing for a sync column
 # to mean on a table that's never drained (see §6.6's synced_at
-# discussion). ticket_out_history and ticket_in_events are different:
-# per Technical v3 §5.9, ticket events ARE the event stream ("sas_events
-# — append-only, drained on invitation, pruned on confirmed ACK"), so
-# they carry synced_at even though this reference tool has no real
-# drain process to ever set it. The column exists so a future one can,
-# and so the correct future cleanup query is obvious and safe:
-# `DELETE ... WHERE synced_at IS NOT NULL` — never a row-count cap,
-# and never anything keyed on age or local disk pressure alone. This
-# tool does not implement that deletion itself; see the module
-# docstring's note on why sustained disk pressure is reported loudly
-# instead of resolved by deleting unsynced rows.
+# discussion). ticket_out_history, ticket_in_events and
+# ticket_in_completions are different: per Technical v3 §5.9, ticket
+# events ARE the event stream ("sas_events — append-only, drained on
+# invitation, pruned on confirmed ACK"), so they carry synced_at even
+# though this reference tool has no real drain process to ever set it.
+# The column exists so a future one can, and so the correct future
+# cleanup query is obvious and safe: `DELETE ... WHERE synced_at IS NOT
+# NULL` — never a row-count cap, and never anything keyed on age or
+# local disk pressure alone. This tool does not implement that deletion
+# itself; see the module docstring's note on why sustained disk
+# pressure is reported loudly instead of resolved by deleting unsynced
+# rows.
+#
+# ticket_in_completions is a separate table from ticket_in_events, not
+# extra columns on it, because nothing in SAS correlates a completion
+# (exception 0x68) back to the specific insertion (exception 0x67) that
+# started its cycle — no shared ID exists to join on. Both are captured
+# as their own append-only log; matching one to the other, if ever
+# needed, is a job for whoever consumes this data (by timestamp
+# proximity and validation_data_hex), not this tool inventing a
+# correlation key SAS itself doesn't provide.
 #
 # validation_pool is different in kind from every other table here: it's
 # not something this tool observes, it's something this tool spends
@@ -519,6 +549,16 @@ DEFAULT_HISTORY_INTERVAL = 60.0
 DEFAULT_BURST_COUNT = 10
 DEFAULT_GENERAL_POLL_RETRIES = 3
 DEFAULT_POOL_AGE_ALERT_HOURS = 36.0
+
+# SAS 6.02 §2.3.3 ("Polling Rate"): "The host may not issue general polls
+# or long polls to any single gaming machine at a rate faster than once
+# per 200 ms. The slowest allowable polling rate is 5000 ms." This is a
+# protocol requirement, not a tuning knob -- it bounds --interval (see
+# main()'s validation) and paces the immediate general-poll retries in
+# _general_poll_with_retry() below, which would otherwise fire back-to-
+# back with no delay between them.
+SAS_MIN_POLL_INTERVAL_S = 0.2
+SAS_MAX_POLL_INTERVAL_S = 5.0
 
 
 @dataclass
@@ -841,6 +881,40 @@ def _capture_ticket_in(client, conn: sqlite3.Connection, now: str) -> None:
     print(f"[{now}] ticket-in captured: amount_cents={ticket.amount_cents} (not redeemed — see module docstring)")
 
 
+def _capture_ticket_in_completion(client, conn: sqlite3.Connection, now: str) -> None:
+    """Called on exception 0x68: the machine's redemption cycle finished
+    — stacked or rejected, not which one (Appendix A of the project's own
+    Technical v3: "Announces that the cycle finished, not that it
+    succeeded"). Reads the outcome via redeem_ticket_status() — the safe,
+    read-only LP 71/FF status query (transfer code FF, §15.12b), never
+    redeem_ticket() itself, so this stays inside the same read-only
+    boundary as _capture_ticket_in(): this tool observes what happened to
+    a ticket, it never decides what should happen to one.
+
+    machine_status 0xFF means no completed cycle since the machine was
+    last polled — the exception fired, but the race is already over by
+    the time this read landed. Logged as-is rather than filtered out:
+    that itself is informative (a fast, easily-missed cycle), not an
+    error.
+    """
+    try:
+        result = client.redeem_ticket_status()
+    except SASError as e:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+            (now, "redeem_ticket_status", type(e).__name__, str(e)),
+        )
+        _safe_commit(conn, now)
+        return
+    conn.execute(
+        "INSERT INTO ticket_in_completions (captured_at, machine_status, amount_cents, parsing_code, validation_data_hex) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (now, result.machine_status, result.amount_cents, result.parsing_code, result.validation_data.hex()),
+    )
+    _safe_commit(conn, now)
+    print(f"[{now}] ticket-in completion captured: machine_status=0x{result.machine_status:02X} amount_cents={result.amount_cents}")
+
+
 class _MeterPollFailure(Exception):
     """Internal signal: one meter poll failed. Carries which poll and the
     original SASError so the caller can log a precise poll_errors row.
@@ -943,7 +1017,9 @@ def _poll_all_meters(client, *, full_sweep: bool = True, table_c7_sweep: bool = 
     return values
 
 
-def _general_poll_with_retry(client, conn: sqlite3.Connection, now: str, *, max_attempts: int) -> tuple[int, int]:
+def _general_poll_with_retry(
+    client, conn: sqlite3.Connection, now: str, *, max_attempts: int, sleep_fn=time.sleep
+) -> tuple[int, int]:
     """SAS delivers exactly one pending exception per poll (§2.2.1); if
     the host doesn't drain it before the next one arrives, the earlier
     exception is overwritten with no trail at all — a real event, gone,
@@ -956,6 +1032,14 @@ def _general_poll_with_retry(client, conn: sqlite3.Connection, now: str, *, max_
     machines; this tool only ever talks to one, but the underlying
     exception-overwrite risk is identical).
 
+    "Immediate" is paced, not truly zero-delay: SAS 6.02 §2.3.3 forbids
+    polling a single machine faster than once per 200 ms
+    (SAS_MIN_POLL_INTERVAL_S) — a retry loop with no pacing would
+    violate that floor whenever an attempt fails fast (a checksum
+    error, say, rather than a timeout that already ran out the clock).
+    Each attempt after the first waits out whatever's left of that
+    200 ms window since the previous attempt started, never more.
+
     Returns (exception_code, attempt_number) on success. Raises the
     final SASError if every attempt fails. Every failed attempt is
     logged to poll_errors individually, numbered, so a flaky link shows
@@ -963,7 +1047,13 @@ def _general_poll_with_retry(client, conn: sqlite3.Connection, now: str, *, max_
     failure.
     """
     last_error: SASError | None = None
+    attempt_started: float | None = None
     for attempt in range(1, max_attempts + 1):
+        if attempt_started is not None:
+            remaining = SAS_MIN_POLL_INTERVAL_S - (time.monotonic() - attempt_started)
+            if remaining > 0:
+                sleep_fn(remaining)
+        attempt_started = time.monotonic()
         try:
             return client.general_poll(), attempt
         except SASError as e:
@@ -993,6 +1083,7 @@ def poll_and_log(
     interval: float | None = None,
     general_poll_retries: int = DEFAULT_GENERAL_POLL_RETRIES,
     pool_age_alert_hours: float = DEFAULT_POOL_AGE_ALERT_HOURS,
+    retry_sleep_fn=time.sleep,
 ) -> None:
     """Run one full cycle: a general poll (retried immediately, up to
     ``general_poll_retries`` consecutive attempts, on failure — see
@@ -1039,7 +1130,9 @@ def poll_and_log(
     _check_pool_age(conn, now, max_age_hours=pool_age_alert_hours)
 
     try:
-        exception_code, attempt = _general_poll_with_retry(client, conn, now, max_attempts=general_poll_retries)
+        exception_code, attempt = _general_poll_with_retry(
+            client, conn, now, max_attempts=general_poll_retries, sleep_fn=retry_sleep_fn
+        )
     except SASError as e:
         print(
             f"[{now}] general poll failed after {general_poll_retries} consecutive attempt(s): "
@@ -1050,6 +1143,8 @@ def poll_and_log(
             print(f"[{now}] general poll recovered on attempt {attempt}/{general_poll_retries}")
         if exception_code == ExceptionCode.TICKET_INSERTED:
             _capture_ticket_in(client, conn, now)
+        elif exception_code == ExceptionCode.TICKET_TRANSFER_COMPLETE:
+            _capture_ticket_in_completion(client, conn, now)
         elif exception_code in (ExceptionCode.CASH_OUT_TICKET_PRINTED, ExceptionCode.HANDPAY_VALIDATED):
             _drain_ticket_out_history(client, conn, now)
         elif exception_code == ExceptionCode.SYSTEM_VALIDATION_REQUEST:
@@ -1143,11 +1238,37 @@ def poll_and_log(
     )
 
 
+def _sas_poll_interval(value: str) -> float:
+    """argparse type= for --interval: SAS 6.02 §2.3.3 ("Polling Rate")
+    is explicit that a host "may not" poll a single machine faster than
+    once per 200 ms, nor slower than once per 5000 ms — a protocol
+    requirement, not a tuning preference. Enforced here rather than
+    just documented, because a --interval outside this range doesn't
+    fail loudly on its own: it risks the EGM misbehaving (or, on the
+    slow side, the machine's own link-down detection tripping) in a way
+    that would look like a bug in whatever's being tested against this
+    tool, not a misconfigured poll rate.
+    """
+    parsed = float(value)
+    if not SAS_MIN_POLL_INTERVAL_S <= parsed <= SAS_MAX_POLL_INTERVAL_S:
+        raise argparse.ArgumentTypeError(
+            f"--interval must be between {SAS_MIN_POLL_INTERVAL_S}s and {SAS_MAX_POLL_INTERVAL_S}s "
+            f"(SAS 6.02 §2.3.3's own polling-rate bounds for a single machine), got {parsed}s"
+        )
+    return parsed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("config", help="gateway .ini file (see saspy/config.py or MANUAL.md)")
     parser.add_argument("--db", default="gateway.sqlite3", help="SQLite file to write to")
-    parser.add_argument("--interval", type=float, default=5.0, help="seconds between poll cycles")
+    parser.add_argument(
+        "--interval",
+        type=_sas_poll_interval,
+        default=SAS_MAX_POLL_INTERVAL_S,
+        help=f"seconds between poll cycles ({SAS_MIN_POLL_INTERVAL_S}-{SAS_MAX_POLL_INTERVAL_S}, "
+        "SAS 6.02 §2.3.3's own bounds for polling a single machine)",
+    )
     parser.add_argument("--cycles", type=int, default=0, help="stop after N cycles (default: run until Ctrl-C)")
     parser.add_argument(
         "--mode",

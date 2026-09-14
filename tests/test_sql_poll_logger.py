@@ -1,3 +1,4 @@
+import argparse
 import sqlite3
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 from examples.sql_poll_logger import (
     ALL_METER_FIELDS,
     GROUPED_METER_POLL_COUNT,
+    SAS_MIN_POLL_INTERVAL_S,
     SCHEMA,
     SINGLE_METER_COLUMNS,
     TABLE_C7_CHUNK_COUNT,
@@ -20,6 +22,7 @@ from examples.sql_poll_logger import (
     _insert_ticket_out_record,
     _pool_age_hours,
     _safe_commit,
+    _sas_poll_interval,
     backfill_ticket_out_history,
     poll_and_log,
     seed_validation_pool,
@@ -35,6 +38,7 @@ from saspy.models import (
     HopperStatus,
     Meters11Through15,
     PendingCashoutInfo,
+    RedeemTicketResult,
     SelectedMeters,
     TicketValidationData,
 )
@@ -124,6 +128,12 @@ def make_ticket_in(**overrides) -> TicketValidationData:
     return TicketValidationData(**base)
 
 
+def make_ticket_completion(**overrides) -> RedeemTicketResult:
+    base = dict(machine_status=0x00, amount_cents=2500, parsing_code=0, validation_data=b"\x00" + b"1" * 9)
+    base.update(overrides)
+    return RedeemTicketResult(**base)
+
+
 class ScriptedClient:
     """Returns scripted sequences per method, one item per call. Methods
     with no script default to the harmless no-op response
@@ -137,6 +147,7 @@ class ScriptedClient:
         *,
         exception_script=None,
         ticket_script=None,
+        ticket_completion_script=None,
         ticket_out_script=None,
         cashout_info_script=None,
         validation_number_script=None,
@@ -153,6 +164,7 @@ class ScriptedClient:
         self._meters_script = list(meters_script)
         self._exception_script = list(exception_script) if exception_script is not None else None
         self._ticket_script = list(ticket_script) if ticket_script is not None else []
+        self._ticket_completion_script = list(ticket_completion_script) if ticket_completion_script is not None else []
         self._ticket_out_script = list(ticket_out_script) if ticket_out_script is not None else []
         self._cashout_info_script = list(cashout_info_script) if cashout_info_script is not None else []
         self._validation_number_script = list(validation_number_script) if validation_number_script is not None else []
@@ -255,6 +267,12 @@ class ScriptedClient:
 
     def send_ticket_validation_data(self):
         item = self._ticket_script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def redeem_ticket_status(self):
+        item = self._ticket_completion_script.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
@@ -852,7 +870,7 @@ def test_general_poll_retries_immediately_and_recovers_within_the_cap():
         [make_meters(total_coin_in=7)],
         exception_script=[SASTimeoutError("try 1"), SASTimeoutError("try 2"), ExceptionCode.NONE],
     )
-    poll_and_log(client, conn, state, history, monotonic_fn=clock, general_poll_retries=3)
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, general_poll_retries=3, retry_sleep_fn=lambda s: None)
     errors = conn.execute("SELECT poll_name, error_type FROM poll_errors ORDER BY id").fetchall()
     assert errors == [
         ("general_poll(attempt 1/3)", "SASTimeoutError"),
@@ -871,7 +889,7 @@ def test_general_poll_retries_exhausted_logs_every_attempt_and_still_polls_meter
         [make_meters(total_coin_in=9)],
         exception_script=[SASTimeoutError("try 1"), SASTimeoutError("try 2"), SASTimeoutError("try 3")],
     )
-    poll_and_log(client, conn, state, history, monotonic_fn=clock, general_poll_retries=3)
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, general_poll_retries=3, retry_sleep_fn=lambda s: None)
     errors = conn.execute("SELECT poll_name, error_type FROM poll_errors ORDER BY id").fetchall()
     assert errors == [
         ("general_poll(attempt 1/3)", "SASTimeoutError"),
@@ -894,10 +912,47 @@ def test_general_poll_default_retries_is_three():
         [make_meters()],
         exception_script=[SASTimeoutError("try 1"), SASTimeoutError("try 2"), SASTimeoutError("try 3")],
     )
-    poll_and_log(client, conn, state, history, monotonic_fn=clock)  # default general_poll_retries
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, retry_sleep_fn=lambda s: None)  # default general_poll_retries
     errors = conn.execute("SELECT poll_name FROM poll_errors").fetchall()
     assert len(errors) == 3
     assert all(name == f"general_poll(attempt {i}/3)" for i, (name,) in enumerate(errors, start=1))
+
+
+def test_general_poll_retries_are_paced_to_the_sas_minimum_poll_interval():
+    """SAS 6.02 §2.3.3: no faster than once per 200ms to a single
+    machine. A retry loop with no pacing would violate that floor on a
+    fast failure -- confirm each retry actually waits for roughly the
+    remainder of that window rather than firing back-to-back.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[SASTimeoutError("try 1"), ExceptionCode.NONE],
+    )
+    sleeps = []
+    poll_and_log(
+        client, conn, state, history, monotonic_fn=clock,
+        general_poll_retries=2, retry_sleep_fn=sleeps.append,
+    )
+    assert len(sleeps) == 1
+    # the mocked exchange takes negligible real time, so the sleep should
+    # be close to the full 200ms window, never negative or wildly larger
+    assert 0 < sleeps[0] <= SAS_MIN_POLL_INTERVAL_S
+
+
+def test_interval_rejects_values_outside_sas_polling_rate_bounds():
+    with pytest.raises(argparse.ArgumentTypeError):
+        _sas_poll_interval("0.1")  # faster than the 200ms floor
+    with pytest.raises(argparse.ArgumentTypeError):
+        _sas_poll_interval("5.1")  # slower than the 5000ms ceiling
+
+
+def test_interval_accepts_values_within_sas_polling_rate_bounds():
+    assert _sas_poll_interval("0.2") == pytest.approx(0.2)
+    assert _sas_poll_interval("5.0") == pytest.approx(5.0)
 
 
 # --- ticket-in capture (exception 0x67) -------------------------------------
@@ -995,6 +1050,75 @@ def test_ticket_in_capture_failure_logs_error_without_stopping_meters():
     errors = conn.execute("SELECT poll_name FROM poll_errors").fetchall()
     assert errors == [("send_ticket_validation_data",)]
     assert current_coin_in(conn) == 9
+
+
+# --- ticket-in completion capture (exception 0x68) --------------------------
+
+
+def test_poll_and_log_captures_ticket_in_completion_on_exception():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.TICKET_TRANSFER_COMPLETE],
+        ticket_completion_script=[make_ticket_completion(machine_status=0x00, amount_cents=2500)],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    rows = conn.execute("SELECT machine_status, amount_cents FROM ticket_in_completions").fetchall()
+    assert rows == [(0, 2500)]
+
+
+def test_ticket_in_completion_ff_status_is_logged_not_filtered():
+    """machine_status 0xFF ("no completed cycle since last polled") is a
+    real race, not an error -- the exception fired, but nothing to read
+    by the time this poll landed. Logged as-is, same as any other status.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.TICKET_TRANSFER_COMPLETE],
+        ticket_completion_script=[make_ticket_completion(machine_status=0xFF, amount_cents=0)],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    rows = conn.execute("SELECT machine_status FROM ticket_in_completions").fetchall()
+    assert rows == [(0xFF,)]
+    assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
+
+
+def test_ticket_in_completion_capture_failure_logs_error_without_stopping_meters():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters(total_coin_in=11)],
+        exception_script=[ExceptionCode.TICKET_TRANSFER_COMPLETE],
+        ticket_completion_script=[SASTimeoutError("no response")],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    errors = conn.execute("SELECT poll_name FROM poll_errors").fetchall()
+    assert errors == [("redeem_ticket_status",)]
+    assert current_coin_in(conn) == 11
+
+
+def test_ticket_in_completions_synced_at_defaults_to_null():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.TICKET_TRANSFER_COMPLETE],
+        ticket_completion_script=[make_ticket_completion()],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    row = conn.execute("SELECT synced_at FROM ticket_in_completions").fetchone()
+    assert row == (None,)
 
 
 # --- ticket-out drain (exception 0x3D/0x3E) ---------------------------------

@@ -321,9 +321,14 @@ the startup read or seeing the same ticket both ways never double-counts
 it.
 
 **Ticket-in capture** (`ticket_in_events`) logs the validation data and
-amount of every ticket a player inserts, the moment it happens. It is
-deliberately **read-only** — this tool never authorizes or redeems a
-ticket (see §4.4 for why, and what happens to an unredeemed ticket).
+amount of every ticket a player inserts, the moment it happens.
+`ticket_in_completions` separately logs how that cycle ended — stacked
+or rejected, via exception `0x68` and a safe, read-only status query
+(`redeem_ticket_status()`, long poll `0x71`/`FF`). Both stay
+**read-only** — this tool never authorizes or redeems a ticket (see
+§4.4 for why, and what happens to an unredeemed ticket); the second
+table only observes an outcome that already happened, it never decides
+one.
 
 **Gateway-local cashout validation** (`validation_pool`) is the other
 direction: when a machine is ready to print a cashout ticket, it waits
@@ -382,7 +387,7 @@ A lab/stress-test run: logs every single poll (uncapped), polling every
 |---|---|---|
 | `config` (positional) | — | Path to a gateway `.ini` file (see §3.4). |
 | `--db` | `gateway.sqlite3` | SQLite file to write to. Created automatically if it doesn't exist. |
-| `--interval` | `5.0` | Seconds to sleep between poll cycles (how often the machine is asked). |
+| `--interval` | `5.0` | Seconds to sleep between poll cycles (how often the machine is asked). Restricted to `0.2`-`5.0` — SAS 6.02 §2.3.3's own hard bounds for polling a single machine, rejected outright outside that range rather than just documented (see §4.4). |
 | `--cycles` | `0` | Stop after this many cycles. `0` means run until Ctrl-C. |
 | `--mode` | `ring` | `ring` (capped history, decoupled cadence — the deploy default) or `append` (uncapped, every poll — lab/stress use). |
 | `--history-cap` | `200` | Max rows kept in the history table in `ring` mode. Ignored in `append` mode. |
@@ -437,7 +442,12 @@ Annex D-09: SAS delivers exactly one pending exception per poll, and if
 the host doesn't drain it fast enough the next exception silently
 overwrites it — "the mirror of ghost redemption," a real event that
 leaves no trail at all. Setting `--general-poll-retries 1` disables the
-extra attempts and restores the plain one-shot behavior. Once a poll
+extra attempts and restores the plain one-shot behavior. "Immediate" is
+paced, not zero-delay: SAS 6.02 §2.3.3 forbids polling a single machine
+faster than once per 200 ms, so a retry that fails fast (not a timeout
+— a checksum error, say) still waits out whatever's left of that
+window before trying again; a retry that already took 200 ms or more
+(a timeout, typically) fires again with no extra wait. Once a poll
 succeeds (first attempt or a later one), its exception code is
 dispatched exactly as before:
 
@@ -450,8 +460,19 @@ dispatched exactly as before:
   that decision correctly. Left unredeemed, the machine returns the
   ticket to the player on its own after a spec-guaranteed 30-second
   timeout — so running this against a real machine never risks an
-  incorrect payout, it just means `ticket_in_events` records that a
-  ticket came in, not what became of it.
+  incorrect payout.
+- Exception `0x68` (ticket transfer complete — the redemption cycle
+  finished, stacked or rejected, not which one per the spec's own
+  Appendix A note) → read the completion status via
+  `redeem_ticket_status()` (long poll `0x71` with transfer code `FF`,
+  a safe read-only status query — never a real `redeem_ticket()` call)
+  and insert it into `ticket_in_completions`. `machine_status` `0xFF`
+  ("no completed cycle since last polled") is logged as-is, not
+  filtered — it means the exception fired but the cycle was already
+  gone by the time this read landed, which is itself worth knowing,
+  not an error. Nothing here correlates a completion back to the
+  insertion that started its cycle — SAS gives no shared ID to join
+  on, so the two tables are independent logs; see §6.3.
 - Exception `0x3D` or `0x3E` (a ticket-out record is ready) → drain
   *every* currently-unread ticket-out record (long poll `0x4D`,
   function code `0x00`, which marks each one read as it goes) into
@@ -904,6 +925,16 @@ CREATE TABLE IF NOT EXISTS ticket_in_events (
     synced_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS ticket_in_completions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    machine_status INTEGER,
+    amount_cents INTEGER,
+    parsing_code INTEGER,
+    validation_data_hex TEXT,
+    synced_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS validation_pool (
     validation_number INTEGER PRIMARY KEY,
     validation_system_id INTEGER NOT NULL,
@@ -984,27 +1015,39 @@ brand-new or infinitely old.
   looks reasonable right up until two sources disagree about what that
   detail means.
 - **Only the event stream drains; meter history never does.**
-  `poll_errors`, `ticket_out_history`, and `ticket_in_events` are this
-  example's event stream — real, per-occurrence records a future sync
-  process is meant to eventually acknowledge and clear (see §6.6 for
-  the general `synced_at` pattern). `meters_current` and
-  `meters_history` deliberately carry no `synced_at` column at all —
-  they're a local diagnostic buffer, not a queue, and there's nothing
-  for a sync column to mean on a table that's read in place and never
-  drained. The distinction is what a row *means*, not which table it
-  happens to live in: a meter reading is a snapshot you can afford to
-  lose (another poll gets you a fresh one); a ticket event is the only
-  record that a specific thing happened at a specific time, and losing
-  it is not recoverable by polling again.
+  `poll_errors`, `ticket_out_history`, `ticket_in_events`, and
+  `ticket_in_completions` are this example's event stream — real,
+  per-occurrence records a future sync process is meant to eventually
+  acknowledge and clear (see §6.6 for the general `synced_at` pattern).
+  `meters_current` and `meters_history` deliberately carry no
+  `synced_at` column at all — they're a local diagnostic buffer, not a
+  queue, and there's nothing for a sync column to mean on a table
+  that's read in place and never drained. The distinction is what a
+  row *means*, not which table it happens to live in: a meter reading
+  is a snapshot you can afford to lose (another poll gets you a fresh
+  one); a ticket event is the only record that a specific thing
+  happened at a specific time, and losing it is not recoverable by
+  polling again.
 - **A table with `synced_at` and nothing consuming it yet is still
-  correct.** `ticket_out_history` and `ticket_in_events` carry the
-  column even though this reference tool has no real drain process to
-  ever set it — see §4.4. That's deliberate, not premature: the column
-  is what makes the eventual, correct cleanup query obvious and safe
-  (`DELETE ... WHERE synced_at IS NOT NULL`), and its absence is what
-  would make "just cap it at N rows" look like the only available
-  option. Add the column for what a table *is* — here, an audit-style
-  event log — not only once something exists to populate it.
+  correct.** `ticket_out_history`, `ticket_in_events`, and
+  `ticket_in_completions` carry the column even though this reference
+  tool has no real drain process to ever set it — see §4.4. That's
+  deliberate, not premature: the column is what makes the eventual,
+  correct cleanup query obvious and safe (`DELETE ... WHERE synced_at
+  IS NOT NULL`), and its absence is what would make "just cap it at N
+  rows" look like the only available option. Add the column for what a
+  table *is* — here, an audit-style event log — not only once
+  something exists to populate it.
+- **Two related events don't need a shared table if nothing correlates
+  them.** `ticket_in_events` (exception `0x67`, an insertion) and
+  `ticket_in_completions` (exception `0x68`, how that cycle ended) are
+  about the same underlying ticket, but SAS gives no ID that ties one
+  to the other — no sequence number, no shared key, nothing. Bolting
+  them into one table would invite treating adjacent rows as related
+  when they might not be (two tickets inserted in quick succession).
+  Two independent append-only logs, correlated later by whoever
+  consumes them (timestamp proximity, `validation_data_hex`) if they
+  need to be, is the honest shape for data SAS itself doesn't link.
 - **A table you spend from needs a status column; a table you only
   observe doesn't.** Every other table here is written by the poller
   and read by someone else. `validation_pool` is the opposite: this
