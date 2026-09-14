@@ -540,6 +540,72 @@ def test_gauge_fields_decreasing_does_not_arm_the_burst_window():
     assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
 
 
+# --- meter poll timing: real wall-clock measurement, not a theoretical
+#     estimate -- see poll_and_log()'s ``interval`` parameter -----------------
+
+
+def test_meter_poll_timing_is_reported(capsys):
+    conn = make_db()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()])
+    times = iter([0.0, 2.5])
+    poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times))
+    assert "meter_poll=2.500s/47polls" in capsys.readouterr().out
+
+
+def test_meter_poll_count_reflects_skip_full_meter_sweep(capsys):
+    conn = make_db()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()])
+    times = iter([0.0, 0.05])
+    poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), full_meter_sweep=False)
+    assert "meter_poll=0.050s/8polls" in capsys.readouterr().out
+
+
+def test_meter_poll_at_or_above_interval_warns(capsys):
+    conn = make_db()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()])
+    times = iter([0.0, 2.5])
+    poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), interval=2.0)
+    out = capsys.readouterr().out
+    assert "WARNING: meter poll took 2.500s across 47 long-poll exchanges" in out
+    assert "--interval 2.0s" in out
+
+
+def test_meter_poll_under_interval_does_not_warn(capsys):
+    conn = make_db()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()])
+    times = iter([0.0, 0.1])
+    poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), interval=5.0)
+    assert "WARNING: meter poll" not in capsys.readouterr().out
+
+
+def test_interval_none_default_never_warns_regardless_of_elapsed(capsys):
+    conn = make_db()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()])
+    times = iter([0.0, 999.0])
+    poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times))  # interval defaults to None
+    assert "WARNING: meter poll" not in capsys.readouterr().out
+
+
+def test_meter_poll_failure_still_reports_elapsed_time(capsys):
+    conn = make_db()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()], meters_11_15=SASTimeoutError("no response"))
+    times = iter([0.0, 1.234])
+    poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times))
+    assert "meters poll failed after 1.234s" in capsys.readouterr().out
+
+
 # --- ring mode: cadence, cap, and burst behavior ---
 
 

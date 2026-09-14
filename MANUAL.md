@@ -501,10 +501,25 @@ before — see §6.3), and **nothing** is written to `meters_current` or
 `meters_history` that cycle. The loop continues after `--interval`
 seconds either way; one bad exchange — a timeout, a checksum failure,
 anything — never stops the run. `--skip-full-meter-sweep` is the
-practical lever if this many polls per cycle (six grouped polls plus
-~39 single-meter ones) is more wire traffic than your hardware or
-`--interval` can absorb — it drops the ~39-poll sweep specifically
-(leaving its columns `NULL` that cycle) while keeping every grouped poll.
+practical lever if this many polls per cycle (8 grouped polls plus
+~39 single-meter ones, 47 total) is more wire traffic than your
+hardware or `--interval` can absorb — it drops the ~39-poll sweep
+specifically (leaving its columns `NULL` that cycle) while keeping
+every grouped poll.
+
+**Is 47 exchanges a cycle actually fast enough on real hardware?**
+This manual won't guess — every cycle's own log line answers it
+directly: `meter_poll=X.XXXs/N polls` is measured wall-clock time
+against whatever `sql_poll_logger.py` is actually talking to, not a
+theoretical wire-speed calculation. Run it against your lab's real
+EGM(s) and read that number back; if it's a meaningful fraction of
+`--interval`, you'll also get an unmissable `WARNING: meter poll took
+X.XXXs ... at or above --interval Ns` line the moment the sweep alone
+doesn't leave room for the general poll and the configured sleep. At
+that point `--skip-full-meter-sweep` (drop the ~39-poll sweep) or a
+larger `--interval` are the two practical levers — which one depends on
+whether you need those columns refreshed every cycle or can live with
+them stale/`NULL`.
 
 ### 4.5 Troubleshooting
 

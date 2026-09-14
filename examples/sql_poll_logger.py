@@ -52,6 +52,14 @@ What each cycle does, in order:
    cycle's entire meter write, rather than saving a row that's fresh in
    some columns and stale or missing in others.
 
+Every cycle's log line reports how long the meter poll took and across
+how many long-poll exchanges (``meter_poll=X.XXXs/N polls``) — measured
+wall-clock time against whatever this ran against, not a theoretical
+number. That's the real answer to "does this many polls fit inside
+--interval on real hardware," and it comes with a WARNING if the meter
+poll alone is at or above --interval, with no separate flag needed to
+turn it on. --skip-full-meter-sweep is the lever if it doesn't fit.
+
 On startup, the full ticket-out buffer (indices 1-31, non-destructive —
 see send_enhanced_validation_information()'s docstring) is also read
 once into ticket_out_history, so you get whatever the machine is already
@@ -316,6 +324,14 @@ ALL_METER_FIELDS = (
     + tuple(SINGLE_METER_COLUMNS.values())
 )
 DECREASE_CHECK_FIELDS = tuple(f for f in ALL_METER_FIELDS if f not in GAUGE_METER_FIELDS)
+
+# The 8 long-poll exchanges _poll_all_meters() always makes, regardless of
+# --skip-full-meter-sweep: send_meters_10_through_15, send_selected_meters
+# (ticket meters), send_meters_11_through_15, send_extended_meters_group,
+# send_games_since_power_up_and_door_closure, send_total_bill_meters,
+# send_total_hand_paid_cancelled_credits, send_current_hopper_status. Used
+# only to report how many exchanges a cycle's meter_poll timing covered.
+GROUPED_METER_POLL_COUNT = 8
 
 _METER_COLUMN_DDL = ",\n    ".join(f"{field} INTEGER" for field in ALL_METER_FIELDS)
 
@@ -796,6 +812,7 @@ def poll_and_log(
     db_size_warning_mb: int = 0,
     db_size_fn=_db_file_size_bytes,
     full_meter_sweep: bool = True,
+    interval: float | None = None,
 ) -> None:
     """Run one full cycle: a general poll (dispatching to ticket-in/
     ticket-out capture on the relevant exception codes), then the full
@@ -809,6 +826,18 @@ def poll_and_log(
     the database file is at or above that size — an early signal ahead
     of an actual full-partition write failure, not a substitute for
     _safe_commit()'s own fault reporting when one happens anyway.
+
+    Every cycle's log line reports how long the meter poll itself took
+    and how many long-poll exchanges that was (``meter_poll=X.XXXs/N
+    polls``) — this is measured wall-clock time against whatever's on
+    the other end of ``client``, not a theoretical figure, so it's the
+    real answer to "does the meter sweep fit in --interval on this
+    hardware." Pass ``interval`` (the caller's own poll-cycle interval,
+    e.g. --interval) to also get a WARNING if the meter poll alone is at
+    or above it — a sign this cycle's own meter sweep doesn't leave any
+    slack for the general poll or the configured sleep, and
+    --skip-full-meter-sweep or a larger --interval is worth considering.
+    ``interval=None`` (the default) skips that comparison.
     """
     now = now_fn()
 
@@ -843,14 +872,27 @@ def poll_and_log(
     try:
         values = _poll_all_meters(client, full_sweep=full_meter_sweep)
     except _MeterPollFailure as failure:
+        meter_poll_elapsed = monotonic_fn() - mono_now
         conn.execute(
             "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
             (now, failure.poll_name, type(failure.original).__name__, str(failure.original)),
         )
         _safe_commit(conn, now)
         state.burst_remaining = max(state.burst_remaining, history.burst_count)
-        print(f"[{now}] meters poll failed ({failure.poll_name}): {type(failure.original).__name__}: {failure.original}")
+        print(
+            f"[{now}] meters poll failed after {meter_poll_elapsed:.3f}s ({failure.poll_name}): "
+            f"{type(failure.original).__name__}: {failure.original}"
+        )
         return
+
+    meter_poll_elapsed = monotonic_fn() - mono_now
+    meter_poll_count = GROUPED_METER_POLL_COUNT + (len(SINGLE_METER_COLUMNS) if full_meter_sweep else 0)
+    if interval is not None and meter_poll_elapsed >= interval:
+        print(
+            f"[{now}] WARNING: meter poll took {meter_poll_elapsed:.3f}s across {meter_poll_count} long-poll "
+            f"exchanges — at or above --interval {interval}s. This cycle's meter sweep alone doesn't leave "
+            "room for the general poll or the configured sleep. Consider --skip-full-meter-sweep or a larger --interval."
+        )
 
     columns = ", ".join(ALL_METER_FIELDS)
     qmarks = ", ".join("?" for _ in ALL_METER_FIELDS)
@@ -903,7 +945,8 @@ def poll_and_log(
     print(
         f"[{now}] coin_in={values['total_coin_in']} coin_out={values['total_coin_out']} "
         f"games_played={values['games_played']} ticket_in_cashable_cents={values['ticket_in_cashable_cents']} "
-        f"ticket_out_cashable_cents={values['ticket_out_cashable_cents']} — {note}"
+        f"ticket_out_cashable_cents={values['ticket_out_cashable_cents']} "
+        f"meter_poll={meter_poll_elapsed:.3f}s/{meter_poll_count}polls — {note}"
     )
 
 
@@ -1021,6 +1064,7 @@ def main() -> int:
                 history,
                 db_size_warning_mb=args.db_size_warning_mb,
                 full_meter_sweep=not args.skip_full_meter_sweep,
+                interval=args.interval,
             )
             time.sleep(args.interval)
     except KeyboardInterrupt:
