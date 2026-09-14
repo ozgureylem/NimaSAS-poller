@@ -77,6 +77,15 @@ ticket-in buffer the way it has one for ticket-out (LP 4D). If you need
 a full ticket-in audit trail, this tool has to be running continuously
 from before the first ticket you care about.
 
+Nothing here ever deletes a ticket-in or ticket-out row to free space,
+even under sustained disk pressure — that decision belongs to whatever
+eventually syncs this data to a server (see synced_at, below), matching
+the project's own Technical v3 §5.9: "Prune on confirmed ACK, never on
+a timer." Instead: a write that actually fails (almost always a full
+partition) is reported loudly rather than silently dropped — see
+_safe_commit() — and --db-size-warning-mb gives you an early signal
+before that happens, not just a fault report after.
+
 Two history modes for meters, chosen with --mode (see MANUAL.md §4 and
 §6 for the full reasoning):
 
@@ -109,6 +118,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import os
 import random
 import sqlite3
 import sys
@@ -166,6 +176,7 @@ CREATE TABLE IF NOT EXISTS ticket_out_history (
     validation_system_id INTEGER,
     expiration TEXT,
     pool_id INTEGER,
+    synced_at TEXT,
     UNIQUE(validation_number, ticket_date, ticket_time)
 );
 
@@ -174,7 +185,8 @@ CREATE TABLE IF NOT EXISTS ticket_in_events (
     captured_at TEXT NOT NULL,
     amount_cents INTEGER,
     parsing_code INTEGER,
-    validation_data_hex TEXT
+    validation_data_hex TEXT,
+    synced_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS validation_pool (
@@ -203,12 +215,20 @@ CREATE TABLE IF NOT EXISTS validation_pool (
 # both observe the same physical ticket, and a ring buffer position gets
 # reused over time, so buffer_index alone is not a stable identity.
 #
-# Neither meters table nor the ticket tables carry a synced_at column.
-# That pattern belongs to the event stream (poll_errors, and this
-# project's broader event handling), which a separate drain process
-# consumes and acknowledges. These are local diagnostic/capture buffers,
-# not a queue — they're never drained by this tool, so there's nothing
-# for a synced_at column to mean here.
+# Neither meters table carries a synced_at column — they're a local
+# diagnostic buffer, not a queue, and there's nothing for a sync column
+# to mean on a table that's never drained (see §6.6's synced_at
+# discussion). ticket_out_history and ticket_in_events are different:
+# per Technical v3 §5.9, ticket events ARE the event stream ("sas_events
+# — append-only, drained on invitation, pruned on confirmed ACK"), so
+# they carry synced_at even though this reference tool has no real
+# drain process to ever set it. The column exists so a future one can,
+# and so the correct future cleanup query is obvious and safe:
+# `DELETE ... WHERE synced_at IS NOT NULL` — never a row-count cap,
+# and never anything keyed on age or local disk pressure alone. This
+# tool does not implement that deletion itself; see the module
+# docstring's note on why sustained disk pressure is reported loudly
+# instead of resolved by deleting unsynced rows.
 #
 # validation_pool is different in kind from every other table here: it's
 # not something this tool observes, it's something this tool spends
@@ -257,6 +277,45 @@ def utc_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _safe_commit(conn: sqlite3.Connection, now: str) -> bool:
+    """Commit, or print a loud, impossible-to-miss fault to stderr and
+    return False rather than raising or failing silently. A commit
+    failure here is almost always SQLITE_FULL — the partition holding
+    the database file is out of space, most likely during an extended
+    network outage with nothing draining this data. Per this project's
+    own Technical v3 §5.9: "If the event-write path does not handle
+    this explicitly, the gateway silently stops buffering and the
+    original no-buffer defect is back. This must fail loudly." This
+    never deletes anything to make room — see the module docstring.
+    """
+    try:
+        conn.commit()
+        return True
+    except sqlite3.OperationalError as e:
+        print(
+            f"[{now}] FAULT: database write failed ({e}) — most likely the partition "
+            "holding the database file is full. This row was not saved. This tool will "
+            "never delete existing rows to make room; free space on the partition or "
+            "move the database file.",
+            file=sys.stderr,
+        )
+        return False
+
+
+def _db_file_size_bytes(conn: sqlite3.Connection) -> int | None:
+    """Best-effort size, in bytes, of the main database file backing
+    ``conn`` — or None if it can't be determined (an in-memory database,
+    used throughout this project's own test suite, has no file to size).
+    """
+    try:
+        for _seq, name, file in conn.execute("PRAGMA database_list"):
+            if name == "main" and file:
+                return os.path.getsize(file)
+    except (sqlite3.Error, OSError):
+        pass
+    return None
+
+
 def _is_empty_ticket_out_record(record: EnhancedValidationInfo) -> bool:
     """Per §15.10: "If no unread records are in the buffer, all fields in
     the long poll 4D response will be zero" — same for an unused/invalid
@@ -287,7 +346,7 @@ def _insert_ticket_out_record(conn: sqlite3.Connection, record: EnhancedValidati
             record.pool_id,
         ),
     )
-    conn.commit()
+    _safe_commit(conn, captured_at)
 
 
 def backfill_ticket_out_history(client, conn: sqlite3.Connection, *, now_fn=utc_now) -> int:
@@ -308,7 +367,7 @@ def backfill_ticket_out_history(client, conn: sqlite3.Connection, *, now_fn=utc_
                 "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
                 (now, "send_enhanced_validation_information(backfill)", type(e).__name__, str(e)),
             )
-            conn.commit()
+            _safe_commit(conn, now)
             continue
         if _is_empty_ticket_out_record(record):
             continue
@@ -335,7 +394,7 @@ def _drain_ticket_out_history(client, conn: sqlite3.Connection, now: str) -> Non
                 "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
                 (now, "send_enhanced_validation_information(drain)", type(e).__name__, str(e)),
             )
-            conn.commit()
+            _safe_commit(conn, now)
             return
         if _is_empty_ticket_out_record(record):
             return
@@ -370,7 +429,7 @@ def seed_validation_pool(
         except sqlite3.IntegrityError:
             continue  # collided with an existing validation_number (primary key) — try another
         added += 1
-    conn.commit()
+    _safe_commit(conn, utc_now())
     return added
 
 
@@ -387,7 +446,7 @@ def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
             "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
             (now, "send_pending_cashout_info", type(e).__name__, str(e)),
         )
-        conn.commit()
+        _safe_commit(conn, now)
         return
     if info.cashout_type == 0x80:
         return  # "not waiting for system validation" (Table 15.7b) — the exception fired, but the race is over
@@ -401,7 +460,7 @@ def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
             "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
             (now, "validation_pool", "PoolExhausted", f"no available validation number for amount_cents={info.amount_cents}"),
         )
-        conn.commit()
+        _safe_commit(conn, now)
         print(f"[{now}] cashout pending (amount_cents={info.amount_cents}) but validation_pool is empty — left unanswered")
         return
 
@@ -415,7 +474,7 @@ def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
             "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
             (now, "send_validation_number", type(e).__name__, str(e)),
         )
-        conn.commit()
+        _safe_commit(conn, now)
         return
 
     if status == 0x00:
@@ -424,7 +483,7 @@ def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
             "WHERE validation_number = ?",
             (now, info.amount_cents, validation_number),
         )
-        conn.commit()
+        _safe_commit(conn, now)
         print(f"[{now}] cashout answered: validation_number={validation_number} amount_cents={info.amount_cents}")
     else:
         # 0x80 not in cashout, 0x81 improper validation rejected (Table 15.8b) — the number was never
@@ -444,7 +503,7 @@ def _capture_ticket_in(client, conn: sqlite3.Connection, now: str) -> None:
             "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
             (now, "send_ticket_validation_data", type(e).__name__, str(e)),
         )
-        conn.commit()
+        _safe_commit(conn, now)
         return
     if not ticket.ticket_in_escrow:
         return  # exception fired, but nothing in escrow by the time we read it — rare, harmless race
@@ -453,7 +512,7 @@ def _capture_ticket_in(client, conn: sqlite3.Connection, now: str) -> None:
         "VALUES (?, ?, ?, ?)",
         (now, ticket.amount_cents, ticket.parsing_code, ticket.validation_data.hex()),
     )
-    conn.commit()
+    _safe_commit(conn, now)
     print(f"[{now}] ticket-in captured: amount_cents={ticket.amount_cents} (not redeemed — see module docstring)")
 
 
@@ -466,6 +525,8 @@ def poll_and_log(
     anomaly: bool = False,
     now_fn=utc_now,
     monotonic_fn=time.monotonic,
+    db_size_warning_mb: int = 0,
+    db_size_fn=_db_file_size_bytes,
 ) -> None:
     """Run one full cycle: a general poll (dispatching to ticket-in/
     ticket-out capture on the relevant exception codes), then the meters
@@ -473,9 +534,21 @@ def poll_and_log(
     meters_history according to ``history``'s mode/cadence/cap, or
     immediately (for the next ``history.burst_count`` cycles) on a meter
     decrease, a failed poll, or an ``anomaly=True`` signal from the
-    caller.
+    caller. ``db_size_warning_mb`` (0 = disabled) prints a warning every
+    cycle the database file is at or above that size — an early signal
+    ahead of an actual full-partition write failure, not a substitute
+    for _safe_commit()'s own fault reporting when one happens anyway.
     """
     now = now_fn()
+
+    if db_size_warning_mb:
+        size = db_size_fn(conn)
+        if size is not None and size >= db_size_warning_mb * 1024 * 1024:
+            print(
+                f"[{now}] WARNING: database file is {size / (1024 * 1024):.1f} MB, at or above "
+                f"--db-size-warning-mb {db_size_warning_mb} — check available space on its partition. "
+                "This tool never deletes ticket/event rows to free space; see the module docstring."
+            )
 
     try:
         exception_code = client.general_poll()
@@ -484,7 +557,7 @@ def poll_and_log(
             "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
             (now, "general_poll", type(e).__name__, str(e)),
         )
-        conn.commit()
+        _safe_commit(conn, now)
         print(f"[{now}] general poll failed: {type(e).__name__}: {e}")
     else:
         if exception_code == ExceptionCode.TICKET_INSERTED:
@@ -503,7 +576,7 @@ def poll_and_log(
             "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
             (now, "send_meters_10_through_15", type(e).__name__, str(e)),
         )
-        conn.commit()
+        _safe_commit(conn, now)
         state.burst_remaining = max(state.burst_remaining, history.burst_count)
         print(f"[{now}] meters poll failed: {type(e).__name__}: {e}")
         return
@@ -548,7 +621,7 @@ def poll_and_log(
                 (history.cap,),
             )
 
-    conn.commit()
+    _safe_commit(conn, now)
     state.last_meters = values
 
     note = "history written" if write_history else "history skipped (cadence)"
@@ -609,6 +682,14 @@ def main() -> int:
         help="top up validation_pool to at least N 'available' rows with random test numbers "
         "(default: 0, don't seed — hand-insert real numbers yourself if you have them)",
     )
+    parser.add_argument(
+        "--db-size-warning-mb",
+        type=int,
+        default=0,
+        metavar="MB",
+        help="print a warning every cycle the database file is at or above this size, as an early "
+        "signal before a full partition actually fails a write (default: 0, disabled)",
+    )
     args = parser.parse_args()
 
     history = HistoryConfig(
@@ -649,7 +730,7 @@ def main() -> int:
     try:
         while args.cycles == 0 or cycle < args.cycles:
             cycle += 1
-            poll_and_log(client, conn, state, history)
+            poll_and_log(client, conn, state, history, db_size_warning_mb=args.db_size_warning_mb)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nStopped.")

@@ -356,6 +356,7 @@ A lab/stress-test run: logs every single poll (uncapped), polling every
 | `--burst-count` | `10` | Consecutive polls logged at full resolution, ignoring `--history-interval`, right after a meter decrease or a failed poll. |
 | `--skip-ticket-out-backfill` | off | Skip the one-time startup read of the full ticket-out buffer (indices 1–31). |
 | `--seed-validation-pool N` | `0` | Top up `validation_pool` to at least `N` `available` rows with random 16-digit test numbers. `0` means don't seed — do this if you're hand-inserting real numbers instead. |
+| `--db-size-warning-mb MB` | `0` | Print a warning every cycle the database file is at or above this size — an early signal, not a substitute for the loud failure a full partition already produces on its own (see §4.4). `0` disables it. |
 
 ### 4.4 What's actually happening (technical)
 
@@ -422,6 +423,20 @@ here its return value — the exception code — is actually acted on:
 
 A `SASError` on the general poll itself is logged to `poll_errors` and
 the cycle moves on to meters anyway — it doesn't block anything.
+
+**Every write goes through `_safe_commit()`**, not a bare `conn.commit()`
+— if the commit fails (almost always `SQLITE_FULL`, the partition
+holding the database file is out of space), it's reported loudly to
+stderr rather than raised or silently dropped, and the loop continues.
+This tool never deletes an existing row to make room, regardless of how
+long that takes to matter — see §6.3's `synced_at` discussion for why,
+and why that decision belongs to a future real sync process, not to
+this tool guessing at a safe row count to keep. `--db-size-warning-mb`
+gives you a signal *before* that happens: every cycle, if given, it
+checks the database file's size and prints a warning once it's at or
+above the threshold — a heads-up, not a fix, and not required for the
+loud-failure behavior above, which happens regardless of whether you set
+it.
 
 **2. Meters.** `client.send_meters_10_through_15()` (long poll `0x0F`).
 On success, `meters_current` (always exactly one row) is overwritten
@@ -504,6 +519,13 @@ anything — never stops the run.
   assuming the pool numbers themselves are the problem. Rejected
   numbers are left `available` for reuse, so this doesn't burn through
   the pool on its own.
+- **A `FAULT: database write failed` line appears on stderr**: the
+  partition holding the database file is almost certainly full — that
+  row was not saved, and none of this tool's other rows were deleted to
+  make room (§4.4/§6.6 explain why it never does that). Free space on
+  that partition, or move the database file to one with more; running
+  with `--db-size-warning-mb` set going forward gives you a warning
+  before this happens instead of only after.
 
 ---
 
@@ -720,6 +742,7 @@ CREATE TABLE IF NOT EXISTS ticket_out_history (
     validation_system_id INTEGER,
     expiration TEXT,
     pool_id INTEGER,
+    synced_at TEXT,
     UNIQUE(validation_number, ticket_date, ticket_time)
 );
 
@@ -728,7 +751,8 @@ CREATE TABLE IF NOT EXISTS ticket_in_events (
     captured_at TEXT NOT NULL,
     amount_cents INTEGER,
     parsing_code INTEGER,
-    validation_data_hex TEXT
+    validation_data_hex TEXT,
+    synced_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS validation_pool (
@@ -792,13 +816,27 @@ CREATE TABLE IF NOT EXISTS validation_pool (
   looks reasonable right up until two sources disagree about what that
   detail means.
 - **Only the event stream drains; meter history never does.**
-  `poll_errors` is this example's event stream, and in the wider
-  project a drain/sync process is what eventually acknowledges and
-  clears events like it (see §6.6 for the `synced_at` pattern that
-  applies there). `meters_current` and `meters_history` deliberately
-  carry no `synced_at` column at all — they're a local diagnostic
-  buffer, not a queue, and there's nothing for a sync column to mean
-  on a table that's read in place and never drained.
+  `poll_errors`, `ticket_out_history`, and `ticket_in_events` are this
+  example's event stream — real, per-occurrence records a future sync
+  process is meant to eventually acknowledge and clear (see §6.6 for
+  the general `synced_at` pattern). `meters_current` and
+  `meters_history` deliberately carry no `synced_at` column at all —
+  they're a local diagnostic buffer, not a queue, and there's nothing
+  for a sync column to mean on a table that's read in place and never
+  drained. The distinction is what a row *means*, not which table it
+  happens to live in: a meter reading is a snapshot you can afford to
+  lose (another poll gets you a fresh one); a ticket event is the only
+  record that a specific thing happened at a specific time, and losing
+  it is not recoverable by polling again.
+- **A table with `synced_at` and nothing consuming it yet is still
+  correct.** `ticket_out_history` and `ticket_in_events` carry the
+  column even though this reference tool has no real drain process to
+  ever set it — see §4.4. That's deliberate, not premature: the column
+  is what makes the eventual, correct cleanup query obvious and safe
+  (`DELETE ... WHERE synced_at IS NOT NULL`), and its absence is what
+  would make "just cap it at N rows" look like the only available
+  option. Add the column for what a table *is* — here, an audit-style
+  event log — not only once something exists to populate it.
 - **A table you spend from needs a status column; a table you only
   observe doesn't.** Every other table here is written by the poller
   and read by someone else. `validation_pool` is the opposite: this
@@ -874,17 +912,24 @@ planning documents, which are being shared with the team separately.
 
 What's worth knowing here, generically, is the shape of the pattern:
 a table that's actually a queue of things to acknowledge — this
-example's `poll_errors` is one; the wider project's own event stream is
-another — can carry a `synced_at` column, left `NULL` until a sync
-process marks a row handled. That gives any future sync process a
-cheap, obvious query (`WHERE synced_at IS NULL`) to find unacknowledged
-rows, without the local poller needing to know anything about how or
-where syncing happens, what transport it uses, or how often it runs.
-That separation of concerns — the poller's only job is "poll reliably
-and log everything, including failures"; a sync process's only job is
-"move rows somewhere and mark them synced" — is the one piece of
+example's `poll_errors`, `ticket_out_history`, and `ticket_in_events`
+are all one; the wider project's own event stream is another — can
+carry a `synced_at` column, left `NULL` until a sync process marks a
+row handled. That gives any future sync process a cheap, obvious query
+(`WHERE synced_at IS NULL`) to find unacknowledged rows, without the
+local poller needing to know anything about how or where syncing
+happens, what transport it uses, or how often it runs. That separation
+of concerns — the poller's only job is "poll reliably and log
+everything, including failures"; a sync process's only job is "move
+rows somewhere and mark them synced" — is the one piece of
 forward-looking design here worth carrying into whatever you build
-next.
+next. It also settles what a local disk-pressure problem should do:
+nothing, on its own. Freeing space by deleting unsynced rows means
+guessing that a row won't be needed — a guess only the sync process
+(or a human, deliberately) is in a position to make correctly. The
+poller's job under pressure is to fail loudly (§4.4's `_safe_commit()`)
+and optionally warn early (`--db-size-warning-mb`), not to pick which
+records to keep.
 
 That pattern belongs to the event stream specifically, and *only* the
 event stream. It's deliberately not on `meters_current` or
