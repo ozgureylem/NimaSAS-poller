@@ -17,7 +17,7 @@ import pytest
 from saspy.bcd import encode_bcd
 from saspy.binary import encode_binary_le
 from saspy.client import SASClient
-from saspy.constants import MeterCode
+from saspy.constants import LongPoll, MeterCode
 from saspy.crc import crc16_bytes
 from saspy.exceptions import SASEncodingError, SASError
 from saspy.transport import SASTransport
@@ -71,12 +71,12 @@ def test_send_meters_10_through_15():
     assert meters.games_played == 600
 
 
-def test_send_meters_11_through_15_extended():
+def test_send_extended_meters_group():
     body = bytes([ADDRESS, 0x1C])
     values = [11, 12, 13, 14, 15, 16, 17, 18]
     for v in values:
         body += encode_bcd(v, 4)
-    meters = make_client(body).send_meters_11_through_15_extended()
+    meters = make_client(body).send_extended_meters_group()
     assert (
         meters.total_coin_in,
         meters.total_coin_out,
@@ -494,3 +494,193 @@ def test_redeem_ticket_status_reports_current_cycle():
     result = make_client(body).redeem_ticket_status()
     assert result.machine_status == 0x00
     assert result.amount_cents == 4750
+
+
+# -- Simple single-meter reads (Table 7.1) -----------------------------------
+
+
+def test_send_meter_reads_a_four_byte_bcd_meter():
+    body = bytes([ADDRESS, 0x11]) + encode_bcd(987654, 4)
+    value = make_client(body).send_meter(LongPoll.SEND_TOTAL_COIN_IN_METER)
+    assert value == 987654
+
+
+def test_send_meter_reads_a_two_byte_bcd_meter():
+    body = bytes([ADDRESS, 0x51]) + encode_bcd(12, 2)
+    value = make_client(body).send_meter(LongPoll.SEND_TOTAL_GAMES_IMPLEMENTED)
+    assert value == 12
+
+
+def test_send_meter_rejects_a_non_meter_poll():
+    transport = SASTransport(FakeSerial(b""))
+    client = SASClient(transport, ADDRESS)
+    with pytest.raises(SASError):
+        client.send_meter(LongPoll.REDEEM_TICKET)
+
+
+def test_send_games_since_power_up_and_door_closure():
+    body = bytes([ADDRESS, 0x18]) + encode_bcd(42, 2) + encode_bcd(7, 2)
+    result = make_client(body).send_games_since_power_up_and_door_closure()
+    assert result.games_since_power_up == 42
+    assert result.games_since_door_closure == 7
+
+
+def test_send_meters_11_through_15_is_the_real_0x19_poll():
+    body = bytes([ADDRESS, 0x19])
+    for v in (100, 200, 300, 400, 500):
+        body += encode_bcd(v, 4)
+    fake = FakeSerial(body + crc16_bytes(body))
+    transport = SASTransport(fake)
+    client = SASClient(transport, ADDRESS)
+    meters = client.send_meters_11_through_15()
+    assert meters.total_coin_in == 100
+    assert meters.games_played == 500
+    written = bytes(fake.written)
+    assert written[1] == 0x19  # not 0x1C
+
+
+def test_send_handpay_information():
+    body = bytes([ADDRESS, 0x1B, 0x02, 0x05])
+    body += encode_bcd(47500, 5)
+    body += encode_bcd(1200, 2)
+    body += bytes([0x01])
+    body += bytes(10)  # unused
+    result = make_client(body).send_handpay_information()
+    assert result.progressive_group == 0x02
+    assert result.level == 0x05
+    assert result.amount == 47500
+    assert result.partial_pay == 1200
+    assert result.reset_id == 1
+
+
+def test_send_total_bill_meters():
+    body = bytes([ADDRESS, 0x1E])
+    for v in (1, 5, 10, 20, 50, 100):
+        body += encode_bcd(v, 4)
+    result = make_client(body).send_total_bill_meters()
+    assert (result.bills_1, result.bills_5, result.bills_10, result.bills_20, result.bills_50, result.bills_100) == (
+        1,
+        5,
+        10,
+        20,
+        50,
+        100,
+    )
+
+
+def test_send_total_hand_paid_cancelled_credits():
+    body = bytes([ADDRESS, 0x2D]) + encode_bcd(1, 2) + encode_bcd(3300, 4)
+    value = make_client(body).send_total_hand_paid_cancelled_credits(game_number=1)
+    assert value == 3300
+
+
+def test_send_cash_out_ticket_information():
+    body = bytes([ADDRESS, 0x3D]) + encode_bcd(1234, 4) + encode_bcd(4750, 5)
+    result = make_client(body).send_cash_out_ticket_information()
+    assert result.ticket_number == 1234
+    assert result.amount_cents == 4750
+
+
+def test_send_current_hopper_status_with_level():
+    body = bytes([ADDRESS, 0x4F, 0x06, 0x00, 0x64]) + encode_bcd(500, 4)
+    result = make_client(body).send_current_hopper_status()
+    assert result.status == 0x00
+    assert result.percent_full == 0x64
+    assert result.level == 500
+
+
+def test_send_current_hopper_status_without_level():
+    body = bytes([ADDRESS, 0x4F, 0x02, 0x00, 0xFF])
+    result = make_client(body).send_current_hopper_status()
+    assert result.percent_full == 0xFF
+    assert result.level is None
+
+
+def test_send_game_n_meters():
+    body = bytes([ADDRESS, 0x52]) + encode_bcd(1, 2)
+    for v in (10, 20, 30, 40):
+        body += encode_bcd(v, 4)
+    result = make_client(body).send_game_n_meters(game_number=1)
+    assert result.game_number == 1
+    assert result.total_coin_in == 10
+    assert result.games_played == 40
+
+
+def test_send_game_n_configuration():
+    body = bytes([ADDRESS, 0x53]) + encode_bcd(1, 2)
+    body += b"AB" + b"001"  # game id + additional id
+    body += bytes([0x04, 0x05, 0x00])  # denom, max bet, progressive group
+    body += encode_binary_le(0x0203, 2)  # game options
+    body += b"PAYTBL" + b"9500"  # paytable id + base pct
+    result = make_client(body).send_game_n_configuration(game_number=1)
+    assert result.game_number == 1
+    assert result.game_id == "AB"
+    assert result.paytable_id == "PAYTBL"
+    assert result.game_options == 0x0203
+
+
+def test_send_selected_game_number():
+    body = bytes([ADDRESS, 0x55]) + encode_bcd(3, 2)
+    assert make_client(body).send_selected_game_number() == 3
+
+
+def test_send_enabled_game_numbers():
+    data = bytes([0x02]) + encode_bcd(1, 2) + encode_bcd(3, 2)
+    body = bytes([ADDRESS, 0x56, len(data)]) + data
+    result = make_client(body).send_enabled_game_numbers()
+    assert result == [1, 3]
+
+
+def test_send_current_date_and_time():
+    body = bytes([ADDRESS, 0x7E]) + encode_bcd(9142026, 4) + encode_bcd(153045, 3)
+    result = make_client(body).send_current_date_and_time()
+    assert result.date == "09142026"
+    assert result.time == "153045"
+
+
+def test_send_physical_reel_stop_information():
+    stops = bytes(range(1, 10))
+    body = bytes([ADDRESS, 0x8F]) + stops
+    result = make_client(body).send_physical_reel_stop_information()
+    assert result == stops
+
+
+def test_send_extended_meters_alternate_uses_0xaf_not_0x6f():
+    data = encode_bcd(0, 2) + encode_binary_le(0x1234, 2) + bytes([2]) + encode_bcd(99, 2)
+    body = bytes([ADDRESS, 0xAF, len(data)]) + data
+    fake = FakeSerial(body + crc16_bytes(body))
+    transport = SASTransport(fake)
+    client = SASClient(transport, ADDRESS)
+    result = client.send_extended_meters_alternate([0x1234])
+    assert result.meters[0x1234] == 99
+    written = bytes(fake.written)
+    assert written[1] == 0xAF
+
+
+def test_send_token_denomination():
+    body = bytes([ADDRESS, 0xB3, 0x04])
+    assert make_client(body).send_token_denomination() == 0x04
+
+
+def test_send_wager_category_information():
+    data = encode_bcd(0, 2) + encode_bcd(0, 2) + b"9500" + bytes([4]) + encode_bcd(123456, 4)
+    body = bytes([ADDRESS, 0xB4, len(data)]) + data
+    result = make_client(body).send_wager_category_information()
+    assert result.payback_percentage == "9500"
+    assert result.coin_in_meter == 123456
+
+
+def test_send_extended_game_n_information():
+    data = encode_bcd(0, 2)  # game number
+    data += encode_bcd(500, 2)  # max bet
+    data += bytes([0x01])  # progressive group
+    data += encode_binary_le(0x00000003, 4)  # progressive levels bitfield
+    data += bytes([3]) + b"ABC"  # game name
+    data += bytes([2]) + b"XY"  # paytable name
+    data += encode_bcd(1, 2)  # wager categories
+    body = bytes([ADDRESS, 0xB5, len(data)]) + data
+    result = make_client(body).send_extended_game_n_information()
+    assert result.max_bet == 500
+    assert result.game_name == "ABC"
+    assert result.paytable_name == "XY"
+    assert result.wager_categories == 1

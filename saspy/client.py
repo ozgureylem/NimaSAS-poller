@@ -18,7 +18,7 @@ from __future__ import annotations
 from . import models
 from .bcd import decode_bcd, encode_bcd
 from .binary import decode_binary_le, encode_binary_le
-from .constants import LONG_POLL_TYPES, METER_CODE_SIZES_BCD, LongPoll, PollType
+from .constants import LONG_POLL_TYPES, METER_CODE_SIZES_BCD, SIMPLE_METER_WIDTH_BCD, LongPoll, PollType
 from .exceptions import SASEncodingError, SASError
 from .framing import build_command, parse_response
 from .transport import SASTransport
@@ -41,6 +41,223 @@ class SASClient:
         response = self.transport.general_poll(self.address, timeout=self.timeout)
         return response[0]
 
+    # -- Single-meter reads (Table 7.1 / Appendix B) -------------------------
+
+    def send_meter(self, poll: LongPoll) -> int:
+        """Read one meter with a Table-7.1-style single-meter long poll —
+        a bare address+command request, response is just the BCD value
+        (see constants.SIMPLE_METER_WIDTH_BCD for the covered codes and
+        their widths). Individually redundant with send_meters_10_through_15()
+        for the six meters it overlaps, but each of these is a real,
+        addressable code in its own right.
+        """
+        width = SIMPLE_METER_WIDTH_BCD.get(poll)
+        if width is None:
+            raise SASError(f"{poll!r} is not a simple single-meter poll — see SIMPLE_METER_WIDTH_BCD")
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=1 + 1 + width + 2, timeout=self.timeout)
+        payload = self._strip(raw)
+        return decode_bcd(payload[1:1 + width])
+
+    def send_games_since_power_up_and_door_closure(self) -> models.GamesSincePowerUpAndDoorClosure:
+        poll = LongPoll.SEND_GAMES_SINCE_POWER_UP_AND_DOOR_CLOSURE
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=8, timeout=self.timeout)
+        payload = self._strip(raw)
+        return models.GamesSincePowerUpAndDoorClosure(
+            games_since_power_up=decode_bcd(payload[1:3]),
+            games_since_door_closure=decode_bcd(payload[3:5]),
+        )
+
+    def send_meters_11_through_15(self) -> models.Meters11Through15:
+        """Long poll 0x19 (Table 7.2b) — the real "meters 11 through 15".
+        Strictly a subset of send_meters_10_through_15()'s response (same
+        five fields minus cancelled credits); kept because 0x19 is a real,
+        independently addressable code, not because it adds information.
+        """
+        poll = LongPoll.SEND_METERS_11_THROUGH_15
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=24, timeout=self.timeout)
+        payload = self._strip(raw)
+        return models.Meters11Through15(
+            total_coin_in=decode_bcd(payload[1:5]),
+            total_coin_out=decode_bcd(payload[5:9]),
+            total_drop=decode_bcd(payload[9:13]),
+            total_jackpot=decode_bcd(payload[13:17]),
+            games_played=decode_bcd(payload[17:21]),
+        )
+
+    def send_handpay_information(self) -> models.HandpayInformation:
+        poll = LongPoll.HANDPAY_INFORMATION
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=24, timeout=self.timeout)
+        payload = self._strip(raw)
+        return models.HandpayInformation(
+            progressive_group=payload[1],
+            level=payload[2],
+            amount=decode_bcd(payload[3:8]),
+            partial_pay=decode_bcd(payload[8:10]),
+            reset_id=payload[10],
+        )
+
+    def send_total_bill_meters(self) -> models.BillMeters:
+        poll = LongPoll.TOTAL_BILL_METERS
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=28, timeout=self.timeout)
+        payload = self._strip(raw)
+        return models.BillMeters(
+            bills_1=decode_bcd(payload[1:5]),
+            bills_5=decode_bcd(payload[5:9]),
+            bills_10=decode_bcd(payload[9:13]),
+            bills_20=decode_bcd(payload[13:17]),
+            bills_50=decode_bcd(payload[17:21]),
+            bills_100=decode_bcd(payload[21:25]),
+        )
+
+    def send_total_hand_paid_cancelled_credits(self, game_number: int = 0) -> int:
+        poll = LongPoll.SEND_TOTAL_HAND_PAID_CANCELLED_CREDITS
+        command_and_data = bytes([poll]) + encode_bcd(game_number, 2)
+        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=10, timeout=self.timeout)
+        payload = self._strip(raw)
+        return decode_bcd(payload[3:7])
+
+    def send_cash_out_ticket_information(self) -> models.CashOutTicketInfo:
+        poll = LongPoll.SEND_CASH_OUT_TICKET_INFORMATION
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=13, timeout=self.timeout)
+        payload = self._strip(raw)
+        return models.CashOutTicketInfo(
+            ticket_number=decode_bcd(payload[1:5]),
+            amount_cents=decode_bcd(payload[5:10]),
+        )
+
+    def send_current_hopper_status(self) -> models.HopperStatus:
+        poll = LongPoll.SEND_CURRENT_HOPPER_STATUS
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        payload = self._strip(raw)
+        length = payload[1]
+        level = decode_bcd(payload[4:8]) if length == 6 else None
+        return models.HopperStatus(status=payload[2], percent_full=payload[3], level=level)
+
+    def send_game_n_meters(self, game_number: int = 0) -> models.GameNMeters:
+        poll = LongPoll.SEND_GAME_N_METERS
+        command_and_data = bytes([poll]) + encode_bcd(game_number, 2)
+        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=22, timeout=self.timeout)
+        payload = self._strip(raw)
+        return models.GameNMeters(
+            game_number=decode_bcd(payload[1:3]),
+            total_coin_in=decode_bcd(payload[3:7]),
+            total_coin_out=decode_bcd(payload[7:11]),
+            total_jackpot=decode_bcd(payload[11:15]),
+            games_played=decode_bcd(payload[15:19]),
+        )
+
+    def send_game_n_configuration(self, game_number: int = 0) -> models.GameNConfiguration:
+        poll = LongPoll.SEND_GAME_N_CONFIGURATION
+        command_and_data = bytes([poll]) + encode_bcd(game_number, 2)
+        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=26, timeout=self.timeout)
+        payload = self._strip(raw)
+        return models.GameNConfiguration(
+            game_number=decode_bcd(payload[1:3]),
+            game_id=payload[3:5].decode("ascii"),
+            additional_id=payload[5:8].decode("ascii"),
+            denomination=payload[8],
+            max_bet=payload[9],
+            progressive_group=payload[10],
+            game_options=decode_binary_le(payload[11:13]),
+            paytable_id=payload[13:19].decode("ascii"),
+            base_percentage=payload[19:23].decode("ascii"),
+        )
+
+    def send_selected_game_number(self) -> int:
+        return self.send_meter(LongPoll.SEND_SELECTED_GAME_NUMBER)
+
+    def send_enabled_game_numbers(self) -> list[int]:
+        poll = LongPoll.SEND_ENABLED_GAME_NUMBERS
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        payload = self._strip(raw)
+        length = payload[1]
+        data = payload[2:2 + length]
+        num_games = data[0]
+        games = []
+        idx = 1
+        for _ in range(num_games):
+            games.append(decode_bcd(data[idx:idx + 2]))
+            idx += 2
+        return games
+
+    def send_current_date_and_time(self) -> models.CurrentDateTime:
+        poll = LongPoll.SEND_CURRENT_DATE_AND_TIME
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=11, timeout=self.timeout)
+        payload = self._strip(raw)
+        return models.CurrentDateTime(
+            date=f"{decode_bcd(payload[1:5]):08d}",
+            time=f"{decode_bcd(payload[5:8]):06d}",
+        )
+
+    def send_physical_reel_stop_information(self) -> bytes:
+        poll = LongPoll.SEND_PHYSICAL_REEL_STOP_INFORMATION
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=13, timeout=self.timeout)
+        payload = self._strip(raw)
+        return bytes(payload[1:10])
+
+    def send_token_denomination(self) -> int:
+        poll = LongPoll.SEND_TOKEN_DENOMINATION
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=5, timeout=self.timeout)
+        payload = self._strip(raw)
+        return payload[1]
+
+    def send_wager_category_information(self, game_number: int = 0, wager_category: int = 0) -> models.WagerCategoryInfo:
+        poll = LongPoll.SEND_WAGER_CATEGORY_INFORMATION
+        command_and_data = bytes([poll]) + encode_bcd(game_number, 2) + encode_bcd(wager_category, 2)
+        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        payload = self._strip(raw)
+        data = payload[2:2 + payload[1]]
+        payback_percentage = data[4:8].decode("ascii")
+        coin_in_size = data[8]
+        coin_in_meter = decode_bcd(data[9:9 + coin_in_size]) if coin_in_size else 0
+        return models.WagerCategoryInfo(payback_percentage=payback_percentage, coin_in_meter=coin_in_meter)
+
+    def send_extended_game_n_information(self, game_number: int = 0) -> models.ExtendedGameNInfo:
+        poll = LongPoll.SEND_EXTENDED_GAME_N_INFORMATION
+        command_and_data = bytes([poll]) + encode_bcd(game_number, 2)
+        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        payload = self._strip(raw)
+        data = payload[2:2 + payload[1]]
+        resp_game_number = decode_bcd(data[0:2])
+        max_bet = decode_bcd(data[2:4])
+        progressive_group = data[4]
+        progressive_levels = decode_binary_le(data[5:9])
+        idx = 9
+        name_len = data[idx]
+        idx += 1
+        game_name = data[idx:idx + name_len].decode("ascii")
+        idx += name_len
+        paytable_len = data[idx]
+        idx += 1
+        paytable_name = data[idx:idx + paytable_len].decode("ascii")
+        idx += paytable_len
+        wager_categories = decode_bcd(data[idx:idx + 2])
+        return models.ExtendedGameNInfo(
+            game_number=resp_game_number,
+            max_bet=max_bet,
+            progressive_group=progressive_group,
+            progressive_levels=progressive_levels,
+            game_name=game_name,
+            paytable_name=paytable_name,
+            wager_categories=wager_categories,
+        )
+
     # -- Meters (0x0F / 0x1C, Table 7.2a / 7.2c) ----------------------------
 
     def send_meters_10_through_15(self) -> models.BasicMeters:
@@ -57,8 +274,15 @@ class SASClient:
             games_played=decode_bcd(payload[21:25]),
         )
 
-    def send_meters_11_through_15_extended(self) -> models.ExtendedMeters:
-        poll = LongPoll.SEND_METERS_11_THROUGH_15
+    def send_extended_meters_group(self) -> models.ExtendedMeters:
+        """Long poll 0x1C (Table 7.2c, "Send meters") — NOT the same as
+        Table 7.2b's actual "Send meters 11 through 15" (0x19, a smaller,
+        5-field response — see send_meters_11_through_15() below). This
+        method used to be misnamed after that other table; the wire code
+        and parsing were always correct, only the name was borrowed from
+        the wrong one.
+        """
+        poll = LongPoll.SEND_METERS_EXTENDED_GROUP
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
         raw = self.transport.exchange_fixed(frame, response_length=36, timeout=self.timeout)
         payload = self._strip(raw)
@@ -125,10 +349,26 @@ class SASClient:
         send_selected_meters() — any meter code from Table C-7 works here,
         not just ones this client has a size table for.
         """
+        return self._send_extended_meters(LongPoll.SEND_EXTENDED_METERS, meter_codes, game_number=game_number)
+
+    def send_extended_meters_alternate(self, meter_codes: list[int], *, game_number: int = 0) -> models.SelectedMeters:
+        """Identical wire shape to send_extended_meters() (0x6F) but sent as
+        0xAF instead — the spec provides two codes for the same data purely
+        so consecutive polls can each get their own implied ACK (§7.21:
+        "Two different long poll codes can be used to access the exact same
+        meter data... to allow a host to perform consecutive meter polls
+        and still provide a proper implied acknowledgement").
+        """
+        return self._send_extended_meters(
+            LongPoll.SEND_EXTENDED_METERS_ALTERNATE, meter_codes, game_number=game_number
+        )
+
+    def _send_extended_meters(
+        self, poll: LongPoll, meter_codes: list[int], *, game_number: int = 0
+    ) -> models.SelectedMeters:
         if not 1 <= len(meter_codes) <= 12:
             raise SASError(f"send_extended_meters takes 1-12 meter codes, got {len(meter_codes)}")
 
-        poll = LongPoll.SEND_EXTENDED_METERS
         body = encode_bcd(game_number, 2)
         for code in meter_codes:
             body += encode_binary_le(code, 2)

@@ -196,3 +196,128 @@ class EnhancedValidationId:
 
     machine_id: int
     sequence_number: int
+
+
+@dataclass(frozen=True)
+class GamesSincePowerUpAndDoorClosure:
+    """Response to long poll 0x18 (Table 7.7)."""
+
+    games_since_power_up: int
+    games_since_door_closure: int
+
+
+@dataclass(frozen=True)
+class Meters11Through15:
+    """Response to long poll 0x19 (Table 7.2b) — the real "meters 11
+    through 15" (see LongPoll.SEND_METERS_EXTENDED_GROUP's docstring for
+    why 0x1C is a different, larger response despite a similar old name).
+    """
+
+    total_coin_in: int
+    total_coin_out: int
+    total_drop: int
+    total_jackpot: int
+    games_played: int
+
+
+@dataclass(frozen=True)
+class HandpayInformation:
+    """Response to long poll 0x1B (Table 7.8). ``amount_cents`` is in cents
+    if any portion is from a progressive win, otherwise in SAS accounting
+    denom units — the machine does not say which, so the caller has to
+    know from context (see the spec note on the Amount field).
+    """
+
+    progressive_group: int
+    level: int
+    amount: int
+    partial_pay: int
+    reset_id: int
+
+
+@dataclass(frozen=True)
+class BillMeters:
+    """Response to long poll 0x1E (Table B-1 row 1E) — six "bills in"
+    count meters for the most common denominations in one poll.
+    """
+
+    bills_1: int
+    bills_5: int
+    bills_10: int
+    bills_20: int
+    bills_50: int
+    bills_100: int
+
+
+@dataclass(frozen=True)
+class CashOutTicketInfo:
+    """Response to long poll 0x3D (Table 15.5)."""
+
+    ticket_number: int
+    amount_cents: int
+
+
+@dataclass(frozen=True)
+class HopperStatus:
+    """Response to long poll 0x4F (Table 7.19a/7.19b). ``level`` is None
+    when the machine can't detect it (length byte 02 rather than 06).
+    """
+
+    status: int
+    percent_full: int
+    level: int | None
+
+
+@dataclass(frozen=True)
+class GameNMeters:
+    """Response to long poll 0x52 (Table 7.6.4b)."""
+
+    game_number: int
+    total_coin_in: int
+    total_coin_out: int
+    total_jackpot: int
+    games_played: int
+
+
+@dataclass(frozen=True)
+class GameNConfiguration:
+    """Response to long poll 0x53 (Table 7.6.5b)."""
+
+    game_number: int
+    game_id: str
+    additional_id: str
+    denomination: int
+    max_bet: int
+    progressive_group: int
+    game_options: int
+    paytable_id: str
+    base_percentage: str
+
+
+@dataclass(frozen=True)
+class CurrentDateTime:
+    """Response to long poll 0x7E (Table B-1 row 7E)."""
+
+    date: str  # MMDDYYYY
+    time: str  # HHMMSS
+
+
+@dataclass(frozen=True)
+class WagerCategoryInfo:
+    """Response to long poll 0xB4 (Table 7.24b)."""
+
+    payback_percentage: str  # ASCII "??.??", decimal implied
+    coin_in_meter: int
+
+
+@dataclass(frozen=True)
+class ExtendedGameNInfo:
+    """Response to long poll 0xB5 (Table 7.23b)."""
+
+    game_number: int
+    max_bet: int
+    progressive_group: int
+    progressive_levels: int  # bitfield, lsb=level 1, msb=level 32
+    game_name: str
+    paytable_name: str
+    wager_categories: int

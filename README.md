@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 80 tests, all against fake serial ports; run them with
+- **`tests/`** — 101 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -62,15 +62,47 @@ through pyserial's cross-platform API, nothing Linux-specific.
 
 ## Long polls implemented
 
-General poll; core meters (0x0F, 0x1C); selected/extended meters (0x2F,
-0x6F — the only way to reach ticket meters such as Cashable Tickets In,
-since 0x0F/0x1C cannot); gaming machine ID (0x1F); enabled features
-(0xA0); AFT register (0x73), lock/status (0x74), transfer funds (0x72);
-secure enhanced validation ID (0x4C); enhanced validation information /
-ticket-out history (0x4D); extended validation status (0x7B); ticket
-validation data (0x70), redeem ticket (0x71, plus the short-form,
-read-only status query); validation number (0x58). See `saspy/client.py`
-— every method cites the spec table it was built from.
+This covers every data-returning long poll in the SAS 6.02 spec's own
+Appendix B (Table B-1) — the complete, authoritative command list — that
+is realistically relevant to a TITO/AFT/meters gateway. See
+`saspy/client.py` and `saspy/constants.py` — every method and constant
+cites the spec table it was built from, and `constants.py`'s module
+docstring explains the scope boundary below.
+
+- **General poll** (0x80/addr).
+- **Meters**: core (0x0F, 0x19, 0x1C — see `constants.py` for why 0x1C
+  isn't literally "11 through 15" despite an earlier misleading name),
+  single-meter reads (0x10-0x18, 0x1A, 0x20, 0x2A-0x2C, bill/stacker
+  meters 0x31-0x4A) via `send_meter()`, selected/extended meters (0x2F,
+  0x6F, 0xAF — the only way to reach ticket meters such as Cashable
+  Tickets In, since the core-meter polls cannot), per-game meters and
+  configuration (0x52, 0x53), hand-paid cancelled credits (0x2D), total
+  bill meters (0x1E), current hopper status (0x4F).
+- **Machine identity/config**: gaming machine ID (0x1F), SAS version and
+  serial (0x54), enabled features (0xA0), token denomination (0xB3),
+  selected/enabled game numbers (0x55, 0x56), games implemented (0x51),
+  wager category info (0xB4), extended game info (0xB5), current
+  date/time (0x7E), physical reel stops (0x8F).
+- **AFT**: register (0x73), lock/status (0x74), transfer funds (0x72).
+- **Ticketing**: secure enhanced validation ID (0x4C), enhanced
+  validation information / ticket-out history (0x4D), extended
+  validation status (0x7B), ticket validation data (0x70), redeem ticket
+  (0x71, plus the short-form, read-only status query), validation number
+  (0x58), pending cashout info (0x57), cash-out ticket info (0x3D),
+  handpay information (0x1B).
+
+**Deliberately not implemented**, and why: pure command/control polls
+with no data to pull (shutdown, sound on/off, bill acceptor enable/
+disable, maintenance mode, delay game, enable/disable game, remote
+handpay reset, jackpot-reset-method/auto-rebet enable, receive-progressive/
+date-time/ticket-data setters) — a distinct, lower-priority piece of work
+from "can't pull some data" if you need it later. Progressive jackpots,
+tournament mode, legacy bonusing, and card/reel-stop data — out of this
+project's stated TITO/AFT/meters scope; long poll 0x8B (multiplied
+jackpots) specifically because the spec itself recommends against
+implementing it. Component authentication (0x6E, Section 17) and the
+multi-denom preamble (0xB0, a request-wrapping mechanism rather than a
+standalone poll) — real gaps, not scoped out, just not yet built.
 
 Meter codes for 0x2F/0x6F are transcribed directly from the spec's own
 Table C-7, not from any secondary source — an earlier project planning
