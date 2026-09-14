@@ -412,6 +412,46 @@ def test_poll_and_log_ignores_ticket_in_exception_when_nothing_in_escrow():
     assert conn.execute("SELECT COUNT(*) FROM ticket_in_events").fetchone()[0] == 0
 
 
+def test_poll_and_log_captures_105_dollar_ticket_in_during_a_meter_rollover_cycle():
+    """A $105.00 ticket-in (amount_cents=10500) landing on the same poll
+    cycle as a basic-meter rollover (total_coin_in wrapping back down, per
+    §8.2 -- decode_bcd() has no notion of "value decreased," so a wrapped
+    meter is just a normal, smaller BCD read). The two are unrelated reads
+    (LP 70's escrow amount vs. LP 0F's cumulative meters), so a rollover
+    on one must not corrupt or block capture of the other: the ticket
+    amount must be stored exactly, and the meter decrease must be logged
+    as diagnostic signal (bursting), not an error.
+
+    Note what this does NOT cover: SAS's own cumulative "Cashable Ticket
+    In" meter (MeterCode.CASHABLE_TICKET_IN_CENTS, only reachable via LP
+    2F -- see test_send_selected_meters_ticket_in_meter_rollover in
+    test_client.py for that meter's own rollover behavior). poll_and_log()
+    never polls LP 2F at all, so a rollover specific to that meter is
+    invisible to this tool today -- a real coverage gap, not exercised or
+    masked by this test.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState(last_meters={
+        "total_cancelled_credits": 0, "total_coin_in": 999_999, "total_coin_out": 0,
+        "total_drop": 0, "total_jackpot": 0, "games_played": 0,
+    })
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters(total_coin_in=12)],  # wrapped: smaller than state.last_meters above
+        exception_script=[ExceptionCode.TICKET_INSERTED],
+        ticket_script=[make_ticket_in(amount_cents=10_500)],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+
+    ticket_rows = conn.execute("SELECT amount_cents FROM ticket_in_events").fetchall()
+    assert ticket_rows == [(10_500,)]
+    assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
+    # the meter decrease is diagnostic signal, not an error: it arms the
+    # burst window (this cycle's own write immediately consumes one)
+    assert state.burst_remaining == history.burst_count - 1
+
+
 def test_ticket_in_capture_failure_logs_error_without_stopping_meters():
     conn = make_db()
     clock = FakeClock()

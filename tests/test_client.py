@@ -367,6 +367,36 @@ def test_send_selected_meters_rejects_too_many_codes():
         client.send_selected_meters([MeterCode.CASHABLE_TICKET_IN_CENTS] * 11)
 
 
+def test_send_selected_meters_ticket_in_meter_rollover():
+    """Cashable Tickets In (Table C-7, 5 BCD bytes -> max 9,999,999,999
+    cents) rolling over mid-session. Concrete numbers: the meter sits at
+    $99,999,950.00, a $105.00 ticket is redeemed, and the field wraps
+    (mod 10**10) to $55.00 -- an ordinary BCD field overflow per Technical
+    v3 §8.2, which the spec is explicit is corrected server-side, never by
+    the device reading the meter. decode_bcd() has no notion of "value
+    went down" -- it only fails on an invalid nibble -- so both the
+    pre-rollover and post-rollover reads must decode cleanly, and the
+    client must return the raw wrapped value with no "helpful" correction
+    of its own.
+    """
+    pre_rollover_cents = 9_999_995_000
+    ticket_cents = 10_500
+    post_rollover_cents = (pre_rollover_cents + ticket_cents) % 10 ** 10
+    assert post_rollover_cents == 5_500  # not 0 -- rules out a hidden "looks like a reset" special case
+
+    def read_meter(cents: int) -> int:
+        data = encode_bcd(0, 2) + bytes([MeterCode.CASHABLE_TICKET_IN_CENTS]) + encode_bcd(cents, 5)
+        body = bytes([ADDRESS, 0x2F, len(data)]) + data
+        result = make_client(body).send_selected_meters([MeterCode.CASHABLE_TICKET_IN_CENTS])
+        return result.meters[MeterCode.CASHABLE_TICKET_IN_CENTS]
+
+    before = read_meter(pre_rollover_cents)
+    after = read_meter(post_rollover_cents)
+    assert before == pre_rollover_cents
+    assert after == post_rollover_cents
+    assert after < before  # the raw wrapped wire value, not a corrected/monotonic one
+
+
 def test_send_extended_meters_handles_arbitrary_code_via_self_describing_size():
     """Unlike LP 2F, LP 6F's response carries its own size byte per meter
     (Table 7.21b), so any code works here even without a METER_CODE_SIZES_BCD
