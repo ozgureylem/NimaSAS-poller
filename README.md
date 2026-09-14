@@ -35,10 +35,13 @@ step-by-step guide to structuring a local SQL layer around a poller.
   querying the machine's SAS version and serial number, and writes a
   `gateway.ini` the other tools can load. Optional — a config file can
   always be hand-written.
-- **`examples/sql_poll_logger.py`** — polls a machine on a timer and logs
-  results (and failures, separately) to a local SQLite database. A
-  runnable starting point for stress-testing over time or prototyping a
-  persistence layer — see MANUAL.md §6 for the schema and reasoning.
+- **`examples/sql_poll_logger.py`** — one poll loop, one SQLite database:
+  meters, full ticket-out history (buffer backfill at startup plus live
+  capture), and read-only ticket-in capture, all from a single
+  general-poll stream (deliberately one program — see the module
+  docstring for why). A runnable starting point for stress-testing over
+  time or prototyping a persistence layer — see MANUAL.md §4/§6 for the
+  schema and reasoning.
 - **`legacy/`** — an earlier Python 2 implementation, kept for reference.
   **It has known, confirmed bugs** (wrong byte offsets, a fabricated
   field on a fund-transfer command, crashes on certain inputs) — don't

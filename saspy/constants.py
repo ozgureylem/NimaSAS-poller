@@ -165,6 +165,20 @@ class PollType(enum.Enum):
     G = "G"  # broadcast, CRC required, no ACK/NACK
 
 
+class ExceptionCode(enum.IntEnum):
+    """General-poll exception codes (Appendix A) — only the ones this
+    client's examples actually act on. 0x00 (no event) plus the four
+    priority exceptions that drive ticket capture in
+    examples/sql_poll_logger.py.
+    """
+
+    NONE = 0x00
+    CASH_OUT_TICKET_PRINTED = 0x3D  # §15.10 — read via LP 4D (Send Enhanced Validation Information)
+    HANDPAY_VALIDATED = 0x3E  # §15.10 — same read as above (spec: "functionally equivalent" to 3D)
+    TICKET_INSERTED = 0x67  # §15.11 — read via LP 70 (Send Ticket Validation Data)
+    TICKET_TRANSFER_COMPLETE = 0x68  # §15.12 — read via LP 71/FF (redeem_ticket_status())
+
+
 class MeterCode(enum.IntEnum):
     """Selected-meter codes for LP 2F/6F (Table C-7, Appendix C). Only the
     codes this client actually verified against the spec table are named

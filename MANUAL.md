@@ -267,13 +267,16 @@ succeeding.
 
 ### 4.1 What it's for
 
-This tool polls a machine on a repeating timer and writes what it reads
-into a local SQLite database file, so instead of a single snapshot you
-get a current value plus a running history — useful for monitoring, for
-stress testing (does the connection survive hours of continuous
-polling?), or as a starting point for a real logging/sync service.
+This tool runs one continuous poll loop against a machine and writes
+everything it sees into a local SQLite database file: meters (a current
+value plus a running history), ticket-out history, and ticket-in
+capture. One program, one poll loop, one database — not three separate
+tools — because only one process can safely own the serial port, and
+ticket capture depends on seeing the same general-poll stream meters
+share the connection with (see §4.4).
 
-It has two history modes, picked with `--mode`:
+**Meters** work as before: a current-value row plus a history table,
+in one of two modes picked with `--mode`:
 
 - **`ring`** (the default) — a single always-current-value row, plus a
   history table capped at a fixed size (oldest rows evicted) and
@@ -284,6 +287,25 @@ It has two history modes, picked with `--mode`:
   never-deleted history row. Right for a lab machine or a stress-test
   run on ordinary disk, where you want every sample and don't care
   about write volume.
+
+**Ticket-out history** (`ticket_out_history`) is read two ways: once at
+startup, every buffer position the machine holds (5–31 records,
+non-destructive); and continuously, drained in full every time the
+machine signals a new one is ready. Rows are deduplicated, so re-running
+the startup read or seeing the same ticket both ways never double-counts
+it.
+
+**Ticket-in capture** (`ticket_in_events`) logs the validation data and
+amount of every ticket a player inserts, the moment it happens. It is
+deliberately **read-only** — this tool never authorizes or redeems a
+ticket (see §4.4 for why, and what happens to an unredeemed ticket).
+
+One asymmetry worth knowing before you rely on this: ticket-*out* has a
+real buffer on the machine, so the startup read gets you history from
+before this tool ever ran. Ticket-*in* has no such buffer anywhere in
+SAS — the machine only ever exposes the *current* redemption cycle, never
+a log of past ones. `ticket_in_events` can only ever contain tickets
+seen while this tool was running; there is no way to backfill it.
 
 ### 4.2 Basic use
 
@@ -316,16 +338,52 @@ A lab/stress-test run: logs every single poll (uncapped), polling every
 | `--history-cap` | `200` | Max rows kept in the history table in `ring` mode. Ignored in `append` mode. |
 | `--history-interval` | `60.0` | Minimum seconds between history writes in `ring` mode, outside a burst (see §4.4). Ignored in `append` mode — how often the *value* is checked (`--interval`) is not how often history is *recorded*. |
 | `--burst-count` | `10` | Consecutive polls logged at full resolution, ignoring `--history-interval`, right after a meter decrease or a failed poll. |
+| `--skip-ticket-out-backfill` | off | Skip the one-time startup read of the full ticket-out buffer (indices 1–31). |
 
 ### 4.4 What's actually happening (technical)
 
 On startup, it loads the config with
 `saspy.config.connect_from_config()` (opens the port, builds a
-`SASTransport` and `SASClient` in one step) and creates three tables if
-they don't already exist — see §6.3 for the schema and why it's shaped
-this way. Each cycle calls `client.send_meters_10_through_15()`
-(long poll `0x0F`).
+`SASTransport` and `SASClient` in one step) and creates the tables if
+they don't already exist — see §6.3 for the meters schema. Unless
+`--skip-ticket-out-backfill` is given, it then reads the machine's
+entire ticket-out buffer once: indices 1 through 31 via
+`send_enhanced_validation_information()` (long poll `0x4D`), which is
+non-destructive at a specific index — it doesn't disturb the "unread"
+state the live capture below depends on. Every non-empty record found
+is stored in `ticket_out_history`.
 
+Each cycle then does two things, in order:
+
+**1. A general poll.** This is the same `general_poll()` that
+`connectivity_check.py` uses to check whether a machine is live, except
+here its return value — the exception code — is actually acted on:
+
+- Exception `0x67` (ticket inserted) → read the ticket's validation
+  data (long poll `0x70`) and insert it into `ticket_in_events`.
+  Deliberately nothing more: this tool never calls `redeem_ticket()` to
+  authorize or reject the ticket. Deciding whether to pay a ticket is a
+  real business/security decision (see your project's own Decisions
+  Annex on exactly this), and a reference poller has no way to make
+  that decision correctly. Left unredeemed, the machine returns the
+  ticket to the player on its own after a spec-guaranteed 30-second
+  timeout — so running this against a real machine never risks an
+  incorrect payout, it just means `ticket_in_events` records that a
+  ticket came in, not what became of it.
+- Exception `0x3D` or `0x3E` (a ticket-out record is ready) → drain
+  *every* currently-unread ticket-out record (long poll `0x4D`,
+  function code `0x00`, which marks each one read as it goes) into
+  `ticket_out_history`, stopping when the machine reports the buffer
+  has nothing more unread. This drains in a loop, not just once, so a
+  burst of several tickets printed between poll cycles is still
+  captured in full rather than only the oldest of them.
+- Any other exception code, including `0x00` (nothing pending), is
+  ignored by this tool.
+
+A `SASError` on the general poll itself is logged to `poll_errors` and
+the cycle moves on to meters anyway — it doesn't block anything.
+
+**2. Meters.** `client.send_meters_10_through_15()` (long poll `0x0F`).
 On success, `meters_current` (always exactly one row) is overwritten
 with the latest values, unconditionally, every cycle. Whether that
 cycle *also* writes a new row to `meters_history` depends on the mode:
@@ -373,6 +431,24 @@ anything — never stops the run.
   space accordingly or switch to `ring` mode, which won't grow past
   `--history-cap` rows in its history table (`meters_current` is always
   one row in either mode). See §6.7 for why this distinction exists.
+- **`ticket_out_history` is empty even though the machine has printed
+  tickets before**: check whether `--skip-ticket-out-backfill` was
+  passed — without it, the startup read should find whatever the
+  machine's buffer currently holds. If the flag wasn't passed and it's
+  still empty, the buffer itself may genuinely be empty (it holds at
+  most 31 records and is overwritten oldest-first — old tickets fall
+  out of it over time, this tool or no).
+- **`ticket_in_events` is missing a ticket you know was inserted**:
+  this table can only ever record tickets seen while the tool was
+  running — see §4.1's note on the ticket-in/ticket-out asymmetry.
+  There's no way to retroactively pull ticket-in history from the
+  machine; if the tool wasn't running when a ticket came in, that
+  event is gone.
+- **A ticket sits in escrow and is never picked up in `ticket_in_events`**:
+  confirm the general poll is actually returning `0x67` for it — a
+  machine not configured for the validation mode this tool expects
+  (or one being polled by a different, competing host) may not report
+  the exception this tool is watching for.
 
 ---
 
@@ -575,6 +651,30 @@ CREATE TABLE IF NOT EXISTS poll_errors (
     error_type TEXT NOT NULL,
     message TEXT
 );
+
+CREATE TABLE IF NOT EXISTS ticket_out_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    buffer_index INTEGER,
+    validation_type INTEGER,
+    ticket_date TEXT,
+    ticket_time TEXT,
+    validation_number INTEGER NOT NULL,
+    amount_cents INTEGER,
+    ticket_number INTEGER,
+    validation_system_id INTEGER,
+    expiration TEXT,
+    pool_id INTEGER,
+    UNIQUE(validation_number, ticket_date, ticket_time)
+);
+
+CREATE TABLE IF NOT EXISTS ticket_in_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    amount_cents INTEGER,
+    parsing_code INTEGER,
+    validation_data_hex TEXT
+);
 ```
 
 - **Split "current" from "history."** Almost every consumer of this
@@ -616,6 +716,18 @@ CREATE TABLE IF NOT EXISTS poll_errors (
   parsed out of the SAS response — this is when you need to know it
   happened, and it's consistent even against machines that don't
   report their own clock.
+- **Identity, not position, decides what counts as a duplicate.**
+  `ticket_out_history` is read two different ways — a non-destructive
+  startup walk by buffer position, and a live, destructive drain
+  triggered by an exception — and both can legitimately observe the
+  same physical ticket. Buffer position isn't a stable identity (it's a
+  ring; the same slot gets reused), so the table's `UNIQUE` constraint
+  is on the ticket's own identity (validation number, date, time)
+  instead, and every insert uses `INSERT OR IGNORE`. Reach for this
+  whenever more than one path can produce the same logical row —
+  deduping on a source-specific detail like position or sequence number
+  looks reasonable right up until two sources disagree about what that
+  detail means.
 - **Only the event stream drains; meter history never does.**
   `poll_errors` is this example's event stream, and in the wider
   project a drain/sync process is what eventually acknowledges and
@@ -632,6 +744,8 @@ python3 examples/sql_poll_logger.py gateway.ini --cycles 3
 sqlite3 gateway.sqlite3 "SELECT * FROM meters_current;"
 sqlite3 gateway.sqlite3 "SELECT * FROM meters_history;"
 sqlite3 gateway.sqlite3 "SELECT * FROM poll_errors;"
+sqlite3 gateway.sqlite3 "SELECT * FROM ticket_out_history;"
+sqlite3 gateway.sqlite3 "SELECT * FROM ticket_in_events;"
 ```
 
 `--cycles 3` gives you a short, bounded run to confirm rows are landing
@@ -646,6 +760,13 @@ want to confirm every poll is landing a history row while you're
 testing. If you don't have the `sqlite3` CLI installed,
 `python3 -c "import sqlite3; print(sqlite3.connect('gateway.sqlite3').execute('SELECT * FROM meters_current').fetchall())"`
 works just as well.
+
+`ticket_out_history` should show rows from the very first cycle (the
+startup backfill runs before the poll loop even starts) if the machine
+has printed any tickets recently. `ticket_in_events` will only show
+rows if you actually feed a ticket into the machine while the tool is
+running — three quick cycles with nothing inserted is expected to leave
+it empty, and that's not a failure.
 
 ### 6.5 Adapting this for stress testing across multiple gateways/environments
 

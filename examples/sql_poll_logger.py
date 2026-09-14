@@ -1,15 +1,57 @@
 #!/usr/bin/env python3
-"""Poll a gateway on a fixed interval and log what comes back to SQLite.
+"""One poll loop, one SQLite database: meters, ticket-out history, and
+ticket-in capture, all from a single continuous general-poll cycle.
 
 This is a worked, runnable example of the "local SQL layer on top of
 SASClient" pattern described in MANUAL.md — a starting point for
 prototyping gateway architecture, not a production drain/sync service.
 Every poll failure is logged rather than raised, so one bad exchange
-never stops the loop — which is the behavior you want during stress
-testing, where the failures are the interesting part.
+never stops the loop.
 
-Two history modes, chosen with --mode (see MANUAL.md §4 and §6 for the
-full reasoning):
+It is deliberately one program, not several. Only one process can safely
+own the serial port's poll loop, and ticket-in/ticket-out capture both
+depend on seeing the *same* continuous general-poll stream that meters
+share the connection with — splitting these into separate programs would
+mean two loops competing over one shared serial line, and would break
+the exception-draining guarantee a real gateway depends on (an
+unread exception can be overwritten by the next one if nothing drains it
+fast enough — see the SAS spec's exception-queue behavior, §2.2.1).
+
+What each cycle does, in order:
+
+1. A general poll. If it returns exception 0x67 (ticket inserted), read
+   the ticket's validation data (LP 70) and log it to ticket_in_events —
+   read-only; see "What this does NOT do" below. If it returns 0x3D or
+   0x3E (a ticket-out record is ready), drain every currently-unread
+   ticket-out record (LP 4D, function code 0x00) into ticket_out_history.
+2. Meters, on the same cadence/ring-history logic as before (see the
+   HistoryConfig docstring and MANUAL.md §4/§6).
+
+On startup, the full ticket-out buffer (indices 1-31, non-destructive —
+see send_enhanced_validation_information()'s docstring) is also read
+once into ticket_out_history, so you get whatever the machine is already
+holding, not just what happens from here forward.
+
+What this does NOT do: authorize or redeem tickets. A ticket-in event is
+read and logged (amount, validation data) but this tool never calls
+redeem_ticket() — deciding whether to pay a ticket is a real business/
+security decision (see the project's own Decisions Annex on this), and
+a reference poller has no way to make that decision correctly. Left
+unredeemed, the machine safely returns the ticket to the player after
+its own 30-second timeout (spec-guaranteed), so running this against a
+real machine does not risk paying out incorrectly — it just means this
+tool's ticket_in_events table records that a ticket came in, not what
+happened to it.
+
+What this does NOT recover: ticket-IN history before this tool started,
+or before the SAS 6.02 spec's own record — because there isn't any. LP
+70/71 only ever expose the *current* redemption cycle; SAS has no
+ticket-in buffer the way it has one for ticket-out (LP 4D). If you need
+a full ticket-in audit trail, this tool has to be running continuously
+from before the first ticket you care about.
+
+Two history modes for meters, chosen with --mode (see MANUAL.md §4 and
+§6 for the full reasoning):
 
 - ``ring`` (default): a single current-value row plus a capped,
   decoupled-cadence history ring buffer. This is the flash-safe,
@@ -30,7 +72,7 @@ Usage:
     python3 examples/sql_poll_logger.py gateway.ini
     python3 examples/sql_poll_logger.py gateway.ini --db gateway.sqlite3 --interval 5
     python3 examples/sql_poll_logger.py gateway.ini --cycles 100   # stop after 100 cycles
-    python3 examples/sql_poll_logger.py gateway.ini --mode append  # lab/stress-testing: log every poll, uncapped
+    python3 examples/sql_poll_logger.py gateway.ini --mode append  # lab/stress-testing: log every meter poll, uncapped
 
 ``gateway.ini`` is the file commission_gateway.py writes (see MANUAL.md),
 or one you hand-wrote in the same format.
@@ -46,7 +88,9 @@ import time
 from dataclasses import dataclass
 
 from saspy.config import connect_from_config
+from saspy.constants import ExceptionCode
 from saspy.exceptions import SASError
+from saspy.models import EnhancedValidationInfo
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meters_current (
@@ -78,6 +122,30 @@ CREATE TABLE IF NOT EXISTS poll_errors (
     error_type TEXT NOT NULL,
     message TEXT
 );
+
+CREATE TABLE IF NOT EXISTS ticket_out_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    buffer_index INTEGER,
+    validation_type INTEGER,
+    ticket_date TEXT,
+    ticket_time TEXT,
+    validation_number INTEGER NOT NULL,
+    amount_cents INTEGER,
+    ticket_number INTEGER,
+    validation_system_id INTEGER,
+    expiration TEXT,
+    pool_id INTEGER,
+    UNIQUE(validation_number, ticket_date, ticket_time)
+);
+
+CREATE TABLE IF NOT EXISTS ticket_in_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    amount_cents INTEGER,
+    parsing_code INTEGER,
+    validation_data_hex TEXT
+);
 """
 # meters_current always holds exactly one row (id=1, INSERT OR REPLACE) —
 # most consumers only ever want the latest value, and a one-row table
@@ -91,11 +159,18 @@ CREATE TABLE IF NOT EXISTS poll_errors (
 # written every cycle, unconditionally: the original behavior, still the
 # right one for a lab/stress run on ordinary disk.
 #
-# Neither meters table carries a synced_at column. That pattern belongs
-# to the event stream (poll_errors, and this project's broader event
-# handling), which a separate drain process consumes and acknowledges.
-# Meter history is a local diagnostic buffer, not a queue — it's never
-# drained, so there's nothing for a synced_at column to mean here.
+# ticket_out_history is deduplicated on (validation_number, ticket_date,
+# ticket_time) — the startup backfill (non-destructive, by buffer index)
+# and the live exception-driven drain (destructive, by "next unread") can
+# both observe the same physical ticket, and a ring buffer position gets
+# reused over time, so buffer_index alone is not a stable identity.
+#
+# Neither meters table nor the ticket tables carry a synced_at column.
+# That pattern belongs to the event stream (poll_errors, and this
+# project's broader event handling), which a separate drain process
+# consumes and acknowledges. These are local diagnostic/capture buffers,
+# not a queue — they're never drained by this tool, so there's nothing
+# for a synced_at column to mean here.
 
 DEFAULT_HISTORY_CAP = 200
 DEFAULT_HISTORY_INTERVAL = 60.0
@@ -136,6 +211,117 @@ def utc_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _is_empty_ticket_out_record(record: EnhancedValidationInfo) -> bool:
+    """Per §15.10: "If no unread records are in the buffer, all fields in
+    the long poll 4D response will be zero" — same for an unused/invalid
+    buffer index. Checked on three fields together rather than just
+    validation_number, since a genuinely-zero value in any single field
+    is far more plausible than all three being zero at once.
+    """
+    return record.validation_number == 0 and record.amount_cents == 0 and record.ticket_number == 0
+
+
+def _insert_ticket_out_record(conn: sqlite3.Connection, record: EnhancedValidationInfo, captured_at: str) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO ticket_out_history "
+        "(captured_at, buffer_index, validation_type, ticket_date, ticket_time, validation_number, "
+        " amount_cents, ticket_number, validation_system_id, expiration, pool_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            captured_at,
+            record.index_number,
+            record.validation_type,
+            record.date,
+            record.time,
+            record.validation_number,
+            record.amount_cents,
+            record.ticket_number,
+            record.validation_system_id,
+            record.expiration,
+            record.pool_id,
+        ),
+    )
+    conn.commit()
+
+
+def backfill_ticket_out_history(client, conn: sqlite3.Connection, *, now_fn=utc_now) -> int:
+    """Read every buffer position (1-31, the spec's maximum — §15.6) once,
+    non-destructively (indexed reads don't mark anything as read), so
+    ticket_out_history starts with whatever the machine is already
+    holding rather than only what happens from here forward. Safe to call
+    more than once — inserts are deduplicated. Returns the number of new
+    rows found.
+    """
+    now = now_fn()
+    found = 0
+    for index in range(1, 32):
+        try:
+            record = client.send_enhanced_validation_information(function_code=index)
+        except SASError as e:
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+                (now, "send_enhanced_validation_information(backfill)", type(e).__name__, str(e)),
+            )
+            conn.commit()
+            continue
+        if _is_empty_ticket_out_record(record):
+            continue
+        before = conn.total_changes
+        _insert_ticket_out_record(conn, record, now)
+        if conn.total_changes > before:
+            found += 1
+    return found
+
+
+def _drain_ticket_out_history(client, conn: sqlite3.Connection, now: str) -> None:
+    """Called on exception 0x3D/0x3E: read every currently-unread
+    ticket-out record (function code 0x00 — "next unread, mark as read")
+    until the buffer reports empty. Unlike the startup backfill, this
+    drains the FIFO "unread" pointer rather than reading by absolute
+    index, which is what lets it see every new record even if several
+    tickets printed between poll cycles.
+    """
+    for _ in range(31):  # hard cap — the buffer can never hold more than this
+        try:
+            record = client.send_enhanced_validation_information(function_code=0x00)
+        except SASError as e:
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+                (now, "send_enhanced_validation_information(drain)", type(e).__name__, str(e)),
+            )
+            conn.commit()
+            return
+        if _is_empty_ticket_out_record(record):
+            return
+        _insert_ticket_out_record(conn, record, now)
+        print(f"[{now}] ticket-out captured: validation_number={record.validation_number} amount_cents={record.amount_cents}")
+
+
+def _capture_ticket_in(client, conn: sqlite3.Connection, now: str) -> None:
+    """Called on exception 0x67: read the ticket's validation data
+    (read-only — see this module's docstring for why redeem_ticket() is
+    deliberately never called here).
+    """
+    try:
+        ticket = client.send_ticket_validation_data()
+    except SASError as e:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+            (now, "send_ticket_validation_data", type(e).__name__, str(e)),
+        )
+        conn.commit()
+        return
+    if not ticket.ticket_in_escrow:
+        return  # exception fired, but nothing in escrow by the time we read it — rare, harmless race
+    conn.execute(
+        "INSERT INTO ticket_in_events (captured_at, amount_cents, parsing_code, validation_data_hex) "
+        "VALUES (?, ?, ?, ?)",
+        (now, ticket.amount_cents, ticket.parsing_code, ticket.validation_data.hex()),
+    )
+    conn.commit()
+    print(f"[{now}] ticket-in captured: amount_cents={ticket.amount_cents} (not redeemed — see module docstring)")
+
+
 def poll_and_log(
     client,
     conn: sqlite3.Connection,
@@ -146,13 +332,31 @@ def poll_and_log(
     now_fn=utc_now,
     monotonic_fn=time.monotonic,
 ) -> None:
-    """Run one poll cycle: always refresh meters_current on success, and
-    write to meters_history according to ``history``'s mode/cadence/cap,
-    or immediately (for the next ``history.burst_count`` cycles) on a
-    meter decrease, a failed poll, or an ``anomaly=True`` signal from
-    the caller.
+    """Run one full cycle: a general poll (dispatching to ticket-in/
+    ticket-out capture on the relevant exception codes), then the meters
+    poll — refreshing meters_current every cycle, and writing to
+    meters_history according to ``history``'s mode/cadence/cap, or
+    immediately (for the next ``history.burst_count`` cycles) on a meter
+    decrease, a failed poll, or an ``anomaly=True`` signal from the
+    caller.
     """
     now = now_fn()
+
+    try:
+        exception_code = client.general_poll()
+    except SASError as e:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+            (now, "general_poll", type(e).__name__, str(e)),
+        )
+        conn.commit()
+        print(f"[{now}] general poll failed: {type(e).__name__}: {e}")
+    else:
+        if exception_code == ExceptionCode.TICKET_INSERTED:
+            _capture_ticket_in(client, conn, now)
+        elif exception_code in (ExceptionCode.CASH_OUT_TICKET_PRINTED, ExceptionCode.HANDPAY_VALIDATED):
+            _drain_ticket_out_history(client, conn, now)
+
     mono_now = monotonic_fn()
 
     try:
@@ -164,7 +368,7 @@ def poll_and_log(
         )
         conn.commit()
         state.burst_remaining = max(state.burst_remaining, history.burst_count)
-        print(f"[{now}] poll failed: {type(e).__name__}: {e}")
+        print(f"[{now}] meters poll failed: {type(e).__name__}: {e}")
         return
 
     values = {field: getattr(meters, field) for field in METER_FIELDS}
@@ -232,7 +436,8 @@ def main() -> int:
         choices=("ring", "append"),
         default="ring",
         help="'ring' (default): capped meters_history at a decoupled write cadence — the flash-safe default. "
-        "'append': unbounded meters_history written every cycle — the original lab/stress-testing behavior.",
+        "'append': unbounded meters_history written every cycle — the original lab/stress-testing behavior. "
+        "Ticket tables are always deduplicated, not capped — see the module docstring.",
     )
     parser.add_argument(
         "--history-cap",
@@ -253,6 +458,11 @@ def main() -> int:
         default=DEFAULT_BURST_COUNT,
         help="consecutive polls logged at full resolution after a meter decrease or failed poll "
         "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--skip-ticket-out-backfill",
+        action="store_true",
+        help="skip the one-time startup read of the full ticket-out buffer (indices 1-31)",
     )
     args = parser.parse_args()
 
@@ -277,6 +487,12 @@ def main() -> int:
         )
     else:
         print("  meters_history: unbounded, written every cycle (lab/stress-testing mode).")
+
+    if not args.skip_ticket_out_backfill:
+        print("Reading the existing ticket-out buffer (indices 1-31, non-destructive)...")
+        found = backfill_ticket_out_history(client, conn)
+        print(f"  {found} ticket-out record(s) found and stored.")
+
     print("Ctrl-C to stop." if args.cycles == 0 else f"Will stop after {args.cycles} cycle(s).")
 
     cycle = 0
