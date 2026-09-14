@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 from examples.sql_poll_logger import (
+    ALL_METER_FIELDS,
     SCHEMA,
     TICKET_METER_CODES,
     TICKET_METER_COLUMNS,
@@ -19,9 +20,20 @@ from examples.sql_poll_logger import (
     poll_and_log,
     seed_validation_pool,
 )
-from saspy.constants import ExceptionCode
+from saspy.constants import ExceptionCode, LongPoll
 from saspy.exceptions import SASTimeoutError
-from saspy.models import BasicMeters, EnhancedValidationInfo, PendingCashoutInfo, SelectedMeters, TicketValidationData
+from saspy.models import (
+    BasicMeters,
+    BillMeters,
+    EnhancedValidationInfo,
+    ExtendedMeters,
+    GamesSincePowerUpAndDoorClosure,
+    HopperStatus,
+    Meters11Through15,
+    PendingCashoutInfo,
+    SelectedMeters,
+    TicketValidationData,
+)
 
 
 def make_meters(**overrides) -> BasicMeters:
@@ -118,6 +130,13 @@ class ScriptedClient:
         cashout_info_script=None,
         validation_number_script=None,
         ticket_meters_script=None,
+        meters_11_15=None,
+        extended_meters_group=None,
+        games_since_power_up=None,
+        total_bill_meters=None,
+        hand_paid_cancelled_credits=None,
+        hopper_status=None,
+        single_meter_values=None,
     ):
         self._meters_script = list(meters_script)
         self._exception_script = list(exception_script) if exception_script is not None else None
@@ -126,6 +145,18 @@ class ScriptedClient:
         self._cashout_info_script = list(cashout_info_script) if cashout_info_script is not None else []
         self._validation_number_script = list(validation_number_script) if validation_number_script is not None else []
         self._ticket_meters_script = list(ticket_meters_script) if ticket_meters_script is not None else None
+        # These next several are fixed values (or an Exception to raise),
+        # applied on every call rather than popped from a sequence — the
+        # rest of this tool's grouped meter polls are read once per cycle
+        # with nothing to sequence, unlike the exception-driven scripts
+        # above. None means "use a harmless all-zero default response."
+        self._meters_11_15 = meters_11_15
+        self._extended_meters_group = extended_meters_group
+        self._games_since_power_up = games_since_power_up
+        self._total_bill_meters = total_bill_meters
+        self._hand_paid_cancelled_credits = hand_paid_cancelled_credits
+        self._hopper_status = hopper_status
+        self._single_meter_values = dict(single_meter_values) if single_meter_values else {}
         self.validation_number_calls = []
 
     def general_poll(self):
@@ -152,6 +183,53 @@ class ScriptedClient:
         if isinstance(item, Exception):
             raise item
         return item
+
+    @staticmethod
+    def _fixed_or_raise(value, default):
+        if value is None:
+            return default
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def send_meters_11_through_15(self):
+        return self._fixed_or_raise(
+            self._meters_11_15,
+            Meters11Through15(total_coin_in=0, total_coin_out=0, total_drop=0, total_jackpot=0, games_played=0),
+        )
+
+    def send_extended_meters_group(self):
+        return self._fixed_or_raise(
+            self._extended_meters_group,
+            ExtendedMeters(
+                total_coin_in=0, total_coin_out=0, total_drop=0, total_jackpot=0,
+                games_played=0, games_won=0, slot_door_opened=0, power_reset=0,
+            ),
+        )
+
+    def send_games_since_power_up_and_door_closure(self):
+        return self._fixed_or_raise(
+            self._games_since_power_up,
+            GamesSincePowerUpAndDoorClosure(games_since_power_up=0, games_since_door_closure=0),
+        )
+
+    def send_total_bill_meters(self):
+        return self._fixed_or_raise(
+            self._total_bill_meters,
+            BillMeters(bills_1=0, bills_5=0, bills_10=0, bills_20=0, bills_50=0, bills_100=0),
+        )
+
+    def send_total_hand_paid_cancelled_credits(self, game_number=0):
+        return self._fixed_or_raise(self._hand_paid_cancelled_credits, 0)
+
+    def send_current_hopper_status(self):
+        return self._fixed_or_raise(self._hopper_status, HopperStatus(status=0, percent_full=0, level=0))
+
+    def send_meter(self, poll):
+        value = self._single_meter_values.get(poll, 0)
+        if isinstance(value, Exception):
+            raise value
+        return value
 
     def send_ticket_validation_data(self):
         item = self._ticket_script.pop(0)
@@ -328,6 +406,137 @@ def test_ticket_meter_decrease_arms_the_burst_window_like_a_core_meter_decrease(
     assert state.burst_remaining == 0  # first cycle: nothing to compare against yet
     poll_and_log(client, conn, state, history, monotonic_fn=clock)
     assert state.burst_remaining == history.burst_count - 1
+    assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
+
+
+# --- the wider meter sweep: LP 0x18/0x19/0x1C/0x1E/0x2D/0x4F and the ~39
+#     single-meter polls (LP 0x10-0x51/0x55) -- deliberately redundant with
+#     the core six and with each other; see the module docstring for why ---
+
+
+def test_poll_and_log_writes_every_meter_column():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()])
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    row = conn.execute(f"SELECT {', '.join(ALL_METER_FIELDS)} FROM meters_current").fetchone()
+    assert row is not None
+    assert len(row) == len(ALL_METER_FIELDS)
+    # every default across every group is 0 -- nothing silently missing or None
+    assert all(v == 0 for v in row)
+
+
+def test_redundant_meter_reads_are_stored_independently_even_when_they_disagree():
+    """Different long polls reading the same underlying counter aren't
+    reconciled or deduped by this tool -- storing both, even when they
+    disagree, is the point (see the module docstring): three long polls
+    disagreeing about "total coin in" this cycle is a real finding a
+    single poll can never surface.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters(total_coin_in=100)],
+        meters_11_15=Meters11Through15(
+            total_coin_in=999, total_coin_out=0, total_drop=0, total_jackpot=0, games_played=0
+        ),
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    row = conn.execute("SELECT total_coin_in, lp19_total_coin_in FROM meters_current").fetchone()
+    assert row == (100, 999)
+
+
+def test_skip_full_meter_sweep_leaves_single_meter_columns_null_but_other_groups_populate():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters(total_coin_in=7)])
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, full_meter_sweep=False)
+    row = conn.execute(
+        "SELECT total_coin_in, sm_true_coin_in, lp19_total_coin_in FROM meters_current"
+    ).fetchone()
+    assert row == (7, None, 0)
+
+
+def test_toggling_full_meter_sweep_between_cycles_does_not_crash_decrease_check():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters(), make_meters()])
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, full_meter_sweep=True)
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, full_meter_sweep=False)
+    assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "kwarg,poll_name",
+    [
+        ("meters_11_15", "send_meters_11_through_15"),
+        ("extended_meters_group", "send_extended_meters_group"),
+        ("games_since_power_up", "send_games_since_power_up_and_door_closure"),
+        ("total_bill_meters", "send_total_bill_meters"),
+        ("hand_paid_cancelled_credits", "send_total_hand_paid_cancelled_credits"),
+        ("hopper_status", "send_current_hopper_status"),
+    ],
+)
+def test_any_new_meter_group_poll_failure_aborts_the_whole_cycle(kwarg, poll_name):
+    """Confirms the "any poll failure aborts the whole cycle" rule holds
+    for every meter poll added in this expansion, not just LP 0x0F/0x2F.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters(total_coin_in=5)], **{kwarg: SASTimeoutError("no response")})
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    rows = conn.execute("SELECT poll_name, error_type FROM poll_errors").fetchall()
+    assert rows == [(poll_name, "SASTimeoutError")]
+    assert conn.execute("SELECT COUNT(*) FROM meters_current").fetchone()[0] == 0
+
+
+def test_single_meter_sweep_failure_aborts_the_whole_cycle():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        single_meter_values={LongPoll.SEND_TRUE_COIN_IN: SASTimeoutError("no response")},
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    rows = conn.execute("SELECT poll_name, error_type FROM poll_errors").fetchall()
+    assert rows == [("send_meter(SEND_TRUE_COIN_IN)", "SASTimeoutError")]
+    assert conn.execute("SELECT COUNT(*) FROM meters_current").fetchone()[0] == 0
+
+
+def test_gauge_fields_decreasing_does_not_arm_the_burst_window():
+    """Current credits, current hopper level/status, and selected game
+    number go up and down in normal operation -- a decrease there is not
+    the anomaly signal a cumulative-counter decrease is. See
+    GAUGE_METER_FIELDS.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters(), make_meters()],
+        hopper_status=HopperStatus(status=1, percent_full=90, level=900),
+        single_meter_values={LongPoll.SEND_CURRENT_CREDITS: 500},
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    # second cycle: hopper drains and the player's credit balance drops --
+    # both ordinary gauge movement, not a rollover
+    client._hopper_status = HopperStatus(status=1, percent_full=10, level=100)
+    client._single_meter_values[LongPoll.SEND_CURRENT_CREDITS] = 0
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    assert state.burst_remaining == 0
     assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
 
 

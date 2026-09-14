@@ -276,10 +276,25 @@ safely own the serial port, and ticket/cashout capture depends on
 seeing the same general-poll stream meters share the connection with
 (see §4.4).
 
-**Meters** cover the six core counters (long poll `0x0F`) plus the eight
-cumulative ticket meters — Cashable/Restricted Ticket In/Out, cents and
-count (long poll `0x2F`, the only way to reach these) — all in one row,
-one history table, in one of two modes picked with `--mode`:
+**Meters** cover as much of this client's meter coverage as fits in one
+row: the six core counters (`0x0F`), the eight cumulative ticket meters
+(`0x2F`, the only way to reach these), independent re-reads of several
+of the same core counters via `0x19`/`0x1C` (`0x1C` also adds games
+won/slot door opened/power reset), games since power-up/door-closure
+(`0x18`), bill meters by denomination (`0x1E`), hand-paid cancelled
+credits (`0x2D`), current hopper status (`0x4F`), and — unless
+`--skip-full-meter-sweep` is given — every other single-meter long poll
+this client implements (`0x10`-`0x51`/`0x55`, roughly 39 more). See
+`ALL_METER_FIELDS` in `sql_poll_logger.py` for the exact, current column
+list — with close to 80 columns, that source list is the one this manual
+won't try to keep a duplicate of. Several of these are deliberately
+redundant: three long polls disagreeing about "total coin in" this cycle
+is a real finding a single poll can never surface, and this is a
+reference/stress-testing tool, not one trying to economize on wire
+traffic — see §4.4 and the module docstring for the full reasoning, and
+`--skip-full-meter-sweep` if the ~39-poll sweep is too much traffic for
+your hardware. All of it lands in one row, one history table, in one of
+two modes picked with `--mode`:
 
 - **`ring`** (the default) — a single always-current-value row, plus a
   history table capped at a fixed size (oldest rows evicted) and
@@ -359,6 +374,7 @@ A lab/stress-test run: logs every single poll (uncapped), polling every
 | `--skip-ticket-out-backfill` | off | Skip the one-time startup read of the full ticket-out buffer (indices 1–31). |
 | `--seed-validation-pool N` | `0` | Top up `validation_pool` to at least `N` `available` rows with random 16-digit test numbers. `0` means don't seed — do this if you're hand-inserting real numbers instead. |
 | `--db-size-warning-mb MB` | `0` | Print a warning every cycle the database file is at or above this size — an early signal, not a substitute for the loud failure a full partition already produces on its own (see §4.4). `0` disables it. |
+| `--skip-full-meter-sweep` | off | Skip the ~39 individual single-meter long polls each cycle (their columns are left `NULL`); every other meter poll (core, ticket, `0x18`/`0x19`/`0x1C`/`0x1E`/`0x2D`/`0x4F`) still runs. Lighter per-cycle wire traffic for hardware where the full sweep isn't affordable — see §4.4. |
 
 ### 4.4 What's actually happening (technical)
 
@@ -440,18 +456,21 @@ above the threshold — a heads-up, not a fix, and not required for the
 loud-failure behavior above, which happens regardless of whether you set
 it.
 
-**2. Meters.** Two polls, both required to succeed before anything is
-written:
+**2. Meters.** `_poll_all_meters()` runs every meter poll this tool
+knows (see §4.1's list and `sql_poll_logger.py`'s `ALL_METER_FIELDS`),
+**all of which must succeed** before anything is written — the six core
+meters (`0x0F`), the eight ticket meters (`0x2F`), `0x18`/`0x19`/`0x1C`/
+`0x1E`/`0x2D`/`0x4F`, and (unless `--skip-full-meter-sweep`) the ~39
+single-meter polls. This is a deliberate, explicit design choice, not
+an accident of how the code happens to be structured: **any one poll in
+this group failing aborts the entire cycle's meter write**, the same as
+it always has for the original two. A row that's fresh in some meter
+columns and stale (or missing) in others would misrepresent what "as of
+`polled_at`" actually means, and that's just as true whether it's 2
+polls or 40.
 
-- `client.send_meters_10_through_15()` (long poll `0x0F`) for the six
-  core meters.
-- `client.send_selected_meters(TICKET_METER_CODES)` (long poll `0x2F`)
-  for the eight cumulative ticket meters — Cashable/Restricted Ticket
-  In/Out, cents and count (Table C-7). This is the only long poll that
-  can reach these at all; `0x0F` doesn't carry them.
-
-On success of both, `meters_current` (always exactly one row) is
-overwritten with the latest values from both polls, unconditionally,
+On success of every poll, `meters_current` (always exactly one row) is
+overwritten with the latest values from all of them, unconditionally,
 every cycle. Whether that cycle *also* writes a new row to
 `meters_history` depends on the mode:
 
@@ -460,25 +479,32 @@ every cycle. Whether that cycle *also* writes a new row to
   `--history-interval` seconds have passed since the last history
   write, or a **burst** is active.
 
-A burst starts when any of the fourteen meter values — core or ticket —
-goes down since the last successful poll (SAS meters are cumulative
-counters — a decrease usually means something worth a closer look, like
-a meter rollover or a reset), or when either poll fails outright, or
-when a caller embedding `poll_and_log()` directly (rather than running
-this as a script) passes `anomaly=True` from its own logic. Once
-started, a burst writes the next `--burst-count` successful polls to
-history at full resolution — one per cycle, cadence ignored — before
-returning to the normal interval. This is deliberate: that's where the
-diagnostic value actually is, and it's cheap precisely because it's rare.
+A burst starts when any *cumulative* meter value goes down since the
+last successful poll (SAS meters are cumulative counters — a decrease
+usually means something worth a closer look, like a meter rollover or a
+reset), or when any poll in the group fails outright, or when a caller
+embedding `poll_and_log()` directly (rather than running this as a
+script) passes `anomaly=True` from its own logic. A handful of fields
+are gauges, not counters — current hopper level/status, current
+credits, selected game number — and are excluded from this check (see
+`GAUGE_METER_FIELDS`), since a decrease there is normal operation, not
+an anomaly. Once a burst starts, it writes the next `--burst-count`
+successful polls to history at full resolution — one per cycle, cadence
+ignored — before returning to the normal interval. This is deliberate:
+that's where the diagnostic value actually is, and it's cheap precisely
+because it's rare.
 
-On a `SASError` from *either* poll, the exception's type and message are
-inserted into `poll_errors` instead (this table's shape and behavior are
-unchanged from before — see §6.3), and **neither** `meters_current` nor
-`meters_history` is written that cycle — a row that's fresh in the core
-meters and stale (or missing) in the ticket meters, or vice versa, would
-misrepresent what "as of `polled_at`" actually means. The loop continues
-after `--interval` seconds either way; one bad exchange — a timeout, a
-checksum failure, anything — never stops the run.
+On a `SASError` from *any* poll in the group, the exception's type,
+message, and the specific poll that failed are inserted into
+`poll_errors` (this table's shape and behavior are unchanged from
+before — see §6.3), and **nothing** is written to `meters_current` or
+`meters_history` that cycle. The loop continues after `--interval`
+seconds either way; one bad exchange — a timeout, a checksum failure,
+anything — never stops the run. `--skip-full-meter-sweep` is the
+practical lever if this many polls per cycle (six grouped polls plus
+~39 single-meter ones) is more wire traffic than your hardware or
+`--interval` can absorb — it drops the ~39-poll sweep specifically
+(leaving its columns `NULL` that cycle) while keeping every grouped poll.
 
 ### 4.5 Troubleshooting
 
@@ -497,12 +523,20 @@ checksum failure, anything — never stops the run.
   still fresh every cycle; check that first if you want the latest
   value, not `meters_history`.
 - **`meters_current`/`meters_history` stop updating, but `poll_errors`
-  is filling up with `send_selected_meters(ticket_meters)` rows**: the
-  core meters (`0x0F`) are fine but the ticket-meter poll (`0x2F`) is
-  failing — check the error's own type/message column first. Either
-  poll failing blocks that cycle's meter write entirely (see §4.4), so
+  is filling up**: `poll_name` names exactly which of this tool's many
+  meter polls is failing (`send_meters_10_through_15`,
+  `send_selected_meters(ticket_meters)`, `send_meter(SEND_TRUE_COIN_IN)`,
+  etc.) — check the error's own type/message column first. Any one of
+  them failing blocks that cycle's *entire* meter write (see §4.4), so
   this isn't a partial-data situation to work around, it's a real
   problem with that specific long poll on this machine.
+- **Every cycle logs a `send_meter(...)` failure and nothing else looks
+  wrong**: this machine doesn't answer one (or several) of the ~39
+  single-meter polls in the sweep — some SAS implementations only
+  support a subset of Appendix B. `--skip-full-meter-sweep` drops that
+  whole sweep (leaving its columns `NULL`) while keeping every other
+  meter poll working normally; that's the practical fix if this
+  machine simply doesn't speak all of them.
 - **Database file grows large during a long `append`-mode stress run**:
   expected — that mode never deletes rows by design. Either plan disk
   space accordingly or switch to `ring` mode, which won't grow past
@@ -732,31 +766,16 @@ CREATE TABLE IF NOT EXISTS meters_current (
     games_played INTEGER,
     ticket_in_cashable_cents INTEGER,
     ticket_in_cashable_count INTEGER,
-    ticket_in_restricted_cents INTEGER,
-    ticket_in_restricted_count INTEGER,
-    ticket_out_cashable_cents INTEGER,
-    ticket_out_cashable_count INTEGER,
-    ticket_out_restricted_cents INTEGER,
-    ticket_out_restricted_count INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS meters_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    polled_at TEXT NOT NULL,
-    total_cancelled_credits INTEGER,
-    total_coin_in INTEGER,
-    total_coin_out INTEGER,
-    total_drop INTEGER,
-    total_jackpot INTEGER,
-    games_played INTEGER,
-    ticket_in_cashable_cents INTEGER,
-    ticket_in_cashable_count INTEGER,
-    ticket_in_restricted_cents INTEGER,
-    ticket_in_restricted_count INTEGER,
-    ticket_out_cashable_cents INTEGER,
-    ticket_out_cashable_count INTEGER,
-    ticket_out_restricted_cents INTEGER,
-    ticket_out_restricted_count INTEGER
+    -- ... and ~70 more meter columns, generated (not hand-typed) from
+    -- ALL_METER_FIELDS in sql_poll_logger.py -- see that name for the
+    -- full, current, authoritative list; this manual won't try to keep
+    -- a duplicate of a list that size in sync by hand. Covers every
+    -- ticket meter (LP 0x2F), LP 0x18/0x19/0x1C/0x1E/0x2D/0x4F, and
+    -- (unless --skip-full-meter-sweep) every other single-meter long
+    -- poll this client implements -- ~80 columns total, deliberately
+    -- including several that read the same underlying counter as
+    -- total_coin_in above through an entirely independent long poll.
+    -- meters_history has the identical column set (same generation).
 );
 
 CREATE TABLE IF NOT EXISTS poll_errors (
@@ -848,9 +867,10 @@ CREATE TABLE IF NOT EXISTS validation_pool (
   are one row per transaction. Both are worth keeping: the cumulative
   meter is what you'd reconcile against (does the machine's own count
   agree with what we captured?), and it's polled/written on exactly the
-  same cadence/rollover logic as the six core meters — one LP 0F/2F
-  failure aborts that cycle's write for both rather than saving a row
-  that's fresh in one half and stale or missing in the other.
+  same cadence/rollover logic as every other meter column — any one
+  meter poll failing (not just LP 0x0F/0x2F; see §4.4) aborts that
+  cycle's write for all of them rather than saving a row that's fresh in
+  some columns and stale or missing in others.
 - **Identity, not position, decides what counts as a duplicate.**
   `ticket_out_history` is read two different ways — a non-destructive
   startup walk by buffer position, and a live, destructive drain

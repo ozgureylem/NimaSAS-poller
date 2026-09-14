@@ -31,13 +31,26 @@ What each cycle does, in order:
    pending cashout amount (LP 57), take the next available number from
    the pool, and answer with it (LP 58) — see "Gateway-local cashout
    validation" below.
-2. Meters: the six core meters (LP 0F) plus the eight cumulative ticket
-   meters (LP 2F — Cashable/Restricted Ticket In/Out, cents and count;
-   the only way to reach these at all, since LP 0F can't report them),
+2. Meters — deliberately as many as this client can reach in one cycle,
    all in the same row, on the same cadence/ring-history/rollover logic
-   (see the HistoryConfig docstring and MANUAL.md §4/§6). A poll failure
-   on either LP aborts that cycle's meter write rather than saving a
-   snapshot that's only half current.
+   (see the HistoryConfig docstring and MANUAL.md §4/§6): the six core
+   meters (LP 0F), the eight cumulative ticket meters (LP 2F — the only
+   way to reach these at all), LP 0x19/0x1C's own independent reads of
+   several of the same core counters, games-since-power-up/door-closure
+   (LP 0x18), total bill meters by denomination (LP 0x1E), hand-paid
+   cancelled credits (LP 0x2D), current hopper status (LP 0x4F), and —
+   unless --skip-full-meter-sweep is given — every other single-meter
+   long poll this client knows how to read (LP 0x10-0x51/0x55, ~39
+   polls). Several of these deliberately overlap: LP 0x19/0x1C, and most
+   of the single-meter sweep, report counters LP 0x0F already reports,
+   through entirely independent request/response exchanges. That
+   redundancy is the point, not an oversight — three long polls
+   disagreeing about "total coin in" this cycle is a real finding a
+   single poll can never surface, and a reference/stress-testing tool
+   has no reason to economize on wire traffic the way a production
+   gateway might. A poll failure anywhere in this group aborts that
+   cycle's entire meter write, rather than saving a row that's fresh in
+   some columns and stale or missing in others.
 
 On startup, the full ticket-out buffer (indices 1-31, non-destructive —
 see send_enhanced_validation_information()'s docstring) is also read
@@ -82,6 +95,12 @@ ticket-in buffer the way it has one for ticket-out (LP 4D). If you need
 a full ticket-in audit trail, this tool has to be running continuously
 from before the first ticket you care about.
 
+What this does NOT cover, even with the full meter sweep: per-game
+meters/configuration (LP 0x52/0x53). Those are indexed by game number,
+which varies per machine, so they don't fit a fixed set of columns the
+way every meter above does — a real gap, not scoped out on purpose, left
+for a future child table keyed on game_number.
+
 Nothing here ever deletes a ticket-in or ticket-out row to free space,
 even under sustained disk pressure — that decision belongs to whatever
 eventually syncs this data to a server (see synced_at, below), matching
@@ -107,13 +126,17 @@ explicit anomaly signal (see poll_and_log()'s ``anomaly`` parameter, for
 callers embedding this as a library function rather than running it as
 a script) makes the next few polls log at full resolution regardless of
 the normal cadence — that's where the diagnostic value actually is, and
-it's cheap because it's rare.
+it's cheap because it's rare. A handful of fields are gauges, not
+cumulative counters (current hopper level/status, current credits,
+selected game number) — a decrease there is normal, not anomalous, so
+they're excluded from this check; see GAUGE_METER_FIELDS.
 
 Usage:
     python3 examples/sql_poll_logger.py gateway.ini
     python3 examples/sql_poll_logger.py gateway.ini --db gateway.sqlite3 --interval 5
     python3 examples/sql_poll_logger.py gateway.ini --cycles 100   # stop after 100 cycles
     python3 examples/sql_poll_logger.py gateway.ini --mode append  # lab/stress-testing: log every meter poll, uncapped
+    python3 examples/sql_poll_logger.py gateway.ini --skip-full-meter-sweep  # skip the ~39 single-meter polls, lighter per cycle
 
 ``gateway.ini`` is the file commission_gateway.py writes (see MANUAL.md),
 or one you hand-wrote in the same format.
@@ -131,49 +154,182 @@ import time
 from dataclasses import dataclass
 
 from saspy.config import connect_from_config
-from saspy.constants import ExceptionCode, MeterCode
+from saspy.constants import SIMPLE_METER_WIDTH_BCD, ExceptionCode, LongPoll, MeterCode
 from saspy.exceptions import SASError
 from saspy.models import EnhancedValidationInfo
 
 DEFAULT_VALIDATION_SYSTEM_ID = 1  # 0 means "deny" per Table 15.8a — never use it for a real pool entry
 
-SCHEMA = """
+# --- Meter columns: every long poll this tool reads into meters_current/
+#     meters_history, grouped by the poll that produces it. Defined before
+#     SCHEMA so the schema's own column list is generated from these tuples
+#     rather than hand-duplicated — at ~80 columns, keeping one source of
+#     truth matters more than reading a literal CREATE TABLE end to end.
+
+METER_FIELDS = (  # LP 0x0F (Table 7.1a/7.1b) — the six core meters
+    "total_cancelled_credits",
+    "total_coin_in",
+    "total_coin_out",
+    "total_drop",
+    "total_jackpot",
+    "games_played",
+)
+
+# Column name and MeterCode are paired by position — zip(TICKET_METER_COLUMNS,
+# TICKET_METER_CODES) is the single source of truth for that mapping, used
+# both to build the LP 2F request and to place its response into the row.
+TICKET_METER_COLUMNS = (  # LP 0x2F — the only way to reach these at all
+    "ticket_in_cashable_cents",
+    "ticket_in_cashable_count",
+    "ticket_in_restricted_cents",
+    "ticket_in_restricted_count",
+    "ticket_out_cashable_cents",
+    "ticket_out_cashable_count",
+    "ticket_out_restricted_cents",
+    "ticket_out_restricted_count",
+)
+TICKET_METER_CODES = (
+    MeterCode.CASHABLE_TICKET_IN_CENTS,
+    MeterCode.CASHABLE_TICKET_IN_QUANTITY,
+    MeterCode.RESTRICTED_TICKET_IN_CENTS,
+    MeterCode.RESTRICTED_TICKET_IN_QUANTITY,
+    MeterCode.CASHABLE_TICKET_OUT_CENTS,
+    MeterCode.CASHABLE_TICKET_OUT_QUANTITY,
+    MeterCode.RESTRICTED_TICKET_OUT_CENTS,
+    MeterCode.RESTRICTED_TICKET_OUT_QUANTITY,
+)  # all 8 fit in one LP 2F poll (max 10 codes per request, §7.3)
+
+LP19_METER_COLUMNS = (  # LP 0x19 (Table 7.2b) — independent re-read of 5 of the 6 core meters
+    "lp19_total_coin_in",
+    "lp19_total_coin_out",
+    "lp19_total_drop",
+    "lp19_total_jackpot",
+    "lp19_games_played",
+)
+
+LP1C_METER_COLUMNS = (  # LP 0x1C (Table 7.2c) — independent re-read of 5, plus 3 new fields
+    "lp1c_total_coin_in",
+    "lp1c_total_coin_out",
+    "lp1c_total_drop",
+    "lp1c_total_jackpot",
+    "lp1c_games_played",
+    "lp1c_games_won",
+    "lp1c_slot_door_opened",
+    "lp1c_power_reset",
+)
+
+LP18_METER_COLUMNS = (  # LP 0x18 (Table 7.7)
+    "lp18_games_since_power_up",
+    "lp18_games_since_door_closure",
+)
+
+LP1E_METER_COLUMNS = (  # LP 0x1E — 6 "bills in" count meters by denomination
+    "lp1e_bills_1",
+    "lp1e_bills_5",
+    "lp1e_bills_10",
+    "lp1e_bills_20",
+    "lp1e_bills_50",
+    "lp1e_bills_100",
+)
+
+LP2D_METER_COLUMNS = ("lp2d_total_hand_paid_cancelled_credits",)  # LP 0x2D, game_number=0 (all games)
+
+LP4F_METER_COLUMNS = (  # LP 0x4F (Table 7.19a/7.19b) — gauges, not cumulative counters
+    "lp4f_hopper_status",
+    "lp4f_hopper_percent_full",
+    "lp4f_hopper_level",
+)
+
+# Every other single-meter long poll this client implements (SASClient.send_meter()),
+# named "sm_" + a descriptive name so none can collide with a column above even
+# where the underlying counter is the same one LP 0x0F/0x19/0x1C already report
+# (e.g. sm_total_coin_in). Built from SIMPLE_METER_WIDTH_BCD so this list can
+# never drift from what SASClient actually supports.
+SINGLE_METER_COLUMNS: dict[LongPoll, str] = {
+    LongPoll.SEND_TOTAL_CANCELLED_CREDITS_METER: "sm_total_cancelled_credits",
+    LongPoll.SEND_TOTAL_COIN_IN_METER: "sm_total_coin_in",
+    LongPoll.SEND_TOTAL_COIN_OUT_METER: "sm_total_coin_out",
+    LongPoll.SEND_TOTAL_DROP_METER: "sm_total_drop",
+    LongPoll.SEND_TOTAL_JACKPOT_METER: "sm_total_jackpot",
+    LongPoll.SEND_GAMES_PLAYED_METER: "sm_games_played",
+    LongPoll.SEND_GAMES_WON_METER: "sm_games_won",
+    LongPoll.SEND_GAMES_LOST_METER: "sm_games_lost",
+    LongPoll.SEND_CURRENT_CREDITS: "sm_current_credits",  # gauge: the player's current balance, not cumulative
+    LongPoll.SEND_TOTAL_DOLLAR_VALUE_OF_BILLS: "sm_total_dollar_value_of_bills",
+    LongPoll.SEND_TRUE_COIN_IN: "sm_true_coin_in",
+    LongPoll.SEND_TRUE_COIN_OUT: "sm_true_coin_out",
+    LongPoll.SEND_CURRENT_HOPPER_LEVEL: "sm_current_hopper_level",  # gauge
+    LongPoll.SEND_BILLS_IN_METER_1: "sm_bills_in_1",
+    LongPoll.SEND_BILLS_IN_METER_2: "sm_bills_in_2",
+    LongPoll.SEND_BILLS_IN_METER_5: "sm_bills_in_5",
+    LongPoll.SEND_BILLS_IN_METER_10: "sm_bills_in_10",
+    LongPoll.SEND_BILLS_IN_METER_20: "sm_bills_in_20",
+    LongPoll.SEND_BILLS_IN_METER_50: "sm_bills_in_50",
+    LongPoll.SEND_BILLS_IN_METER_100: "sm_bills_in_100",
+    LongPoll.SEND_BILLS_IN_METER_500: "sm_bills_in_500",
+    LongPoll.SEND_BILLS_IN_METER_1000: "sm_bills_in_1000",
+    LongPoll.SEND_BILLS_IN_METER_200: "sm_bills_in_200",
+    LongPoll.SEND_BILLS_IN_METER_25: "sm_bills_in_25",
+    LongPoll.SEND_BILLS_IN_METER_2000: "sm_bills_in_2000",
+    LongPoll.SEND_BILLS_IN_METER_2500: "sm_bills_in_2500",
+    LongPoll.SEND_BILLS_IN_METER_5000: "sm_bills_in_5000",
+    LongPoll.SEND_BILLS_IN_METER_10000: "sm_bills_in_10000",
+    LongPoll.SEND_BILLS_IN_METER_20000: "sm_bills_in_20000",
+    LongPoll.SEND_BILLS_IN_METER_25000: "sm_bills_in_25000",
+    LongPoll.SEND_BILLS_IN_METER_50000: "sm_bills_in_50000",
+    LongPoll.SEND_BILLS_IN_METER_100000: "sm_bills_in_100000",
+    LongPoll.SEND_BILLS_IN_METER_250: "sm_bills_in_250",
+    LongPoll.SEND_CREDIT_AMOUNT_OF_ALL_BILLS_ACCEPTED: "sm_credit_amount_of_all_bills_accepted",
+    LongPoll.SEND_COIN_AMOUNT_FROM_EXTERNAL_ACCEPTOR: "sm_coin_amount_from_external_acceptor",
+    LongPoll.SEND_BILLS_IN_STACKER_COUNT: "sm_bills_in_stacker_count",
+    LongPoll.SEND_BILLS_IN_STACKER_CREDIT_AMOUNT: "sm_bills_in_stacker_credit_amount",
+    LongPoll.SEND_TOTAL_GAMES_IMPLEMENTED: "sm_total_games_implemented",  # config, not really a meter, kept for completeness
+    LongPoll.SEND_SELECTED_GAME_NUMBER: "sm_selected_game_number",  # gauge: current game, not cumulative
+}
+assert set(SINGLE_METER_COLUMNS) == set(SIMPLE_METER_WIDTH_BCD), (
+    "SINGLE_METER_COLUMNS must cover exactly what SASClient.send_meter() supports"
+)
+
+# Gauges: fields that go up AND down in normal operation, so a decrease here
+# is not the diagnostic signal it is for a cumulative counter. Excluded from
+# poll_and_log()'s burst-arming "decreased" check, not from the row itself.
+GAUGE_METER_FIELDS = frozenset(
+    {
+        "lp4f_hopper_status",
+        "lp4f_hopper_percent_full",
+        "lp4f_hopper_level",  # also the one field here that can be None (Table 7.19a: no hopper-level sensor)
+        "sm_current_credits",
+        "sm_current_hopper_level",
+        "sm_selected_game_number",
+    }
+)
+
+ALL_METER_FIELDS = (
+    METER_FIELDS
+    + TICKET_METER_COLUMNS
+    + LP19_METER_COLUMNS
+    + LP1C_METER_COLUMNS
+    + LP18_METER_COLUMNS
+    + LP1E_METER_COLUMNS
+    + LP2D_METER_COLUMNS
+    + LP4F_METER_COLUMNS
+    + tuple(SINGLE_METER_COLUMNS.values())
+)
+DECREASE_CHECK_FIELDS = tuple(f for f in ALL_METER_FIELDS if f not in GAUGE_METER_FIELDS)
+
+_METER_COLUMN_DDL = ",\n    ".join(f"{field} INTEGER" for field in ALL_METER_FIELDS)
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS meters_current (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     polled_at TEXT NOT NULL,
-    total_cancelled_credits INTEGER,
-    total_coin_in INTEGER,
-    total_coin_out INTEGER,
-    total_drop INTEGER,
-    total_jackpot INTEGER,
-    games_played INTEGER,
-    ticket_in_cashable_cents INTEGER,
-    ticket_in_cashable_count INTEGER,
-    ticket_in_restricted_cents INTEGER,
-    ticket_in_restricted_count INTEGER,
-    ticket_out_cashable_cents INTEGER,
-    ticket_out_cashable_count INTEGER,
-    ticket_out_restricted_cents INTEGER,
-    ticket_out_restricted_count INTEGER
+    {_METER_COLUMN_DDL}
 );
 
 CREATE TABLE IF NOT EXISTS meters_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     polled_at TEXT NOT NULL,
-    total_cancelled_credits INTEGER,
-    total_coin_in INTEGER,
-    total_coin_out INTEGER,
-    total_drop INTEGER,
-    total_jackpot INTEGER,
-    games_played INTEGER,
-    ticket_in_cashable_cents INTEGER,
-    ticket_in_cashable_count INTEGER,
-    ticket_in_restricted_cents INTEGER,
-    ticket_in_restricted_count INTEGER,
-    ticket_out_cashable_cents INTEGER,
-    ticket_out_cashable_count INTEGER,
-    ticket_out_restricted_cents INTEGER,
-    ticket_out_restricted_count INTEGER
+    {_METER_COLUMN_DDL}
 );
 
 CREATE TABLE IF NOT EXISTS poll_errors (
@@ -230,18 +386,24 @@ CREATE TABLE IF NOT EXISTS validation_pool (
 # written every cycle, unconditionally: the original behavior, still the
 # right one for a lab/stress run on ordinary disk.
 #
-# Both tables' ticket_in_*/ticket_out_* columns are the machine's own
-# cumulative SAS meters (LP 2F — MeterCode.CASHABLE_TICKET_IN_CENTS and
-# its seven siblings, Table C-7), polled alongside the six core meters
-# every cycle. These are a different thing from ticket_in_events and
-# ticket_out_history below: those tables record individual transactions
-# (one row per ticket); these columns are running totals the machine
-# itself maintains, useful for reconciling "does the machine's own count
-# agree with what we captured per-ticket" without summing either table.
-# Being ordinary BCD meters, they roll over exactly like the core six
-# (§8.2) — decode_bcd() has no notion of "value decreased," so a wrapped
-# ticket meter is just a normal, smaller read, and is treated exactly
-# like a core-meter decrease below: diagnostic burst signal, not an error.
+# Both tables carry ~80 meter columns, generated from ALL_METER_FIELDS
+# (see above) rather than hand-typed here — deliberately redundant by
+# design, not an accident: LP 0x0F/0x19/0x1C, and most of the "sm_"
+# single-meter sweep, independently report several of the same
+# underlying counters through entirely different request/response
+# exchanges. Three long polls disagreeing about "total coin in" this
+# cycle is a real finding; a schema that only kept one of them couldn't
+# surface it. ticket_in_*/ticket_out_* (LP 2F) are a different thing
+# again from ticket_in_events/ticket_out_history below: those record
+# individual transactions (one row per ticket); these columns are
+# running totals the machine itself maintains, useful for reconciling
+# "does the machine's own count agree with what we captured per-ticket"
+# without summing either table. Being ordinary BCD meters, all of these
+# roll over exactly like the core six (§8.2) — decode_bcd() has no
+# notion of "value decreased," so a wrapped meter is just a normal,
+# smaller read, treated as diagnostic burst signal, not an error (except
+# the handful of true gauges in GAUGE_METER_FIELDS, where a decrease is
+# just normal operation, not a rollover).
 #
 # ticket_out_history is deduplicated on (validation_number, ticket_date,
 # ticket_time) — the startup backfill (non-destructive, by buffer index)
@@ -275,41 +437,6 @@ CREATE TABLE IF NOT EXISTS validation_pool (
 DEFAULT_HISTORY_CAP = 200
 DEFAULT_HISTORY_INTERVAL = 60.0
 DEFAULT_BURST_COUNT = 10
-
-METER_FIELDS = (
-    "total_cancelled_credits",
-    "total_coin_in",
-    "total_coin_out",
-    "total_drop",
-    "total_jackpot",
-    "games_played",
-)
-
-# Column name and MeterCode are paired by position — zip(TICKET_METER_COLUMNS,
-# TICKET_METER_CODES) is the single source of truth for that mapping, used
-# both to build the LP 2F request and to place its response into the row.
-TICKET_METER_COLUMNS = (
-    "ticket_in_cashable_cents",
-    "ticket_in_cashable_count",
-    "ticket_in_restricted_cents",
-    "ticket_in_restricted_count",
-    "ticket_out_cashable_cents",
-    "ticket_out_cashable_count",
-    "ticket_out_restricted_cents",
-    "ticket_out_restricted_count",
-)
-TICKET_METER_CODES = (
-    MeterCode.CASHABLE_TICKET_IN_CENTS,
-    MeterCode.CASHABLE_TICKET_IN_QUANTITY,
-    MeterCode.RESTRICTED_TICKET_IN_CENTS,
-    MeterCode.RESTRICTED_TICKET_IN_QUANTITY,
-    MeterCode.CASHABLE_TICKET_OUT_CENTS,
-    MeterCode.CASHABLE_TICKET_OUT_QUANTITY,
-    MeterCode.RESTRICTED_TICKET_OUT_CENTS,
-    MeterCode.RESTRICTED_TICKET_OUT_QUANTITY,
-)  # all 8 fit in one LP 2F poll (max 10 codes per request, §7.3)
-
-ALL_METER_FIELDS = METER_FIELDS + TICKET_METER_COLUMNS
 
 
 @dataclass
@@ -576,6 +703,87 @@ def _capture_ticket_in(client, conn: sqlite3.Connection, now: str) -> None:
     print(f"[{now}] ticket-in captured: amount_cents={ticket.amount_cents} (not redeemed — see module docstring)")
 
 
+class _MeterPollFailure(Exception):
+    """Internal signal: one meter poll failed. Carries which poll and the
+    original SASError so the caller can log a precise poll_errors row.
+    Any failure anywhere in _poll_all_meters() aborts the whole cycle's
+    meter write — see poll_and_log() and the module docstring for why:
+    a row that's fresh in some meter columns and stale or missing in
+    others would misrepresent what "as of polled_at" means.
+    """
+
+    def __init__(self, poll_name: str, original: SASError):
+        super().__init__(f"{poll_name}: {original}")
+        self.poll_name = poll_name
+        self.original = original
+
+
+def _poll_all_meters(client, *, full_sweep: bool = True) -> dict:
+    """Poll every meter this tool knows how to read, in one pass, and
+    return {column: value} covering every name in ALL_METER_FIELDS.
+    Raises _MeterPollFailure on the first failure, naming exactly which
+    poll failed. When ``full_sweep`` is False, the ~39 SINGLE_METER_COLUMNS
+    are skipped and left as None (NULL) in the returned row rather than
+    polled — a lighter-weight cycle for hardware where that much extra
+    wire traffic per cycle isn't affordable; see --skip-full-meter-sweep.
+    """
+    values: dict = {}
+
+    def poll(name, fn, *args):
+        try:
+            return fn(*args)
+        except SASError as e:
+            raise _MeterPollFailure(name, e) from e
+
+    meters = poll("send_meters_10_through_15", client.send_meters_10_through_15)
+    values.update({f: getattr(meters, f) for f in METER_FIELDS})
+
+    ticket_meters = poll("send_selected_meters(ticket_meters)", client.send_selected_meters, list(TICKET_METER_CODES))
+    values.update((c, ticket_meters.meters[code]) for c, code in zip(TICKET_METER_COLUMNS, TICKET_METER_CODES))
+
+    m19 = poll("send_meters_11_through_15", client.send_meters_11_through_15)
+    values.update(zip(LP19_METER_COLUMNS, (m19.total_coin_in, m19.total_coin_out, m19.total_drop, m19.total_jackpot, m19.games_played)))
+
+    m1c = poll("send_extended_meters_group", client.send_extended_meters_group)
+    values.update(
+        zip(
+            LP1C_METER_COLUMNS,
+            (
+                m1c.total_coin_in,
+                m1c.total_coin_out,
+                m1c.total_drop,
+                m1c.total_jackpot,
+                m1c.games_played,
+                m1c.games_won,
+                m1c.slot_door_opened,
+                m1c.power_reset,
+            ),
+        )
+    )
+
+    m18 = poll("send_games_since_power_up_and_door_closure", client.send_games_since_power_up_and_door_closure)
+    values.update(zip(LP18_METER_COLUMNS, (m18.games_since_power_up, m18.games_since_door_closure)))
+
+    bills = poll("send_total_bill_meters", client.send_total_bill_meters)
+    values.update(zip(LP1E_METER_COLUMNS, (bills.bills_1, bills.bills_5, bills.bills_10, bills.bills_20, bills.bills_50, bills.bills_100)))
+
+    values[LP2D_METER_COLUMNS[0]] = poll(
+        "send_total_hand_paid_cancelled_credits", client.send_total_hand_paid_cancelled_credits
+    )
+
+    hopper = poll("send_current_hopper_status", client.send_current_hopper_status)
+    values.update(zip(LP4F_METER_COLUMNS, (hopper.status, hopper.percent_full, hopper.level)))
+
+    if full_sweep:
+        for lp, column in SINGLE_METER_COLUMNS.items():
+            values[column] = poll(f"send_meter({lp.name})", client.send_meter, lp)
+    else:
+        for column in SINGLE_METER_COLUMNS.values():
+            values[column] = None
+
+    return values
+
+
 def poll_and_log(
     client,
     conn: sqlite3.Connection,
@@ -587,17 +795,20 @@ def poll_and_log(
     monotonic_fn=time.monotonic,
     db_size_warning_mb: int = 0,
     db_size_fn=_db_file_size_bytes,
+    full_meter_sweep: bool = True,
 ) -> None:
     """Run one full cycle: a general poll (dispatching to ticket-in/
-    ticket-out capture on the relevant exception codes), then the meters
-    poll — refreshing meters_current every cycle, and writing to
-    meters_history according to ``history``'s mode/cadence/cap, or
-    immediately (for the next ``history.burst_count`` cycles) on a meter
-    decrease, a failed poll, or an ``anomaly=True`` signal from the
-    caller. ``db_size_warning_mb`` (0 = disabled) prints a warning every
-    cycle the database file is at or above that size — an early signal
-    ahead of an actual full-partition write failure, not a substitute
-    for _safe_commit()'s own fault reporting when one happens anyway.
+    ticket-out capture on the relevant exception codes), then the full
+    meter poll (see _poll_all_meters()) — refreshing meters_current every
+    cycle, and writing to meters_history according to ``history``'s
+    mode/cadence/cap, or immediately (for the next ``history.burst_count``
+    cycles) on a meter decrease, a failed poll, or an ``anomaly=True``
+    signal from the caller. A failure in ANY meter poll aborts that
+    cycle's entire meter write — see _poll_all_meters()'s docstring.
+    ``db_size_warning_mb`` (0 = disabled) prints a warning every cycle
+    the database file is at or above that size — an early signal ahead
+    of an actual full-partition write failure, not a substitute for
+    _safe_commit()'s own fault reporting when one happens anyway.
     """
     now = now_fn()
 
@@ -630,33 +841,17 @@ def poll_and_log(
     mono_now = monotonic_fn()
 
     try:
-        meters = client.send_meters_10_through_15()
-    except SASError as e:
+        values = _poll_all_meters(client, full_sweep=full_meter_sweep)
+    except _MeterPollFailure as failure:
         conn.execute(
             "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
-            (now, "send_meters_10_through_15", type(e).__name__, str(e)),
+            (now, failure.poll_name, type(failure.original).__name__, str(failure.original)),
         )
         _safe_commit(conn, now)
         state.burst_remaining = max(state.burst_remaining, history.burst_count)
-        print(f"[{now}] meters poll failed: {type(e).__name__}: {e}")
+        print(f"[{now}] meters poll failed ({failure.poll_name}): {type(failure.original).__name__}: {failure.original}")
         return
 
-    try:
-        ticket_meters = client.send_selected_meters(list(TICKET_METER_CODES))
-    except SASError as e:
-        conn.execute(
-            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
-            (now, "send_selected_meters(ticket_meters)", type(e).__name__, str(e)),
-        )
-        _safe_commit(conn, now)
-        state.burst_remaining = max(state.burst_remaining, history.burst_count)
-        print(f"[{now}] ticket meters poll failed: {type(e).__name__}: {e}")
-        return
-
-    values = {field: getattr(meters, field) for field in METER_FIELDS}
-    values.update(
-        (column, ticket_meters.meters[code]) for column, code in zip(TICKET_METER_COLUMNS, TICKET_METER_CODES)
-    )
     columns = ", ".join(ALL_METER_FIELDS)
     qmarks = ", ".join("?" for _ in ALL_METER_FIELDS)
     bind = tuple(values[f] for f in ALL_METER_FIELDS)
@@ -667,7 +862,8 @@ def poll_and_log(
     )
 
     decreased = state.last_meters is not None and any(
-        values[f] < state.last_meters[f] for f in ALL_METER_FIELDS
+        values[f] is not None and state.last_meters.get(f) is not None and values[f] < state.last_meters[f]
+        for f in DECREASE_CHECK_FIELDS
     )
     if decreased or anomaly:
         state.burst_remaining = history.burst_count
@@ -766,6 +962,14 @@ def main() -> int:
         help="print a warning every cycle the database file is at or above this size, as an early "
         "signal before a full partition actually fails a write (default: 0, disabled)",
     )
+    parser.add_argument(
+        "--skip-full-meter-sweep",
+        action="store_true",
+        help=f"skip the ~{len(SINGLE_METER_COLUMNS)} individual single-meter long polls each cycle "
+        "(sm_* columns are left NULL) — lighter per-cycle wire traffic, for hardware where that "
+        "much extra polling isn't affordable. The six core meters, eight ticket meters, and the "
+        "other grouped meter polls (LP 0x18/0x19/0x1C/0x1E/0x2D/0x4F) still run either way.",
+    )
     args = parser.parse_args()
 
     history = HistoryConfig(
@@ -789,6 +993,10 @@ def main() -> int:
         )
     else:
         print("  meters_history: unbounded, written every cycle (lab/stress-testing mode).")
+    print(
+        f"  meters: {len(ALL_METER_FIELDS)} columns per row "
+        f"({'full single-meter sweep enabled' if not args.skip_full_meter_sweep else 'single-meter sweep skipped'})."
+    )
 
     if not args.skip_ticket_out_backfill:
         print("Reading the existing ticket-out buffer (indices 1-31, non-destructive)...")
@@ -806,7 +1014,14 @@ def main() -> int:
     try:
         while args.cycles == 0 or cycle < args.cycles:
             cycle += 1
-            poll_and_log(client, conn, state, history, db_size_warning_mb=args.db_size_warning_mb)
+            poll_and_log(
+                client,
+                conn,
+                state,
+                history,
+                db_size_warning_mb=args.db_size_warning_mb,
+                full_meter_sweep=not args.skip_full_meter_sweep,
+            )
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nStopped.")
