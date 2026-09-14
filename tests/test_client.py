@@ -12,10 +12,14 @@ mistake were reintroduced.
 
 from __future__ import annotations
 
+import pytest
+
 from saspy.bcd import encode_bcd
 from saspy.binary import encode_binary_le
 from saspy.client import SASClient
+from saspy.constants import MeterCode
 from saspy.crc import crc16_bytes
+from saspy.exceptions import SASEncodingError, SASError
 from saspy.transport import SASTransport
 
 ADDRESS = 0x01
@@ -298,3 +302,195 @@ def test_send_validation_number_status():
     body = bytes([ADDRESS, 0x58, 0x00])
     status = make_client(body).send_validation_number(validation_system_id=1, validation_number=1234567890123456)
     assert status == 0x00
+
+
+# -- Selected / extended meters (0x2F, 0x6F) --------------------------------
+
+
+def test_send_selected_meters_reads_ticket_meters():
+    """This is the exact gap the review found: LP 0x0F/0x1C cannot report
+    ticket meters at all (Table 7.2a/7.2c only cover the six core meters).
+    Cashable Tickets In (the meter D-01's testable prediction depends on)
+    is only reachable via LP 2F/6F.
+    """
+    data = encode_bcd(0, 2)  # game number
+    data += bytes([MeterCode.CASHABLE_TICKET_IN_CENTS]) + encode_bcd(4750, 5)
+    data += bytes([MeterCode.CASHABLE_TICKET_IN_QUANTITY]) + encode_bcd(12, 4)
+    body = bytes([ADDRESS, 0x2F, len(data)]) + data
+    result = make_client(body).send_selected_meters(
+        [MeterCode.CASHABLE_TICKET_IN_CENTS, MeterCode.CASHABLE_TICKET_IN_QUANTITY]
+    )
+    assert result.game_number == 0
+    assert result.meters[MeterCode.CASHABLE_TICKET_IN_CENTS] == 4750
+    assert result.meters[MeterCode.CASHABLE_TICKET_IN_QUANTITY] == 12
+
+
+def test_send_selected_meters_request_uses_bcd_game_number_and_binary_codes():
+    data = encode_bcd(0, 2) + bytes([MeterCode.CASHABLE_TICKET_IN_CENTS]) + encode_bcd(0, 5)
+    body = bytes([ADDRESS, 0x2F, len(data)]) + data
+    fake = FakeSerial(body + crc16_bytes(body))
+    transport = SASTransport(fake)
+    client = SASClient(transport, ADDRESS)
+    client.send_selected_meters([MeterCode.CASHABLE_TICKET_IN_CENTS], game_number=12)
+
+    written = bytes(fake.written)
+    length_byte = written[2]
+    request_data = written[3:3 + length_byte]
+    assert request_data[0:2] == encode_bcd(12, 2)
+    assert request_data[2] == MeterCode.CASHABLE_TICKET_IN_CENTS
+
+
+def test_send_selected_meters_rejects_unknown_meter_code():
+    transport = SASTransport(FakeSerial(b""))
+    client = SASClient(transport, ADDRESS)
+    with pytest.raises(SASEncodingError):
+        client.send_selected_meters([0x7E])  # not in METER_CODE_SIZES_BCD
+
+
+def test_send_selected_meters_rejects_too_many_codes():
+    transport = SASTransport(FakeSerial(b""))
+    client = SASClient(transport, ADDRESS)
+    with pytest.raises(SASError):
+        client.send_selected_meters([MeterCode.CASHABLE_TICKET_IN_CENTS] * 11)
+
+
+def test_send_extended_meters_handles_arbitrary_code_via_self_describing_size():
+    """Unlike LP 2F, LP 6F's response carries its own size byte per meter
+    (Table 7.21b), so any code works here even without a METER_CODE_SIZES_BCD
+    entry.
+    """
+    data = encode_bcd(0, 2)  # game number
+    data += encode_binary_le(0x1234, 2) + bytes([3]) + encode_bcd(567, 3)
+    body = bytes([ADDRESS, 0x6F, len(data)]) + data
+    result = make_client(body).send_extended_meters([0x1234])
+    assert result.meters[0x1234] == 567
+
+
+def test_send_extended_meters_skips_unsupported_meter():
+    data = encode_bcd(0, 2)
+    data += encode_binary_le(0x9999, 2) + bytes([0])  # size 0 = unsupported, no value bytes
+    body = bytes([ADDRESS, 0x6F, len(data)]) + data
+    result = make_client(body).send_extended_meters([0x9999])
+    assert result.meters == {}
+
+
+# -- Secure enhanced validation ID (0x4C) -----------------------------------
+
+
+def test_set_secure_enhanced_validation_id_round_trip():
+    body = bytes([ADDRESS, 0x4C]) + encode_binary_le(0xABCDEF, 3) + encode_binary_le(0x001234, 3)
+    result = make_client(body).set_secure_enhanced_validation_id(machine_id=0xABCDEF, sequence_number=0x001234)
+    assert result.machine_id == 0xABCDEF
+    assert result.sequence_number == 0x001234
+
+
+def test_set_secure_enhanced_validation_id_query_form_uses_zero():
+    body = bytes([ADDRESS, 0x4C]) + encode_binary_le(0, 3) + encode_binary_le(0, 3)
+    fake = FakeSerial(body + crc16_bytes(body))
+    transport = SASTransport(fake)
+    client = SASClient(transport, ADDRESS)
+    client.set_secure_enhanced_validation_id()  # defaults: query, don't set
+    written = bytes(fake.written)
+    assert written[2:5] == encode_binary_le(0, 3)  # machine_id field
+
+
+# -- Enhanced validation information / ticket-out history (0x4D) -----------
+
+
+def test_send_enhanced_validation_information_parses_ticket_out_record():
+    body = bytes([ADDRESS, 0x4D])
+    body += bytes([0x00, 0x03])  # validation type, index number
+    body += encode_bcd(9142026, 4)  # date MMDDYYYY (09142026)... zero-padded via BCD width
+    body += encode_bcd(153045, 3)  # time HHMMSS
+    body += encode_bcd(1234567890123456, 8)  # validation number
+    body += encode_bcd(4750, 5)  # amount cents
+    body += encode_binary_le(0x0007, 2)  # ticket number
+    body += encode_bcd(0, 1)  # validation system id
+    body += encode_bcd(9999, 4)  # expiration
+    body += encode_binary_le(0, 2)  # pool id
+    info = make_client(body).send_enhanced_validation_information(function_code=0x03)
+    assert info.validation_type == 0x00
+    assert info.index_number == 3
+    assert info.validation_number == 1234567890123456
+    assert info.amount_cents == 4750
+    assert info.ticket_number == 7
+    assert info.pool_id == 0
+
+
+def test_send_enhanced_validation_information_default_function_code_is_peek():
+    """Default must be the non-destructive peek (0xFF), not the
+    mark-as-read form (0x00) — boot reconciliation and casual reads must
+    never accidentally consume buffer state.
+    """
+    body = bytes([ADDRESS, 0x4D]) + bytes(31)  # all-zero record (no data)
+    fake = FakeSerial(body + crc16_bytes(body))
+    transport = SASTransport(fake)
+    client = SASClient(transport, ADDRESS)
+    client.send_enhanced_validation_information()
+    written = bytes(fake.written)
+    assert written[2] == 0xFF
+
+
+# -- Extended validation status (0x7B) --------------------------------------
+
+
+def test_extended_validation_status_inquiry_round_trip():
+    data = encode_binary_le(0x0A0B0C0D, 4)  # asset number
+    data += encode_binary_le(0x00FF, 2)  # status bits
+    data += encode_bcd(30, 2)  # cashable expiration days
+    data += encode_bcd(60, 2)  # restricted expiration days
+    body = bytes([ADDRESS, 0x7B, len(data)]) + data
+    status = make_client(body).extended_validation_status()
+    assert status.asset_number == 0x0A0B0C0D
+    assert status.status_bits == 0x00FF
+    assert status.cashable_ticket_expiration_days == 30
+    assert status.restricted_ticket_expiration_days == 60
+
+
+def test_extended_validation_status_default_call_does_not_change_anything():
+    data = bytes(12)
+    body = bytes([ADDRESS, 0x7B, len(data)]) + data
+    fake = FakeSerial(body + crc16_bytes(body))
+    transport = SASTransport(fake)
+    client = SASClient(transport, ADDRESS)
+    client.extended_validation_status()
+    written = bytes(fake.written)
+    length_byte = written[2]
+    request_data = written[3:3 + length_byte]
+    # control_mask all zero -> "no bit may be changed" (§15.2)
+    assert request_data[0:2] == encode_binary_le(0, 2)
+
+
+# -- Redeem ticket status query (0x71/FF short form) ------------------------
+
+
+def test_redeem_ticket_status_sends_the_short_form_request():
+    """Appendix D Step 7: `2A 71 01 FF cc cc` — a 1-byte body, not the full
+    transfer request. This is what reading completion status safely
+    depends on; sending the full redeem_ticket() shape instead risks the
+    machine treating it as a new redemption attempt.
+    """
+    ack_body = bytes([ADDRESS, 0x71, 0x01, 0x00])
+    fake = FakeSerial(ack_body + crc16_bytes(ack_body))
+    transport = SASTransport(fake)
+    client = SASClient(transport, ADDRESS)
+    client.redeem_ticket_status()
+    written = bytes(fake.written)
+    request = bytes([ADDRESS, 0x71, 0x01, 0xFF])
+    assert written == request + crc16_bytes(request)
+
+
+def test_redeem_ticket_status_no_previous_cycle():
+    body = bytes([ADDRESS, 0x71, 0x01, 0xFF])
+    result = make_client(body).redeem_ticket_status()
+    assert result.machine_status == 0xFF
+    assert result.amount_cents == 0
+
+
+def test_redeem_ticket_status_reports_current_cycle():
+    validation_data = bytes([0x00] + list(encode_bcd(1234567890123456, 8)))
+    data = bytes([0x00]) + encode_bcd(4750, 5) + bytes([0x00]) + validation_data
+    body = bytes([ADDRESS, 0x71, len(data)]) + data
+    result = make_client(body).redeem_ticket_status()
+    assert result.machine_status == 0x00
+    assert result.amount_cents == 4750

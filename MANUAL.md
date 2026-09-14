@@ -497,6 +497,15 @@ they have known bugs (documented in their own header comments) and are
 not exercised by anything else here. This manual intentionally doesn't
 give them a usage section, because they aren't meant to be used.
 
+`legacy/pre_pollcode_expansion/` is a different, unrelated thing: a
+frozen snapshot of `saspy/constants.py`, `client.py`, and `models.py`
+taken immediately before LP 2F/6F, 4C, 4D, 7B and
+`redeem_ticket_status()` were added, kept purely as a fast, file-level
+rollback path during live floor testing (alongside ordinary git
+history). See its own `README.md` for what it covers and how to use
+it. It is not maintained going forward and is not a second
+implementation to build against.
+
 ---
 
 ## 6. Structuring a SQL layer around a poller: step by step

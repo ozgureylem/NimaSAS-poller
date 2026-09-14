@@ -18,8 +18,8 @@ from __future__ import annotations
 from . import models
 from .bcd import decode_bcd, encode_bcd
 from .binary import decode_binary_le, encode_binary_le
-from .constants import LONG_POLL_TYPES, METER_CODE_SIZES_BCD, LongPoll, PollType
-from .exceptions import SASEncodingError, SASError
+from .constants import LONG_POLL_TYPES, LongPoll, PollType
+from .exceptions import SASError
 from .framing import build_command, parse_response
 from .transport import SASTransport
 
@@ -71,167 +71,6 @@ class SASClient:
             games_won=decode_bcd(payload[21:25]),
             slot_door_opened=decode_bcd(payload[25:29]),
             power_reset=decode_bcd(payload[29:33]),
-        )
-
-    # -- Selected meters (0x2F, Table 7.3a/7.3b) -----------------------------
-
-    def send_selected_meters(self, meter_codes: list[int], *, game_number: int = 0) -> models.SelectedMeters:
-        """Read up to 10 meters by code in one poll. Unlike LP 6F, LP 2F's
-        response has no per-meter size byte (§7.3), so every code in
-        ``meter_codes`` must be one this client knows the size of — see
-        ``constants.METER_CODE_SIZES_BCD`` / ``constants.MeterCode``. This is
-        the only way to reach ticket meters (e.g. Cashable Tickets In,
-        MeterCode.CASHABLE_TICKET_IN_CENTS/_QUANTITY) — LP 0x0F/0x1C cannot
-        report them at all (Table 7.2a/7.2c only cover the six core meters).
-        """
-        if not 1 <= len(meter_codes) <= 10:
-            raise SASError(f"send_selected_meters takes 1-10 meter codes, got {len(meter_codes)}")
-        unknown = [c for c in meter_codes if c not in METER_CODE_SIZES_BCD]
-        if unknown:
-            raise SASEncodingError(
-                f"unknown meter code(s) {[hex(c) for c in unknown]} — "
-                "add their Table C-7 size to METER_CODE_SIZES_BCD before requesting them"
-            )
-
-        poll = LongPoll.SEND_SELECTED_METERS
-        body = encode_bcd(game_number, 2) + bytes(meter_codes)
-        command_and_data = bytes([poll]) + bytes([len(body)]) + body
-        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
-        payload = self._strip(raw)
-
-        length = payload[1]
-        data = payload[2:2 + length]
-        resp_game_number = decode_bcd(data[0:2])
-        meters: dict[int, int] = {}
-        idx = 2
-        while idx < len(data):
-            code = data[idx]
-            idx += 1
-            size = METER_CODE_SIZES_BCD.get(code)
-            if size is None:
-                # A code we didn't ask for, or whose size we don't know —
-                # can't tell where the next code/value pair starts either.
-                raise SASEncodingError(f"response contains unrecognised meter code 0x{code:02X}")
-            meters[code] = decode_bcd(data[idx:idx + size])
-            idx += size
-        return models.SelectedMeters(game_number=resp_game_number, meters=meters)
-
-    # -- Extended meters (0x6F, Table 7.21a/7.21b) ---------------------------
-
-    def send_extended_meters(self, meter_codes: list[int], *, game_number: int = 0) -> models.SelectedMeters:
-        """Read up to 12 meters by code in one poll. Unlike LP 2F, each meter
-        in the response carries its own size byte (§7.21), so — unlike
-        send_selected_meters() — any meter code from Table C-7 works here,
-        not just ones this client has a size table for.
-        """
-        if not 1 <= len(meter_codes) <= 12:
-            raise SASError(f"send_extended_meters takes 1-12 meter codes, got {len(meter_codes)}")
-
-        poll = LongPoll.SEND_EXTENDED_METERS
-        body = encode_bcd(game_number, 2)
-        for code in meter_codes:
-            body += encode_binary_le(code, 2)
-        command_and_data = bytes([poll]) + bytes([len(body)]) + body
-        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
-        payload = self._strip(raw)
-
-        length = payload[1]
-        data = payload[2:2 + length]
-        resp_game_number = decode_bcd(data[0:2])
-        meters: dict[int, int] = {}
-        idx = 2
-        while idx < len(data):
-            code = decode_binary_le(data[idx:idx + 2])
-            idx += 2
-            size = data[idx]
-            idx += 1
-            if size == 0:
-                continue  # unsupported meter: code + size=0, no value bytes (§7.21)
-            meters[code] = decode_bcd(data[idx:idx + size])
-            idx += size
-        return models.SelectedMeters(game_number=resp_game_number, meters=meters)
-
-    # -- Secure enhanced validation ID (0x4C, Table 15.6a/15.6b) -------------
-
-    def set_secure_enhanced_validation_id(
-        self, machine_id: int = 0, sequence_number: int = 0
-    ) -> models.EnhancedValidationId:
-        """Set (or, with machine_id=0, read back) the machine's secure
-        enhanced validation ID and starting sequence number. Commissioning
-        only — see §15.6.
-        """
-        poll = LongPoll.SET_SECURE_ENHANCED_VALIDATION_ID
-        command_and_data = bytes([poll]) + encode_binary_le(machine_id, 3) + encode_binary_le(sequence_number, 3)
-        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=10, timeout=self.timeout)
-        payload = self._strip(raw)
-        return models.EnhancedValidationId(
-            machine_id=decode_binary_le(payload[1:4]),
-            sequence_number=decode_binary_le(payload[4:7]),
-        )
-
-    # -- Enhanced validation information / ticket-out history (0x4D, Table 15.10a/15.10b) --
-
-    def send_enhanced_validation_information(self, function_code: int = 0xFF) -> models.EnhancedValidationInfo:
-        """Read one ticket-out record from the machine's own buffer —
-        function_code 0x00 returns the next unread record and marks it read,
-        0x01-0x1F reads buffer index n directly, 0xFF (the default here)
-        peeks at the next unread record without marking it read. This is the
-        multi-record buffer walk boot reconciliation depends on (§5.6): walk
-        indices 0x01-0x1F to read the whole buffer without disturbing the
-        unread/read state (see Appendix A — LP 7B does NOT do this; it's a
-        status/config poll, not a history read).
-        """
-        poll = LongPoll.SEND_ENHANCED_VALIDATION_INFORMATION
-        command_and_data = bytes([poll, function_code])
-        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=35, timeout=self.timeout)
-        payload = self._strip(raw)
-        return models.EnhancedValidationInfo(
-            validation_type=payload[1],
-            index_number=payload[2],
-            date=f"{decode_bcd(payload[3:7]):08d}",
-            time=f"{decode_bcd(payload[7:10]):06d}",
-            validation_number=decode_bcd(payload[10:18]),
-            amount_cents=decode_bcd(payload[18:23]),
-            ticket_number=decode_binary_le(payload[23:25]),
-            validation_system_id=decode_bcd(payload[25:26]),
-            expiration=f"{decode_bcd(payload[26:30]):08d}",
-            pool_id=decode_binary_le(payload[30:32]),
-        )
-
-    # -- Extended validation status (0x7B, Table 15.2a/15.2b) ----------------
-
-    def extended_validation_status(
-        self,
-        *,
-        control_mask: int = 0x0000,
-        status_bit_control_states: int = 0x0000,
-        cashable_ticket_expiration_days: int = 0,
-        restricted_ticket_expiration_days: int = 0,
-    ) -> models.ExtendedValidationStatus:
-        """Inquire (all-defaults call) or set validation/ticket-printing
-        parameters. A 0 control_mask bit leaves that function's current
-        state untouched (§15.2) — the all-defaults call is a pure status
-        read. Not a history read: this cannot walk the ticket-out buffer —
-        see send_enhanced_validation_information() (LP 4D) for that.
-        """
-        poll = LongPoll.EXTENDED_VALIDATION_STATUS
-        body = encode_binary_le(control_mask, 2)
-        body += encode_binary_le(status_bit_control_states, 2)
-        body += encode_bcd(cashable_ticket_expiration_days, 2)
-        body += encode_bcd(restricted_ticket_expiration_days, 2)
-        command_and_data = bytes([poll]) + bytes([len(body)]) + body
-        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
-        payload = self._strip(raw)
-        return models.ExtendedValidationStatus(
-            asset_number=decode_binary_le(payload[2:6]),
-            status_bits=decode_binary_le(payload[6:8]),
-            cashable_ticket_expiration_days=decode_bcd(payload[8:10]),
-            restricted_ticket_expiration_days=decode_bcd(payload[10:12]),
         )
 
     # -- Gaming machine ID (0x1F, Table 7.10) -------------------------------
@@ -500,33 +339,7 @@ class SASClient:
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
         raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
-        return self._parse_redeem_ticket_response(payload)
 
-    def redeem_ticket_status(self) -> models.RedeemTicketResult:
-        """Safe, read-only status query for the current ticket redemption
-        cycle: transfer code FF, all other fields omitted (§15.12b — "the
-        host may use long poll 71 to request the current ticket status at
-        any time by setting the transfer code to FF and omitting the
-        transfer amount, parsing code and validation data fields"). This is
-        the exchange reading a ticket's completion status safely depends on
-        (Appendix D Step 7: `2A 71 01 FF cc cc`, a 1-byte body) — sending a
-        full redeem_ticket() call instead risks the machine reading it as a
-        new redemption attempt rather than a status read.
-
-        machine_status FF means there has been no previous redemption cycle
-        on this machine since it was last polled.
-        """
-        poll = LongPoll.REDEEM_TICKET
-        command_and_data = bytes([poll, 0x01, 0xFF])  # length=1, body=transfer_code FF only
-        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
-        payload = self._strip(raw)
-        return self._parse_redeem_ticket_response(payload)
-
-    def _parse_redeem_ticket_response(self, payload: bytes) -> models.RedeemTicketResult:
-        """Shared by redeem_ticket() and redeem_ticket_status() — both get
-        the same response shape (Table 15.12b).
-        """
         status = payload[2]
         length = payload[1]
         if length <= 1:

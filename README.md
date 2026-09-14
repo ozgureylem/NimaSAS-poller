@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 65 tests, all against fake serial ports; run them with
+- **`tests/`** — 80 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -43,7 +43,11 @@ step-by-step guide to structuring a local SQL layer around a poller.
   **It has known, confirmed bugs** (wrong byte offsets, a fabricated
   field on a fund-transfer command, crashes on certain inputs) — don't
   use it as a second source of truth, and don't build on it. It's here
-  purely as command-coverage history.
+  purely as command-coverage history. `legacy/pre_pollcode_expansion/`
+  is unrelated: a frozen snapshot of `saspy/constants.py`, `client.py`,
+  and `models.py` from just before LP 2F/6F/4C/4D/7B were added, kept
+  as a fast rollback path during live floor testing — see its own
+  `README.md`.
 
 ## Setup
 
@@ -58,11 +62,22 @@ through pyserial's cross-platform API, nothing Linux-specific.
 
 ## Long polls implemented
 
-General poll; meters (0x0F, 0x1C); gaming machine ID (0x1F); enabled
-features (0xA0); AFT register (0x73), lock/status (0x74), transfer funds
-(0x72); ticket validation data (0x70), redeem ticket (0x71); validation
-number (0x58). See `saspy/client.py` — every method cites the spec table
-it was built from.
+General poll; core meters (0x0F, 0x1C); selected/extended meters (0x2F,
+0x6F — the only way to reach ticket meters such as Cashable Tickets In,
+since 0x0F/0x1C cannot); gaming machine ID (0x1F); enabled features
+(0xA0); AFT register (0x73), lock/status (0x74), transfer funds (0x72);
+secure enhanced validation ID (0x4C); enhanced validation information /
+ticket-out history (0x4D); extended validation status (0x7B); ticket
+validation data (0x70), redeem ticket (0x71, plus the short-form,
+read-only status query); validation number (0x58). See `saspy/client.py`
+— every method cites the spec table it was built from.
+
+Meter codes for 0x2F/0x6F are transcribed directly from the spec's own
+Table C-7, not from any secondary source — an earlier project planning
+document had the ticket-meter codes wrong (off by more than a naming
+slip: 0x1A/0x1B are unrelated meters in the real table), which is worth
+knowing if you're cross-checking against project docs rather than the
+spec itself.
 
 ## Multi-version SAS (6.0 / 6.01 / 6.02)
 
