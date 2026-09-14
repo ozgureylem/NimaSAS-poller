@@ -276,8 +276,10 @@ safely own the serial port, and ticket/cashout capture depends on
 seeing the same general-poll stream meters share the connection with
 (see §4.4).
 
-**Meters** work as before: a current-value row plus a history table,
-in one of two modes picked with `--mode`:
+**Meters** cover the six core counters (long poll `0x0F`) plus the eight
+cumulative ticket meters — Cashable/Restricted Ticket In/Out, cents and
+count (long poll `0x2F`, the only way to reach these) — all in one row,
+one history table, in one of two modes picked with `--mode`:
 
 - **`ring`** (the default) — a single always-current-value row, plus a
   history table capped at a fixed size (oldest rows evicted) and
@@ -438,32 +440,45 @@ above the threshold — a heads-up, not a fix, and not required for the
 loud-failure behavior above, which happens regardless of whether you set
 it.
 
-**2. Meters.** `client.send_meters_10_through_15()` (long poll `0x0F`).
-On success, `meters_current` (always exactly one row) is overwritten
-with the latest values, unconditionally, every cycle. Whether that
-cycle *also* writes a new row to `meters_history` depends on the mode:
+**2. Meters.** Two polls, both required to succeed before anything is
+written:
+
+- `client.send_meters_10_through_15()` (long poll `0x0F`) for the six
+  core meters.
+- `client.send_selected_meters(TICKET_METER_CODES)` (long poll `0x2F`)
+  for the eight cumulative ticket meters — Cashable/Restricted Ticket
+  In/Out, cents and count (Table C-7). This is the only long poll that
+  can reach these at all; `0x0F` doesn't carry them.
+
+On success of both, `meters_current` (always exactly one row) is
+overwritten with the latest values from both polls, unconditionally,
+every cycle. Whether that cycle *also* writes a new row to
+`meters_history` depends on the mode:
 
 - In `append` mode, always.
 - In `ring` mode, only if: this is the first poll ever, or
   `--history-interval` seconds have passed since the last history
   write, or a **burst** is active.
 
-A burst starts when a meter value goes down since the last successful
-poll (SAS meters are cumulative counters — a decrease usually means
-something worth a closer look, like a meter rollover or a reset), or
-when a poll fails outright, or when a caller embedding
-`poll_and_log()` directly (rather than running this as a script) passes
-`anomaly=True` from its own logic. Once started, a burst writes the
-next `--burst-count` successful polls to history at full resolution —
-one per cycle, cadence ignored — before returning to the normal
-interval. This is deliberate: that's where the diagnostic value
-actually is, and it's cheap precisely because it's rare.
+A burst starts when any of the fourteen meter values — core or ticket —
+goes down since the last successful poll (SAS meters are cumulative
+counters — a decrease usually means something worth a closer look, like
+a meter rollover or a reset), or when either poll fails outright, or
+when a caller embedding `poll_and_log()` directly (rather than running
+this as a script) passes `anomaly=True` from its own logic. Once
+started, a burst writes the next `--burst-count` successful polls to
+history at full resolution — one per cycle, cadence ignored — before
+returning to the normal interval. This is deliberate: that's where the
+diagnostic value actually is, and it's cheap precisely because it's rare.
 
-On a `SASError`, the exception's type and message are inserted into
-`poll_errors` instead (this table's shape and behavior are unchanged
-from before — see §6.3), and the loop continues after `--interval`
-seconds either way. One bad exchange — a timeout, a checksum failure,
-anything — never stops the run.
+On a `SASError` from *either* poll, the exception's type and message are
+inserted into `poll_errors` instead (this table's shape and behavior are
+unchanged from before — see §6.3), and **neither** `meters_current` nor
+`meters_history` is written that cycle — a row that's fresh in the core
+meters and stale (or missing) in the ticket meters, or vice versa, would
+misrepresent what "as of `polled_at`" actually means. The loop continues
+after `--interval` seconds either way; one bad exchange — a timeout, a
+checksum failure, anything — never stops the run.
 
 ### 4.5 Troubleshooting
 
@@ -481,6 +496,13 @@ anything — never stops the run.
   `--history-interval` cadence, not every poll. `meters_current` is
   still fresh every cycle; check that first if you want the latest
   value, not `meters_history`.
+- **`meters_current`/`meters_history` stop updating, but `poll_errors`
+  is filling up with `send_selected_meters(ticket_meters)` rows**: the
+  core meters (`0x0F`) are fine but the ticket-meter poll (`0x2F`) is
+  failing — check the error's own type/message column first. Either
+  poll failing blocks that cycle's meter write entirely (see §4.4), so
+  this isn't a partial-data situation to work around, it's a real
+  problem with that specific long poll on this machine.
 - **Database file grows large during a long `append`-mode stress run**:
   expected — that mode never deletes rows by design. Either plan disk
   space accordingly or switch to `ring` mode, which won't grow past
@@ -707,7 +729,15 @@ CREATE TABLE IF NOT EXISTS meters_current (
     total_coin_out INTEGER,
     total_drop INTEGER,
     total_jackpot INTEGER,
-    games_played INTEGER
+    games_played INTEGER,
+    ticket_in_cashable_cents INTEGER,
+    ticket_in_cashable_count INTEGER,
+    ticket_in_restricted_cents INTEGER,
+    ticket_in_restricted_count INTEGER,
+    ticket_out_cashable_cents INTEGER,
+    ticket_out_cashable_count INTEGER,
+    ticket_out_restricted_cents INTEGER,
+    ticket_out_restricted_count INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS meters_history (
@@ -718,7 +748,15 @@ CREATE TABLE IF NOT EXISTS meters_history (
     total_coin_out INTEGER,
     total_drop INTEGER,
     total_jackpot INTEGER,
-    games_played INTEGER
+    games_played INTEGER,
+    ticket_in_cashable_cents INTEGER,
+    ticket_in_cashable_count INTEGER,
+    ticket_in_restricted_cents INTEGER,
+    ticket_in_restricted_count INTEGER,
+    ticket_out_cashable_cents INTEGER,
+    ticket_out_cashable_count INTEGER,
+    ticket_out_restricted_cents INTEGER,
+    ticket_out_restricted_count INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS poll_errors (
@@ -803,6 +841,16 @@ CREATE TABLE IF NOT EXISTS validation_pool (
   parsed out of the SAS response — this is when you need to know it
   happened, and it's consistent even against machines that don't
   report their own clock.
+- **A cumulative meter and its event table are not the same data, even
+  when they cover the same thing.** `meters_current`/`meters_history`'s
+  `ticket_in_*`/`ticket_out_*` columns are the machine's own running
+  totals (LP 2F — see §4); `ticket_in_events`/`ticket_out_history`
+  are one row per transaction. Both are worth keeping: the cumulative
+  meter is what you'd reconcile against (does the machine's own count
+  agree with what we captured?), and it's polled/written on exactly the
+  same cadence/rollover logic as the six core meters — one LP 0F/2F
+  failure aborts that cycle's write for both rather than saving a row
+  that's fresh in one half and stale or missing in the other.
 - **Identity, not position, decides what counts as a duplicate.**
   `ticket_out_history` is read two different ways — a non-destructive
   startup walk by buffer position, and a live, destructive drain

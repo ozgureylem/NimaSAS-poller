@@ -31,8 +31,13 @@ What each cycle does, in order:
    pending cashout amount (LP 57), take the next available number from
    the pool, and answer with it (LP 58) — see "Gateway-local cashout
    validation" below.
-2. Meters, on the same cadence/ring-history logic as before (see the
-   HistoryConfig docstring and MANUAL.md §4/§6).
+2. Meters: the six core meters (LP 0F) plus the eight cumulative ticket
+   meters (LP 2F — Cashable/Restricted Ticket In/Out, cents and count;
+   the only way to reach these at all, since LP 0F can't report them),
+   all in the same row, on the same cadence/ring-history/rollover logic
+   (see the HistoryConfig docstring and MANUAL.md §4/§6). A poll failure
+   on either LP aborts that cycle's meter write rather than saving a
+   snapshot that's only half current.
 
 On startup, the full ticket-out buffer (indices 1-31, non-destructive —
 see send_enhanced_validation_information()'s docstring) is also read
@@ -126,7 +131,7 @@ import time
 from dataclasses import dataclass
 
 from saspy.config import connect_from_config
-from saspy.constants import ExceptionCode
+from saspy.constants import ExceptionCode, MeterCode
 from saspy.exceptions import SASError
 from saspy.models import EnhancedValidationInfo
 
@@ -141,7 +146,15 @@ CREATE TABLE IF NOT EXISTS meters_current (
     total_coin_out INTEGER,
     total_drop INTEGER,
     total_jackpot INTEGER,
-    games_played INTEGER
+    games_played INTEGER,
+    ticket_in_cashable_cents INTEGER,
+    ticket_in_cashable_count INTEGER,
+    ticket_in_restricted_cents INTEGER,
+    ticket_in_restricted_count INTEGER,
+    ticket_out_cashable_cents INTEGER,
+    ticket_out_cashable_count INTEGER,
+    ticket_out_restricted_cents INTEGER,
+    ticket_out_restricted_count INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS meters_history (
@@ -152,7 +165,15 @@ CREATE TABLE IF NOT EXISTS meters_history (
     total_coin_out INTEGER,
     total_drop INTEGER,
     total_jackpot INTEGER,
-    games_played INTEGER
+    games_played INTEGER,
+    ticket_in_cashable_cents INTEGER,
+    ticket_in_cashable_count INTEGER,
+    ticket_in_restricted_cents INTEGER,
+    ticket_in_restricted_count INTEGER,
+    ticket_out_cashable_cents INTEGER,
+    ticket_out_cashable_count INTEGER,
+    ticket_out_restricted_cents INTEGER,
+    ticket_out_restricted_count INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS poll_errors (
@@ -209,6 +230,19 @@ CREATE TABLE IF NOT EXISTS validation_pool (
 # written every cycle, unconditionally: the original behavior, still the
 # right one for a lab/stress run on ordinary disk.
 #
+# Both tables' ticket_in_*/ticket_out_* columns are the machine's own
+# cumulative SAS meters (LP 2F — MeterCode.CASHABLE_TICKET_IN_CENTS and
+# its seven siblings, Table C-7), polled alongside the six core meters
+# every cycle. These are a different thing from ticket_in_events and
+# ticket_out_history below: those tables record individual transactions
+# (one row per ticket); these columns are running totals the machine
+# itself maintains, useful for reconciling "does the machine's own count
+# agree with what we captured per-ticket" without summing either table.
+# Being ordinary BCD meters, they roll over exactly like the core six
+# (§8.2) — decode_bcd() has no notion of "value decreased," so a wrapped
+# ticket meter is just a normal, smaller read, and is treated exactly
+# like a core-meter decrease below: diagnostic burst signal, not an error.
+#
 # ticket_out_history is deduplicated on (validation_number, ticket_date,
 # ticket_time) — the startup backfill (non-destructive, by buffer index)
 # and the live exception-driven drain (destructive, by "next unread") can
@@ -250,6 +284,32 @@ METER_FIELDS = (
     "total_jackpot",
     "games_played",
 )
+
+# Column name and MeterCode are paired by position — zip(TICKET_METER_COLUMNS,
+# TICKET_METER_CODES) is the single source of truth for that mapping, used
+# both to build the LP 2F request and to place its response into the row.
+TICKET_METER_COLUMNS = (
+    "ticket_in_cashable_cents",
+    "ticket_in_cashable_count",
+    "ticket_in_restricted_cents",
+    "ticket_in_restricted_count",
+    "ticket_out_cashable_cents",
+    "ticket_out_cashable_count",
+    "ticket_out_restricted_cents",
+    "ticket_out_restricted_count",
+)
+TICKET_METER_CODES = (
+    MeterCode.CASHABLE_TICKET_IN_CENTS,
+    MeterCode.CASHABLE_TICKET_IN_QUANTITY,
+    MeterCode.RESTRICTED_TICKET_IN_CENTS,
+    MeterCode.RESTRICTED_TICKET_IN_QUANTITY,
+    MeterCode.CASHABLE_TICKET_OUT_CENTS,
+    MeterCode.CASHABLE_TICKET_OUT_QUANTITY,
+    MeterCode.RESTRICTED_TICKET_OUT_CENTS,
+    MeterCode.RESTRICTED_TICKET_OUT_QUANTITY,
+)  # all 8 fit in one LP 2F poll (max 10 codes per request, §7.3)
+
+ALL_METER_FIELDS = METER_FIELDS + TICKET_METER_COLUMNS
 
 
 @dataclass
@@ -581,10 +641,25 @@ def poll_and_log(
         print(f"[{now}] meters poll failed: {type(e).__name__}: {e}")
         return
 
+    try:
+        ticket_meters = client.send_selected_meters(list(TICKET_METER_CODES))
+    except SASError as e:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+            (now, "send_selected_meters(ticket_meters)", type(e).__name__, str(e)),
+        )
+        _safe_commit(conn, now)
+        state.burst_remaining = max(state.burst_remaining, history.burst_count)
+        print(f"[{now}] ticket meters poll failed: {type(e).__name__}: {e}")
+        return
+
     values = {field: getattr(meters, field) for field in METER_FIELDS}
-    columns = ", ".join(METER_FIELDS)
-    qmarks = ", ".join("?" for _ in METER_FIELDS)
-    bind = tuple(values[f] for f in METER_FIELDS)
+    values.update(
+        (column, ticket_meters.meters[code]) for column, code in zip(TICKET_METER_COLUMNS, TICKET_METER_CODES)
+    )
+    columns = ", ".join(ALL_METER_FIELDS)
+    qmarks = ", ".join("?" for _ in ALL_METER_FIELDS)
+    bind = tuple(values[f] for f in ALL_METER_FIELDS)
 
     conn.execute(
         f"INSERT OR REPLACE INTO meters_current (id, polled_at, {columns}) VALUES (1, ?, {qmarks})",
@@ -592,7 +667,7 @@ def poll_and_log(
     )
 
     decreased = state.last_meters is not None and any(
-        values[f] < state.last_meters[f] for f in METER_FIELDS
+        values[f] < state.last_meters[f] for f in ALL_METER_FIELDS
     )
     if decreased or anomaly:
         state.burst_remaining = history.burst_count
@@ -631,7 +706,8 @@ def poll_and_log(
         note += ", anomaly signaled"
     print(
         f"[{now}] coin_in={values['total_coin_in']} coin_out={values['total_coin_out']} "
-        f"games_played={values['games_played']} — {note}"
+        f"games_played={values['games_played']} ticket_in_cashable_cents={values['ticket_in_cashable_cents']} "
+        f"ticket_out_cashable_cents={values['ticket_out_cashable_cents']} — {note}"
     )
 
 

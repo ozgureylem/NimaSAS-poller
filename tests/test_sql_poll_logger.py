@@ -8,6 +8,8 @@ import pytest
 
 from examples.sql_poll_logger import (
     SCHEMA,
+    TICKET_METER_CODES,
+    TICKET_METER_COLUMNS,
     HistoryConfig,
     PollState,
     _db_file_size_bytes,
@@ -19,7 +21,7 @@ from examples.sql_poll_logger import (
 )
 from saspy.constants import ExceptionCode
 from saspy.exceptions import SASTimeoutError
-from saspy.models import BasicMeters, EnhancedValidationInfo, PendingCashoutInfo, TicketValidationData
+from saspy.models import BasicMeters, EnhancedValidationInfo, PendingCashoutInfo, SelectedMeters, TicketValidationData
 
 
 def make_meters(**overrides) -> BasicMeters:
@@ -33,6 +35,18 @@ def make_meters(**overrides) -> BasicMeters:
     )
     base.update(overrides)
     return BasicMeters(**base)
+
+
+def make_ticket_meters(**overrides) -> SelectedMeters:
+    """``overrides`` keys are TICKET_METER_COLUMNS names (e.g.
+    ticket_in_cashable_cents=10500), not MeterCode values — translated
+    here to the {code: value} shape send_selected_meters() actually
+    returns, matching the column<->code pairing in TICKET_METER_COLUMNS.
+    """
+    base = {column: 0 for column in TICKET_METER_COLUMNS}
+    base.update(overrides)
+    meters = {code: base[column] for column, code in zip(TICKET_METER_COLUMNS, TICKET_METER_CODES)}
+    return SelectedMeters(game_number=0, meters=meters)
 
 
 def make_ticket_out(**overrides) -> EnhancedValidationInfo:
@@ -103,6 +117,7 @@ class ScriptedClient:
         ticket_out_script=None,
         cashout_info_script=None,
         validation_number_script=None,
+        ticket_meters_script=None,
     ):
         self._meters_script = list(meters_script)
         self._exception_script = list(exception_script) if exception_script is not None else None
@@ -110,6 +125,7 @@ class ScriptedClient:
         self._ticket_out_script = list(ticket_out_script) if ticket_out_script is not None else []
         self._cashout_info_script = list(cashout_info_script) if cashout_info_script is not None else []
         self._validation_number_script = list(validation_number_script) if validation_number_script is not None else []
+        self._ticket_meters_script = list(ticket_meters_script) if ticket_meters_script is not None else None
         self.validation_number_calls = []
 
     def general_poll(self):
@@ -122,6 +138,17 @@ class ScriptedClient:
 
     def send_meters_10_through_15(self):
         item = self._meters_script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def send_selected_meters(self, meter_codes, *, game_number=0):
+        if self._ticket_meters_script is None:
+            # No script given: a harmless all-zero read (never decreases,
+            # never raises) so tests that don't care about ticket meters
+            # don't need to know this poll exists at all.
+            return make_ticket_meters()
+        item = self._ticket_meters_script.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
@@ -234,6 +261,74 @@ def test_one_failure_does_not_stop_subsequent_polls():
     poll_and_log(client, conn, state, history, monotonic_fn=clock)
     assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 1
     assert current_coin_in(conn) == 1
+
+
+# --- ticket meters (LP 2F): cumulative Cashable/Restricted Ticket In/Out ---
+
+
+def test_ticket_meters_are_written_to_meters_current_and_history():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        ticket_meters_script=[make_ticket_meters(ticket_in_cashable_cents=10_500, ticket_out_cashable_count=3)],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+
+    current = conn.execute(
+        "SELECT ticket_in_cashable_cents, ticket_out_cashable_count FROM meters_current"
+    ).fetchone()
+    assert current == (10_500, 3)
+    history_row = conn.execute(
+        "SELECT ticket_in_cashable_cents, ticket_out_cashable_count FROM meters_history"
+    ).fetchone()
+    assert history_row == (10_500, 3)
+
+
+def test_ticket_meters_poll_failure_logs_error_and_does_not_touch_meters_current():
+    """Mirrors test_failed_poll_does_not_touch_meters_current for LP 0F:
+    a failed LP 2F read must not write a meters_current row that's only
+    half current (basic meters fresh, ticket meters stale or missing).
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters(total_coin_in=5)],
+        ticket_meters_script=[SASTimeoutError("no response")],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    rows = conn.execute("SELECT poll_name, error_type, message FROM poll_errors").fetchall()
+    assert rows == [("send_selected_meters(ticket_meters)", "SASTimeoutError", "no response")]
+    assert conn.execute("SELECT COUNT(*) FROM meters_current").fetchone()[0] == 0
+    assert history_row_count(conn) == 0
+
+
+def test_ticket_meter_decrease_arms_the_burst_window_like_a_core_meter_decrease():
+    """A wrapped ticket meter (§8.2 rollover) is ordinary diagnostic
+    signal, not an error -- exactly like a core-meter decrease. See
+    test_poll_and_log_detects_ticket_in_meter_rollover_during_105_dollar_ticket_capture
+    for the full $105.00-ticket scenario this generalizes.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring", burst_count=3)
+    client = ScriptedClient(
+        [make_meters(), make_meters()],
+        ticket_meters_script=[
+            make_ticket_meters(ticket_out_cashable_count=50),
+            make_ticket_meters(ticket_out_cashable_count=2),  # wrapped: fewer than before
+        ],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    assert state.burst_remaining == 0  # first cycle: nothing to compare against yet
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    assert state.burst_remaining == history.burst_count - 1
+    assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
 
 
 # --- ring mode: cadence, cap, and burst behavior ---
@@ -412,43 +507,48 @@ def test_poll_and_log_ignores_ticket_in_exception_when_nothing_in_escrow():
     assert conn.execute("SELECT COUNT(*) FROM ticket_in_events").fetchone()[0] == 0
 
 
-def test_poll_and_log_captures_105_dollar_ticket_in_during_a_meter_rollover_cycle():
-    """A $105.00 ticket-in (amount_cents=10500) landing on the same poll
-    cycle as a basic-meter rollover (total_coin_in wrapping back down, per
-    §8.2 -- decode_bcd() has no notion of "value decreased," so a wrapped
-    meter is just a normal, smaller BCD read). The two are unrelated reads
-    (LP 70's escrow amount vs. LP 0F's cumulative meters), so a rollover
-    on one must not corrupt or block capture of the other: the ticket
-    amount must be stored exactly, and the meter decrease must be logged
-    as diagnostic signal (bursting), not an error.
-
-    Note what this does NOT cover: SAS's own cumulative "Cashable Ticket
-    In" meter (MeterCode.CASHABLE_TICKET_IN_CENTS, only reachable via LP
-    2F -- see test_send_selected_meters_ticket_in_meter_rollover in
-    test_client.py for that meter's own rollover behavior). poll_and_log()
-    never polls LP 2F at all, so a rollover specific to that meter is
-    invisible to this tool today -- a real coverage gap, not exercised or
-    masked by this test.
+def test_poll_and_log_detects_ticket_in_meter_rollover_during_105_dollar_ticket_capture():
+    """The scenario this project was actually asked to test: an EGM whose
+    cumulative Cashable Ticket In meter (LP 2F, 5 BCD bytes) sits near its
+    max and rolls over ($99,999,950.00 -> $55.00, mod 10**10 -- see
+    test_send_selected_meters_ticket_in_meter_rollover in test_client.py
+    for the raw decode), on the very poll cycle a $105.00 ticket is
+    inserted and captured via LP 70. poll_and_log() polls LP 2F every
+    cycle now (previously a real gap: this rollover was invisible to the
+    tool entirely), so this exercises the full path: the wrapped meter
+    must be stored as-is (no client-side correction), must arm the burst
+    window exactly like a core-meter decrease, and must not interfere
+    with the independent LP 70 ticket-in capture landing on the same
+    cycle.
     """
     conn = make_db()
     clock = FakeClock()
+    pre_rollover_cents = 9_999_995_000
+    post_rollover_cents = 5_500  # (pre_rollover_cents + 10_500) % 10**10
     state = PollState(last_meters={
-        "total_cancelled_credits": 0, "total_coin_in": 999_999, "total_coin_out": 0,
+        "total_cancelled_credits": 0, "total_coin_in": 0, "total_coin_out": 0,
         "total_drop": 0, "total_jackpot": 0, "games_played": 0,
+        **{column: 0 for column in TICKET_METER_COLUMNS},
+        "ticket_in_cashable_cents": pre_rollover_cents,
     })
     history = HistoryConfig(mode="ring")
     client = ScriptedClient(
-        [make_meters(total_coin_in=12)],  # wrapped: smaller than state.last_meters above
+        [make_meters()],  # basic meters unchanged -- isolates the ticket meter as the trigger
         exception_script=[ExceptionCode.TICKET_INSERTED],
         ticket_script=[make_ticket_in(amount_cents=10_500)],
+        ticket_meters_script=[make_ticket_meters(ticket_in_cashable_cents=post_rollover_cents)],
     )
     poll_and_log(client, conn, state, history, monotonic_fn=clock)
 
     ticket_rows = conn.execute("SELECT amount_cents FROM ticket_in_events").fetchall()
     assert ticket_rows == [(10_500,)]
     assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
-    # the meter decrease is diagnostic signal, not an error: it arms the
-    # burst window (this cycle's own write immediately consumes one)
+
+    row = conn.execute("SELECT ticket_in_cashable_cents FROM meters_current").fetchone()
+    assert row[0] == post_rollover_cents  # the raw wrapped wire value, not a corrected one
+
+    # the ticket-meter decrease alone (basic meters didn't move) still arms
+    # the burst window: this cycle's own write immediately consumes one
     assert state.burst_remaining == history.burst_count - 1
 
 
