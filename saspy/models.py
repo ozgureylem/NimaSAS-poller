@@ -148,6 +148,20 @@ class RedeemTicketResult:
 
 
 @dataclass(frozen=True)
+class PendingCashoutInfo:
+    """Response to long poll 0x57 (Table 15.7a), read after exception 0x57
+    (system validation request). ``cashout_type`` per Table 15.7b: 0x00
+    cashable ticket, 0x01 restricted promotional ticket, 0x80 not
+    actually waiting for system validation (the exception fired but the
+    cashout is already gone — a race, not an error; callers should treat
+    this like "nothing to answer" rather than retry).
+    """
+
+    cashout_type: int
+    amount_cents: int
+
+
+@dataclass(frozen=True)
 class SelectedMeters:
     """Response to long poll 0x2F or 0x6F (Table 7.3b / 7.21b).
 

@@ -691,6 +691,22 @@ class SASClient:
             cumulative_nonrestricted_meter=nonrestricted_meter,
         )
 
+    # -- Pending cashout information (0x57, Table 15.7a/15.7b) --------------
+
+    def send_pending_cashout_info(self) -> models.PendingCashoutInfo:
+        """Read after exception 0x57 (system validation request) — the
+        machine is waiting to be told what validation number to print on
+        a cashout ticket. Answer with send_validation_number() (LP 58).
+        """
+        poll = LongPoll.SEND_PENDING_CASHOUT_INFO
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=10, timeout=self.timeout)
+        payload = self._strip(raw)
+        return models.PendingCashoutInfo(
+            cashout_type=payload[1],
+            amount_cents=decode_bcd(payload[2:7]),
+        )
+
     # -- Ticket validation data (0x70, Table 15.11a) ------------------------
 
     def send_ticket_validation_data(self) -> models.TicketValidationData:

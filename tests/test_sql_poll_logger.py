@@ -6,10 +6,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
-from examples.sql_poll_logger import SCHEMA, HistoryConfig, PollState, backfill_ticket_out_history, poll_and_log
+from examples.sql_poll_logger import (
+    SCHEMA,
+    HistoryConfig,
+    PollState,
+    backfill_ticket_out_history,
+    poll_and_log,
+    seed_validation_pool,
+)
 from saspy.constants import ExceptionCode
 from saspy.exceptions import SASTimeoutError
-from saspy.models import BasicMeters, EnhancedValidationInfo, TicketValidationData
+from saspy.models import BasicMeters, EnhancedValidationInfo, PendingCashoutInfo, TicketValidationData
 
 
 def make_meters(**overrides) -> BasicMeters:
@@ -56,6 +63,21 @@ EMPTY_TICKET_OUT = EnhancedValidationInfo(
 )
 
 
+def make_cashout_info(**overrides) -> PendingCashoutInfo:
+    base = dict(cashout_type=0x00, amount_cents=1000)
+    base.update(overrides)
+    return PendingCashoutInfo(**base)
+
+
+def seed_pool(conn, *numbers, validation_system_id=1):
+    for n in numbers:
+        conn.execute(
+            "INSERT INTO validation_pool (validation_number, validation_system_id, status) VALUES (?, ?, 'available')",
+            (n, validation_system_id),
+        )
+    conn.commit()
+
+
 def make_ticket_in(**overrides) -> TicketValidationData:
     base = dict(ticket_in_escrow=True, amount_cents=2500, parsing_code=0, validation_data=b"\x00" + b"1" * 9)
     base.update(overrides)
@@ -69,11 +91,23 @@ class ScriptedClient:
     about meters don't need to know about ticket capture at all.
     """
 
-    def __init__(self, meters_script, *, exception_script=None, ticket_script=None, ticket_out_script=None):
+    def __init__(
+        self,
+        meters_script,
+        *,
+        exception_script=None,
+        ticket_script=None,
+        ticket_out_script=None,
+        cashout_info_script=None,
+        validation_number_script=None,
+    ):
         self._meters_script = list(meters_script)
         self._exception_script = list(exception_script) if exception_script is not None else None
         self._ticket_script = list(ticket_script) if ticket_script is not None else []
         self._ticket_out_script = list(ticket_out_script) if ticket_out_script is not None else []
+        self._cashout_info_script = list(cashout_info_script) if cashout_info_script is not None else []
+        self._validation_number_script = list(validation_number_script) if validation_number_script is not None else []
+        self.validation_number_calls = []
 
     def general_poll(self):
         if self._exception_script is None:
@@ -97,6 +131,19 @@ class ScriptedClient:
 
     def send_enhanced_validation_information(self, function_code=0xFF):
         item = self._ticket_out_script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def send_pending_cashout_info(self):
+        item = self._cashout_info_script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def send_validation_number(self, validation_system_id, validation_number):
+        self.validation_number_calls.append((validation_system_id, validation_number))
+        item = self._validation_number_script.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
@@ -490,3 +537,152 @@ def test_ticket_out_dedup_across_backfill_and_live_drain():
     )
     poll_and_log(live_client, conn, state, history, monotonic_fn=clock)
     assert conn.execute("SELECT COUNT(*) FROM ticket_out_history").fetchone()[0] == 1
+
+
+# --- gateway-local cashout validation (exception 0x57) ----------------------
+
+
+def test_cashout_request_assigns_next_available_pool_number():
+    conn = make_db()
+    seed_pool(conn, 111, 222)
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.SYSTEM_VALIDATION_REQUEST],
+        cashout_info_script=[make_cashout_info(amount_cents=2500)],
+        validation_number_script=[0x00],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    assert client.validation_number_calls == [(1, 111)]  # lowest available number used first
+    row = conn.execute(
+        "SELECT status, assigned_amount_cents FROM validation_pool WHERE validation_number = 111"
+    ).fetchone()
+    assert row == ("assigned", 2500)
+    remaining = conn.execute(
+        "SELECT status FROM validation_pool WHERE validation_number = 222"
+    ).fetchone()
+    assert remaining == ("available",)
+
+
+def test_cashout_request_with_empty_pool_logs_pool_exhausted_and_leaves_machine_unanswered():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.SYSTEM_VALIDATION_REQUEST],
+        cashout_info_script=[make_cashout_info(amount_cents=500)],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    errors = conn.execute("SELECT poll_name, error_type FROM poll_errors").fetchall()
+    assert errors == [("validation_pool", "PoolExhausted")]
+    assert client.validation_number_calls == []  # never even tried to answer
+
+
+def test_cashout_request_ignores_race_where_machine_no_longer_waiting():
+    conn = make_db()
+    seed_pool(conn, 111)
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.SYSTEM_VALIDATION_REQUEST],
+        cashout_info_script=[make_cashout_info(cashout_type=0x80)],  # "not waiting for system validation"
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    assert client.validation_number_calls == []
+    row = conn.execute("SELECT status FROM validation_pool WHERE validation_number = 111").fetchone()
+    assert row == ("available",)
+
+
+def test_cashout_request_rejected_number_stays_available_for_reuse():
+    conn = make_db()
+    seed_pool(conn, 111)
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.SYSTEM_VALIDATION_REQUEST],
+        cashout_info_script=[make_cashout_info(amount_cents=750)],
+        validation_number_script=[0x81],  # improper validation rejected
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    row = conn.execute("SELECT status, assigned_at FROM validation_pool WHERE validation_number = 111").fetchone()
+    assert row == ("available", None)
+
+
+def test_cashout_info_read_failure_logs_error_without_stopping_meters():
+    conn = make_db()
+    seed_pool(conn, 111)
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters(total_coin_in=6)],
+        exception_script=[ExceptionCode.SYSTEM_VALIDATION_REQUEST],
+        cashout_info_script=[SASTimeoutError("no response")],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    errors = conn.execute("SELECT poll_name FROM poll_errors").fetchall()
+    assert errors == [("send_pending_cashout_info",)]
+    assert current_coin_in(conn) == 6
+
+
+def test_send_validation_number_failure_leaves_number_available():
+    conn = make_db()
+    seed_pool(conn, 111)
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.SYSTEM_VALIDATION_REQUEST],
+        cashout_info_script=[make_cashout_info()],
+        validation_number_script=[SASTimeoutError("no response")],
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    errors = conn.execute("SELECT poll_name FROM poll_errors").fetchall()
+    assert errors == [("send_validation_number",)]
+    row = conn.execute("SELECT status FROM validation_pool WHERE validation_number = 111").fetchone()
+    assert row == ("available",)
+
+
+# --- validation pool seeding -------------------------------------------------
+
+
+def test_seed_validation_pool_adds_requested_count():
+    conn = make_db()
+    counter = iter(range(1, 100))
+    added = seed_validation_pool(conn, 5, random_fn=lambda bits: next(counter))
+    assert added == 5
+    assert conn.execute("SELECT COUNT(*) FROM validation_pool WHERE status = 'available'").fetchone()[0] == 5
+
+
+def test_seed_validation_pool_only_tops_up_the_shortfall():
+    conn = make_db()
+    seed_pool(conn, 1, 2, 3)
+    counter = iter(range(1000, 1100))
+    added = seed_validation_pool(conn, 5, random_fn=lambda bits: next(counter))
+    assert added == 2
+    assert conn.execute("SELECT COUNT(*) FROM validation_pool").fetchone()[0] == 5
+
+
+def test_seed_validation_pool_retries_on_collision():
+    conn = make_db()
+    seed_pool(conn, 42)
+    sequence = iter([42, 42, 43])  # first two candidates collide with the existing row and each other
+    added = seed_validation_pool(conn, 2, random_fn=lambda bits: next(sequence))
+    assert added == 1
+    numbers = {r[0] for r in conn.execute("SELECT validation_number FROM validation_pool").fetchall()}
+    assert numbers == {42, 43}
+
+
+def test_seed_validation_pool_zero_is_a_no_op():
+    conn = make_db()
+    assert seed_validation_pool(conn, 0) == 0
+    assert conn.execute("SELECT COUNT(*) FROM validation_pool").fetchone()[0] == 0

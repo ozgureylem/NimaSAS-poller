@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 101 tests, all against fake serial ports; run them with
+- **`tests/`** — 124 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -37,7 +37,8 @@ step-by-step guide to structuring a local SQL layer around a poller.
   always be hand-written.
 - **`examples/sql_poll_logger.py`** — one poll loop, one SQLite database:
   meters, full ticket-out history (buffer backfill at startup plus live
-  capture), and read-only ticket-in capture, all from a single
+  capture), read-only ticket-in capture, and gateway-local cashout
+  validation against a seeded local pool, all from a single
   general-poll stream (deliberately one program — see the module
   docstring for why). A runnable starting point for stress-testing over
   time or prototyping a persistence layer — see MANUAL.md §4/§6 for the

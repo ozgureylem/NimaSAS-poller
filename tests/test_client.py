@@ -304,6 +304,19 @@ def test_send_validation_number_status():
     assert status == 0x00
 
 
+def test_send_pending_cashout_info():
+    body = bytes([ADDRESS, 0x57, 0x00]) + encode_bcd(4750, 5)
+    info = make_client(body).send_pending_cashout_info()
+    assert info.cashout_type == 0x00
+    assert info.amount_cents == 4750
+
+
+def test_send_pending_cashout_info_not_waiting():
+    body = bytes([ADDRESS, 0x57, 0x80]) + encode_bcd(0, 5)
+    info = make_client(body).send_pending_cashout_info()
+    assert info.cashout_type == 0x80
+
+
 # -- Selected / extended meters (0x2F, 0x6F) --------------------------------
 
 

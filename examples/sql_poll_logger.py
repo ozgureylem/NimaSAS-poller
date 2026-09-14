@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""One poll loop, one SQLite database: meters, ticket-out history, and
-ticket-in capture, all from a single continuous general-poll cycle.
+"""One poll loop, one SQLite database: meters, ticket-out history,
+ticket-in capture, and gateway-local cashout validation, all from a
+single continuous general-poll cycle.
 
 This is a worked, runnable example of the "local SQL layer on top of
 SASClient" pattern described in MANUAL.md — a starting point for
@@ -24,6 +25,12 @@ What each cycle does, in order:
    read-only; see "What this does NOT do" below. If it returns 0x3D or
    0x3E (a ticket-out record is ready), drain every currently-unread
    ticket-out record (LP 4D, function code 0x00) into ticket_out_history.
+   If it returns 0x57 (system validation request — the machine is ready
+   to print a cashout ticket and is waiting to be told what validation
+   number to use), answer it locally from validation_pool: read the
+   pending cashout amount (LP 57), take the next available number from
+   the pool, and answer with it (LP 58) — see "Gateway-local cashout
+   validation" below.
 2. Meters, on the same cadence/ring-history logic as before (see the
    HistoryConfig docstring and MANUAL.md §4/§6).
 
@@ -32,16 +39,36 @@ see send_enhanced_validation_information()'s docstring) is also read
 once into ticket_out_history, so you get whatever the machine is already
 holding, not just what happens from here forward.
 
-What this does NOT do: authorize or redeem tickets. A ticket-in event is
-read and logged (amount, validation data) but this tool never calls
-redeem_ticket() — deciding whether to pay a ticket is a real business/
-security decision (see the project's own Decisions Annex on this), and
-a reference poller has no way to make that decision correctly. Left
-unredeemed, the machine safely returns the ticket to the player after
-its own 30-second timeout (spec-guaranteed), so running this against a
-real machine does not risk paying out incorrectly — it just means this
-tool's ticket_in_events table records that a ticket came in, not what
-happened to it.
+Gateway-local cashout validation. Per the project's own Technical v3
+§5.4: cashout is the one direction where the gateway IS meant to answer
+without a server round-trip — the server pre-issues a batch of
+validation numbers to the gateway in advance, and the gateway assigns
+the next one itself when the machine asks. This is the opposite rule
+from ticket-in (§5.8) below, not an inconsistency: a gateway may spend
+from a pool it was already trusted with, but may never itself decide
+whether someone else's ticket is genuine.
+
+validation_pool here is a deliberately simplified stand-in for that
+server-issued pool — a local SQLite table you seed (--seed-validation-
+pool, or hand-insert real numbers yourself), with no protocol behind it
+(no pool_epoch, no batch_uuid, no HMAC-authenticated top-up over the
+network — that's real gateway<->server protocol machinery, out of scope
+for a SAS wire-protocol reference client). If the pool runs out,
+the cashout is left unanswered and the machine's own 10-second timeout
+handles it, logged as a PoolExhausted row in poll_errors.
+
+What this does NOT do: authorize or redeem tickets *coming in*. A
+ticket-in event is read and logged (amount, validation data) but this
+tool never calls redeem_ticket() — deciding whether to pay a ticket is
+a real business/security decision (see the project's own Decisions
+Annex on this), and a reference poller has no way to make that decision
+correctly. Left unredeemed, the machine safely returns the ticket to
+the player after its own 30-second timeout (spec-guaranteed), so
+running this against a real machine does not risk paying out
+incorrectly — it just means this tool's ticket_in_events table records
+that a ticket came in, not what happened to it. This is a different
+direction from cashout validation above, not a contradiction of it —
+see §5.4 vs. §5.8 in the docstring paragraph above.
 
 What this does NOT recover: ticket-IN history before this tool started,
 or before the SAS 6.02 spec's own record — because there isn't any. LP
@@ -82,6 +109,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import random
 import sqlite3
 import sys
 import time
@@ -91,6 +119,8 @@ from saspy.config import connect_from_config
 from saspy.constants import ExceptionCode
 from saspy.exceptions import SASError
 from saspy.models import EnhancedValidationInfo
+
+DEFAULT_VALIDATION_SYSTEM_ID = 1  # 0 means "deny" per Table 15.8a — never use it for a real pool entry
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meters_current (
@@ -146,6 +176,14 @@ CREATE TABLE IF NOT EXISTS ticket_in_events (
     parsing_code INTEGER,
     validation_data_hex TEXT
 );
+
+CREATE TABLE IF NOT EXISTS validation_pool (
+    validation_number INTEGER PRIMARY KEY,
+    validation_system_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'available',
+    assigned_at TEXT,
+    assigned_amount_cents INTEGER
+);
 """
 # meters_current always holds exactly one row (id=1, INSERT OR REPLACE) —
 # most consumers only ever want the latest value, and a one-row table
@@ -171,6 +209,14 @@ CREATE TABLE IF NOT EXISTS ticket_in_events (
 # consumes and acknowledges. These are local diagnostic/capture buffers,
 # not a queue — they're never drained by this tool, so there's nothing
 # for a synced_at column to mean here.
+#
+# validation_pool is different in kind from every other table here: it's
+# not something this tool observes, it's something this tool spends
+# from. A row starts 'available' (seeded by --seed-validation-pool, or
+# hand-inserted with real numbers) and moves to 'assigned' the moment
+# the machine acknowledges it (status 0x00 on LP 58) — never reused,
+# and never removed, so validation_pool doubles as its own audit trail
+# of what this gateway has ever handed out.
 
 DEFAULT_HISTORY_CAP = 200
 DEFAULT_HISTORY_INTERVAL = 60.0
@@ -297,6 +343,95 @@ def _drain_ticket_out_history(client, conn: sqlite3.Connection, now: str) -> Non
         print(f"[{now}] ticket-out captured: validation_number={record.validation_number} amount_cents={record.amount_cents}")
 
 
+def seed_validation_pool(
+    conn: sqlite3.Connection,
+    target_available: int,
+    *,
+    validation_system_id: int = DEFAULT_VALIDATION_SYSTEM_ID,
+    random_fn=random.getrandbits,
+) -> int:
+    """Top up validation_pool to at least ``target_available`` 'available'
+    rows, generating random 16-digit numbers (not real server-issued
+    ones — see the module docstring). Safe to call every run: it only
+    adds what's missing, and a random collision with an existing number
+    just retries. Returns how many rows were actually added.
+    """
+    if target_available <= 0:
+        return 0
+    existing = conn.execute("SELECT COUNT(*) FROM validation_pool WHERE status = 'available'").fetchone()[0]
+    added = 0
+    while existing + added < target_available:
+        candidate = random_fn(53) % 10**16
+        try:
+            conn.execute(
+                "INSERT INTO validation_pool (validation_number, validation_system_id, status) VALUES (?, ?, 'available')",
+                (candidate, validation_system_id),
+            )
+        except sqlite3.IntegrityError:
+            continue  # collided with an existing validation_number (primary key) — try another
+        added += 1
+    conn.commit()
+    return added
+
+
+def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
+    """Called on exception 0x57 (system validation request): read the
+    pending cashout amount (LP 57), take the next available number from
+    validation_pool, and answer with it (LP 58) — the gateway-local
+    cashout-validation flow described in the module docstring (§5.4).
+    """
+    try:
+        info = client.send_pending_cashout_info()
+    except SASError as e:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+            (now, "send_pending_cashout_info", type(e).__name__, str(e)),
+        )
+        conn.commit()
+        return
+    if info.cashout_type == 0x80:
+        return  # "not waiting for system validation" (Table 15.7b) — the exception fired, but the race is over
+
+    row = conn.execute(
+        "SELECT validation_number, validation_system_id FROM validation_pool "
+        "WHERE status = 'available' ORDER BY validation_number LIMIT 1"
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+            (now, "validation_pool", "PoolExhausted", f"no available validation number for amount_cents={info.amount_cents}"),
+        )
+        conn.commit()
+        print(f"[{now}] cashout pending (amount_cents={info.amount_cents}) but validation_pool is empty — left unanswered")
+        return
+
+    validation_number, validation_system_id = row
+    try:
+        status = client.send_validation_number(
+            validation_system_id=validation_system_id, validation_number=validation_number
+        )
+    except SASError as e:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+            (now, "send_validation_number", type(e).__name__, str(e)),
+        )
+        conn.commit()
+        return
+
+    if status == 0x00:
+        conn.execute(
+            "UPDATE validation_pool SET status = 'assigned', assigned_at = ?, assigned_amount_cents = ? "
+            "WHERE validation_number = ?",
+            (now, info.amount_cents, validation_number),
+        )
+        conn.commit()
+        print(f"[{now}] cashout answered: validation_number={validation_number} amount_cents={info.amount_cents}")
+    else:
+        # 0x80 not in cashout, 0x81 improper validation rejected (Table 15.8b) — the number was never
+        # actually consumed, so leave it 'available' for the next attempt rather than burning it.
+        print(f"[{now}] validation number rejected by machine (status=0x{status:02X}); left available for reuse")
+
+
 def _capture_ticket_in(client, conn: sqlite3.Connection, now: str) -> None:
     """Called on exception 0x67: read the ticket's validation data
     (read-only — see this module's docstring for why redeem_ticket() is
@@ -356,6 +491,8 @@ def poll_and_log(
             _capture_ticket_in(client, conn, now)
         elif exception_code in (ExceptionCode.CASH_OUT_TICKET_PRINTED, ExceptionCode.HANDPAY_VALIDATED):
             _drain_ticket_out_history(client, conn, now)
+        elif exception_code == ExceptionCode.SYSTEM_VALIDATION_REQUEST:
+            _handle_cashout_request(client, conn, now)
 
     mono_now = monotonic_fn()
 
@@ -464,6 +601,14 @@ def main() -> int:
         action="store_true",
         help="skip the one-time startup read of the full ticket-out buffer (indices 1-31)",
     )
+    parser.add_argument(
+        "--seed-validation-pool",
+        type=int,
+        default=0,
+        metavar="N",
+        help="top up validation_pool to at least N 'available' rows with random test numbers "
+        "(default: 0, don't seed — hand-insert real numbers yourself if you have them)",
+    )
     args = parser.parse_args()
 
     history = HistoryConfig(
@@ -492,6 +637,11 @@ def main() -> int:
         print("Reading the existing ticket-out buffer (indices 1-31, non-destructive)...")
         found = backfill_ticket_out_history(client, conn)
         print(f"  {found} ticket-out record(s) found and stored.")
+
+    if args.seed_validation_pool:
+        added = seed_validation_pool(conn, args.seed_validation_pool)
+        available = conn.execute("SELECT COUNT(*) FROM validation_pool WHERE status = 'available'").fetchone()[0]
+        print(f"  validation_pool: added {added} test number(s), {available} available (lab numbers, not server-issued).")
 
     print("Ctrl-C to stop." if args.cycles == 0 else f"Will stop after {args.cycles} cycle(s).")
 

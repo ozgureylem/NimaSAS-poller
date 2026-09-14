@@ -167,14 +167,15 @@ class PollType(enum.Enum):
 
 class ExceptionCode(enum.IntEnum):
     """General-poll exception codes (Appendix A) — only the ones this
-    client's examples actually act on. 0x00 (no event) plus the four
-    priority exceptions that drive ticket capture in
+    client's examples actually act on. 0x00 (no event) plus the five
+    priority exceptions that drive ticket/cashout capture in
     examples/sql_poll_logger.py.
     """
 
     NONE = 0x00
     CASH_OUT_TICKET_PRINTED = 0x3D  # §15.10 — read via LP 4D (Send Enhanced Validation Information)
     HANDPAY_VALIDATED = 0x3E  # §15.10 — same read as above (spec: "functionally equivalent" to 3D)
+    SYSTEM_VALIDATION_REQUEST = 0x57  # §15.7 — read via LP 57 (Send Pending Cashout Information), answered via LP 58
     TICKET_INSERTED = 0x67  # §15.11 — read via LP 70 (Send Ticket Validation Data)
     TICKET_TRANSFER_COMPLETE = 0x68  # §15.12 — read via LP 71/FF (redeem_ticket_status())
 

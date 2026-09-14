@@ -269,11 +269,12 @@ succeeding.
 
 This tool runs one continuous poll loop against a machine and writes
 everything it sees into a local SQLite database file: meters (a current
-value plus a running history), ticket-out history, and ticket-in
-capture. One program, one poll loop, one database — not three separate
-tools — because only one process can safely own the serial port, and
-ticket capture depends on seeing the same general-poll stream meters
-share the connection with (see §4.4).
+value plus a running history), ticket-out history, ticket-in capture,
+and gateway-local cashout validation. One program, one poll loop, one
+database — not four separate tools — because only one process can
+safely own the serial port, and ticket/cashout capture depends on
+seeing the same general-poll stream meters share the connection with
+(see §4.4).
 
 **Meters** work as before: a current-value row plus a history table,
 in one of two modes picked with `--mode`:
@@ -300,12 +301,27 @@ amount of every ticket a player inserts, the moment it happens. It is
 deliberately **read-only** — this tool never authorizes or redeems a
 ticket (see §4.4 for why, and what happens to an unredeemed ticket).
 
-One asymmetry worth knowing before you rely on this: ticket-*out* has a
-real buffer on the machine, so the startup read gets you history from
-before this tool ever ran. Ticket-*in* has no such buffer anywhere in
-SAS — the machine only ever exposes the *current* redemption cycle, never
-a log of past ones. `ticket_in_events` can only ever contain tickets
-seen while this tool was running; there is no way to backfill it.
+**Gateway-local cashout validation** (`validation_pool`) is the other
+direction: when a machine is ready to print a cashout ticket, it waits
+for the host to hand it a validation number. This tool answers that
+locally, from a pool you seed in advance (`--seed-validation-pool`, or
+hand-inserted real numbers) — no server round-trip, which is exactly
+the split your own project's Technical v3 §5.4/§5.8 describes: cashout
+is gateway-authority, redemption isn't. See §4.4 for the full mechanism
+and §6.3 for why this direction gets a spend-from pool while ticket-in
+only ever gets a read-only log.
+
+Two asymmetries worth knowing before you rely on this. First: ticket-
+*out* history has a real buffer on the machine, so the startup read
+gets you history from before this tool ever ran; ticket-*in* has no
+such buffer anywhere in SAS — the machine only ever exposes the
+*current* redemption cycle, never a log of past ones, so
+`ticket_in_events` can only ever contain tickets seen while this tool
+was running. Second, in the other direction: cashout validation numbers
+are something this tool *spends*, not observes — `validation_pool`
+starts empty and stays empty until you seed it; nothing about starting
+this tool conjures real, usable validation numbers out of nowhere (see
+§4.4 for exactly what `--seed-validation-pool` numbers are and aren't).
 
 ### 4.2 Basic use
 
@@ -339,6 +355,7 @@ A lab/stress-test run: logs every single poll (uncapped), polling every
 | `--history-interval` | `60.0` | Minimum seconds between history writes in `ring` mode, outside a burst (see §4.4). Ignored in `append` mode — how often the *value* is checked (`--interval`) is not how often history is *recorded*. |
 | `--burst-count` | `10` | Consecutive polls logged at full resolution, ignoring `--history-interval`, right after a meter decrease or a failed poll. |
 | `--skip-ticket-out-backfill` | off | Skip the one-time startup read of the full ticket-out buffer (indices 1–31). |
+| `--seed-validation-pool N` | `0` | Top up `validation_pool` to at least `N` `available` rows with random 16-digit test numbers. `0` means don't seed — do this if you're hand-inserting real numbers instead. |
 
 ### 4.4 What's actually happening (technical)
 
@@ -377,6 +394,29 @@ here its return value — the exception code — is actually acted on:
   has nothing more unread. This drains in a loop, not just once, so a
   burst of several tickets printed between poll cycles is still
   captured in full rather than only the oldest of them.
+- Exception `0x57` (system validation request — the machine is ready to
+  print a cashout ticket and is waiting for a validation number) →
+  read the pending amount (long poll `0x57`), take the lowest-numbered
+  `available` row from `validation_pool`, and answer with it (long poll
+  `0x58`). Three outcomes, each handled differently:
+  - The machine acknowledges (status `0x00`) → the row moves to
+    `assigned`, permanently — `validation_pool` doubles as its own
+    audit trail of everything this gateway has ever handed out.
+  - The machine rejects it (`0x80`/`0x81` — Table 15.8b) → the row is
+    left `available`, since the number itself was never actually
+    consumed.
+  - `validation_pool` has no `available` row at all → nothing is sent;
+    a `PoolExhausted` row is written to `poll_errors` and the machine's
+    own 10-second cashout timer runs out on its own. This is the local
+    equivalent of what your project's own design calls "pool_low" —
+    this reference tool just logs it rather than raising an alert or
+    disabling TITO.
+
+  One race is handled explicitly: if `send_pending_cashout_info()`
+  comes back with cashout type `0x80` ("not waiting for system
+  validation," Table 15.7b), the exception fired but the cashout is
+  already gone by the time this tool read it — nothing is answered,
+  and no pool number is spent.
 - Any other exception code, including `0x00` (nothing pending), is
   ignored by this tool.
 
@@ -449,6 +489,21 @@ anything — never stops the run.
   machine not configured for the validation mode this tool expects
   (or one being polled by a different, competing host) may not report
   the exception this tool is watching for.
+- **A cashout never gets a validation number and the machine falls back
+  to another payout method**: check `validation_pool` for any
+  `available` rows first — `--seed-validation-pool` has to actually be
+  passed (or real numbers hand-inserted) before this tool has anything
+  to hand out, and it defaults to not seeding at all. A `PoolExhausted`
+  row in `poll_errors` confirms this is what happened, versus a wiring
+  or configuration problem further up.
+- **`send_validation_number` keeps getting rejected (status `0x80` or
+  `0x81`)**: the machine either isn't currently waiting for system
+  validation (the race this tool already checks for via cashout type
+  `0x80` on the read side, §4.4) or isn't configured for system
+  validation at all — confirm the machine's validation mode before
+  assuming the pool numbers themselves are the problem. Rejected
+  numbers are left `available` for reuse, so this doesn't burn through
+  the pool on its own.
 
 ---
 
@@ -675,6 +730,14 @@ CREATE TABLE IF NOT EXISTS ticket_in_events (
     parsing_code INTEGER,
     validation_data_hex TEXT
 );
+
+CREATE TABLE IF NOT EXISTS validation_pool (
+    validation_number INTEGER PRIMARY KEY,
+    validation_system_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'available',
+    assigned_at TEXT,
+    assigned_amount_cents INTEGER
+);
 ```
 
 - **Split "current" from "history."** Almost every consumer of this
@@ -736,16 +799,29 @@ CREATE TABLE IF NOT EXISTS ticket_in_events (
   carry no `synced_at` column at all — they're a local diagnostic
   buffer, not a queue, and there's nothing for a sync column to mean
   on a table that's read in place and never drained.
+- **A table you spend from needs a status column; a table you only
+  observe doesn't.** Every other table here is written by the poller
+  and read by someone else. `validation_pool` is the opposite: this
+  tool is the one *consuming* it, one row at a time, and once a row is
+  spent it must never be handed out again — that's a correctness
+  requirement, not a convenience. `status` (`available` → `assigned`)
+  is what enforces that, and rows are never deleted even after they're
+  spent, so the table stays its own audit trail of every number this
+  gateway has ever issued. This is the same shape as a job queue or a
+  ticket-lock table in any other system: whenever "pick the next one
+  and never reuse it" matters, reach for a status column before reaching
+  for `DELETE` or an external tracking structure.
 
 ### 6.4 Running and verifying it
 
 ```
-python3 examples/sql_poll_logger.py gateway.ini --cycles 3
+python3 examples/sql_poll_logger.py gateway.ini --cycles 3 --seed-validation-pool 10
 sqlite3 gateway.sqlite3 "SELECT * FROM meters_current;"
 sqlite3 gateway.sqlite3 "SELECT * FROM meters_history;"
 sqlite3 gateway.sqlite3 "SELECT * FROM poll_errors;"
 sqlite3 gateway.sqlite3 "SELECT * FROM ticket_out_history;"
 sqlite3 gateway.sqlite3 "SELECT * FROM ticket_in_events;"
+sqlite3 gateway.sqlite3 "SELECT * FROM validation_pool;"
 ```
 
 `--cycles 3` gives you a short, bounded run to confirm rows are landing
@@ -766,7 +842,10 @@ startup backfill runs before the poll loop even starts) if the machine
 has printed any tickets recently. `ticket_in_events` will only show
 rows if you actually feed a ticket into the machine while the tool is
 running — three quick cycles with nothing inserted is expected to leave
-it empty, and that's not a failure.
+it empty, and that's not a failure. `validation_pool` should show 10
+`available` rows immediately (seeding happens at startup, before the
+loop) with random test numbers, not real ones — cash out from the
+machine while the tool is running to see one flip to `assigned`.
 
 ### 6.5 Adapting this for stress testing across multiple gateways/environments
 
