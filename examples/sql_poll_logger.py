@@ -51,16 +51,25 @@ What each cycle does, in order:
    cancelled credits (LP 0x2D), current hopper status (LP 0x4F), and —
    unless --skip-full-meter-sweep is given — every other single-meter
    long poll this client knows how to read (LP 0x10-0x51/0x55, ~39
-   polls). Several of these deliberately overlap: LP 0x19/0x1C, and most
-   of the single-meter sweep, report counters LP 0x0F already reports,
-   through entirely independent request/response exchanges. That
-   redundancy is the point, not an oversight — three long polls
-   disagreeing about "total coin in" this cycle is a real finding a
-   single poll can never surface, and a reference/stress-testing tool
-   has no reason to economize on wire traffic the way a production
-   gateway might. A poll failure anywhere in this group aborts that
-   cycle's entire meter write, rather than saving a row that's fresh in
-   some columns and stale or missing in others.
+   polls). On top of that, unless --skip-table-c7-sweep is given,
+   essentially the rest of Table C-7 (~154 more meter codes — every
+   assigned code this client didn't already have a dedicated long poll
+   for: per-denomination bill-acceptor counts, SAS-validation-specific
+   meters, AFT transfer meters, and more) via LP 0x6F in ~13 chunked
+   exchanges, 12 codes per exchange, self-describing size — far more
+   wire-efficient per meter than the single-meter sweep, which is why
+   it has its own opt-out rather than sharing --skip-full-meter-sweep's.
+   Several of these deliberately overlap: LP 0x19/0x1C, most of the
+   single-meter sweep, and a good part of the Table C-7 sweep, report
+   counters LP 0x0F already reports, through entirely independent
+   request/response exchanges. That redundancy is the point, not an
+   oversight — three long polls disagreeing about "total coin in" this
+   cycle is a real finding a single poll can never surface, and a
+   reference/stress-testing tool has no reason to economize on wire
+   traffic the way a production gateway might. A poll failure anywhere
+   in this group aborts that cycle's entire meter write, rather than
+   saving a row that's fresh in some columns and stale or missing in
+   others.
 
 Every cycle's log line reports how long the meter poll took and across
 how many long-poll exchanges (``meter_poll=X.XXXs/N polls``) — measured
@@ -325,6 +334,22 @@ assert set(SINGLE_METER_COLUMNS) == set(SIMPLE_METER_WIDTH_BCD), (
     "SINGLE_METER_COLUMNS must cover exactly what SASClient.send_meter() supports"
 )
 
+# Every Table C-7 meter code NOT already covered by TICKET_METER_COLUMNS above
+# — roughly the rest of the table (~154 codes: core/extended/bill-denomination,
+# SAS-validation-specific, AFT-specific; see MeterCode's own docstring for the
+# exact ranges). Read via LP 0x6F (send_extended_meters()), 12 codes per
+# exchange (self-describing size, unlike LP 2F) — see _poll_all_meters().
+# Column name is "c7_" + the MeterCode member's own name, lowercased, so
+# every one of these is traceable back to its exact spec entry with no
+# separate name-mapping table to keep in sync (unlike SINGLE_METER_COLUMNS
+# above, which is hand-mapped because LongPoll names don't read as column
+# names directly). Built from MeterCode directly so this can never drift
+# from what the enum actually contains.
+TABLE_C7_EXTENDED_CODES: tuple[MeterCode, ...] = tuple(c for c in MeterCode if c not in TICKET_METER_CODES)
+TABLE_C7_EXTENDED_COLUMNS: tuple[str, ...] = tuple(f"c7_{c.name.lower()}" for c in TABLE_C7_EXTENDED_CODES)
+TABLE_C7_CHUNK_SIZE = 12  # LP 0x6F's own per-request limit (§7.21)
+TABLE_C7_CHUNK_COUNT = -(-len(TABLE_C7_EXTENDED_CODES) // TABLE_C7_CHUNK_SIZE)  # ceil division
+
 # Gauges: fields that go up AND down in normal operation, so a decrease here
 # is not the diagnostic signal it is for a cumulative counter. Excluded from
 # poll_and_log()'s burst-arming "decreased" check, not from the row itself.
@@ -336,6 +361,11 @@ GAUGE_METER_FIELDS = frozenset(
         "sm_current_credits",
         "sm_current_hopper_level",
         "sm_selected_game_number",
+        "c7_current_credits",  # MeterCode.CURRENT_CREDITS (0x0C) — same gauge as sm_current_credits, different long poll
+        "c7_current_restricted_credits",  # MeterCode.CURRENT_RESTRICTED_CREDITS (0x1B)
+        "c7_number_of_bills_currently_in_stacker",  # fills/empties with normal operation, not cumulative
+        "c7_total_value_of_bills_currently_in_stacker_credits",
+        "c7_weighted_average_theoretical_payback_percentage",  # a percentage, not a counter
     }
 )
 
@@ -349,15 +379,17 @@ ALL_METER_FIELDS = (
     + LP2D_METER_COLUMNS
     + LP4F_METER_COLUMNS
     + tuple(SINGLE_METER_COLUMNS.values())
+    + TABLE_C7_EXTENDED_COLUMNS
 )
 DECREASE_CHECK_FIELDS = tuple(f for f in ALL_METER_FIELDS if f not in GAUGE_METER_FIELDS)
 
 # The 8 long-poll exchanges _poll_all_meters() always makes, regardless of
-# --skip-full-meter-sweep: send_meters_10_through_15, send_selected_meters
-# (ticket meters), send_meters_11_through_15, send_extended_meters_group,
-# send_games_since_power_up_and_door_closure, send_total_bill_meters,
-# send_total_hand_paid_cancelled_credits, send_current_hopper_status. Used
-# only to report how many exchanges a cycle's meter_poll timing covered.
+# --skip-full-meter-sweep/--skip-table-c7-sweep: send_meters_10_through_15,
+# send_selected_meters (ticket meters), send_meters_11_through_15,
+# send_extended_meters_group, send_games_since_power_up_and_door_closure,
+# send_total_bill_meters, send_total_hand_paid_cancelled_credits,
+# send_current_hopper_status. Used only to report how many exchanges a
+# cycle's meter_poll timing covered.
 GROUPED_METER_POLL_COUNT = 8
 
 _METER_COLUMN_DDL = ",\n    ".join(f"{field} INTEGER" for field in ALL_METER_FIELDS)
@@ -824,7 +856,7 @@ class _MeterPollFailure(Exception):
         self.original = original
 
 
-def _poll_all_meters(client, *, full_sweep: bool = True) -> dict:
+def _poll_all_meters(client, *, full_sweep: bool = True, table_c7_sweep: bool = True) -> dict:
     """Poll every meter this tool knows how to read, in one pass, and
     return {column: value} covering every name in ALL_METER_FIELDS.
     Raises _MeterPollFailure on the first failure, naming exactly which
@@ -832,6 +864,12 @@ def _poll_all_meters(client, *, full_sweep: bool = True) -> dict:
     are skipped and left as None (NULL) in the returned row rather than
     polled — a lighter-weight cycle for hardware where that much extra
     wire traffic per cycle isn't affordable; see --skip-full-meter-sweep.
+    When ``table_c7_sweep`` is False, the ~154 TABLE_C7_EXTENDED_COLUMNS
+    are likewise skipped and left None; see --skip-table-c7-sweep. The
+    two sweeps are independent: LP 0x6F (this one) is far more
+    wire-efficient per meter than the single-meter LP sweep (12 meters
+    per exchange instead of 1), so it's worth keeping on even where the
+    single-meter sweep isn't.
     """
     values: dict = {}
 
@@ -887,6 +925,21 @@ def _poll_all_meters(client, *, full_sweep: bool = True) -> dict:
         for column in SINGLE_METER_COLUMNS.values():
             values[column] = None
 
+    if table_c7_sweep:
+        for i in range(0, len(TABLE_C7_EXTENDED_CODES), TABLE_C7_CHUNK_SIZE):
+            chunk_codes = TABLE_C7_EXTENDED_CODES[i:i + TABLE_C7_CHUNK_SIZE]
+            chunk_columns = TABLE_C7_EXTENDED_COLUMNS[i:i + TABLE_C7_CHUNK_SIZE]
+            chunk_num = i // TABLE_C7_CHUNK_SIZE + 1
+            result = poll(
+                f"send_extended_meters(chunk {chunk_num}/{TABLE_C7_CHUNK_COUNT})",
+                client.send_extended_meters,
+                list(chunk_codes),
+            )
+            values.update((column, result.meters[code]) for column, code in zip(chunk_columns, chunk_codes))
+    else:
+        for column in TABLE_C7_EXTENDED_COLUMNS:
+            values[column] = None
+
     return values
 
 
@@ -936,6 +989,7 @@ def poll_and_log(
     db_size_warning_mb: int = 0,
     db_size_fn=_db_file_size_bytes,
     full_meter_sweep: bool = True,
+    table_c7_sweep: bool = True,
     interval: float | None = None,
     general_poll_retries: int = DEFAULT_GENERAL_POLL_RETRIES,
     pool_age_alert_hours: float = DEFAULT_POOL_AGE_ALERT_HOURS,
@@ -967,8 +1021,9 @@ def poll_and_log(
     e.g. --interval) to also get a WARNING if the meter poll alone is at
     or above it — a sign this cycle's own meter sweep doesn't leave any
     slack for the general poll or the configured sleep, and
-    --skip-full-meter-sweep or a larger --interval is worth considering.
-    ``interval=None`` (the default) skips that comparison.
+    --skip-full-meter-sweep, --skip-table-c7-sweep, or a larger
+    --interval is worth considering. ``interval=None`` (the default)
+    skips that comparison.
     """
     now = now_fn()
 
@@ -1003,7 +1058,7 @@ def poll_and_log(
     mono_now = monotonic_fn()
 
     try:
-        values = _poll_all_meters(client, full_sweep=full_meter_sweep)
+        values = _poll_all_meters(client, full_sweep=full_meter_sweep, table_c7_sweep=table_c7_sweep)
     except _MeterPollFailure as failure:
         meter_poll_elapsed = monotonic_fn() - mono_now
         conn.execute(
@@ -1019,12 +1074,17 @@ def poll_and_log(
         return
 
     meter_poll_elapsed = monotonic_fn() - mono_now
-    meter_poll_count = GROUPED_METER_POLL_COUNT + (len(SINGLE_METER_COLUMNS) if full_meter_sweep else 0)
+    meter_poll_count = (
+        GROUPED_METER_POLL_COUNT
+        + (len(SINGLE_METER_COLUMNS) if full_meter_sweep else 0)
+        + (TABLE_C7_CHUNK_COUNT if table_c7_sweep else 0)
+    )
     if interval is not None and meter_poll_elapsed >= interval:
         print(
             f"[{now}] WARNING: meter poll took {meter_poll_elapsed:.3f}s across {meter_poll_count} long-poll "
             f"exchanges — at or above --interval {interval}s. This cycle's meter sweep alone doesn't leave "
-            "room for the general poll or the configured sleep. Consider --skip-full-meter-sweep or a larger --interval."
+            "room for the general poll or the configured sleep. Consider --skip-full-meter-sweep, "
+            "--skip-table-c7-sweep, or a larger --interval."
         )
 
     columns = ", ".join(ALL_METER_FIELDS)
@@ -1147,6 +1207,17 @@ def main() -> int:
         "other grouped meter polls (LP 0x18/0x19/0x1C/0x1E/0x2D/0x4F) still run either way.",
     )
     parser.add_argument(
+        "--skip-table-c7-sweep",
+        action="store_true",
+        help=f"skip the {len(TABLE_C7_EXTENDED_COLUMNS)} extra meters read via LP 0x6F in "
+        f"{TABLE_C7_CHUNK_COUNT} chunked exchanges (c7_* columns are left NULL) — nearly the rest "
+        "of Table C-7 beyond the core/ticket meters (per-denomination bill counts, AFT transfer "
+        "meters, SAS-validation-specific meters, and more). Independent of "
+        "--skip-full-meter-sweep: this poll is far more wire-efficient per meter (12 meters per "
+        "exchange, self-describing size) than the single-meter sweep, so it's worth keeping on "
+        "even where that one isn't affordable.",
+    )
+    parser.add_argument(
         "--general-poll-retries",
         type=int,
         default=DEFAULT_GENERAL_POLL_RETRIES,
@@ -1192,7 +1263,8 @@ def main() -> int:
         print("  meters_history: unbounded, written every cycle (lab/stress-testing mode).")
     print(
         f"  meters: {len(ALL_METER_FIELDS)} columns per row "
-        f"({'full single-meter sweep enabled' if not args.skip_full_meter_sweep else 'single-meter sweep skipped'})."
+        f"(single-meter sweep {'enabled' if not args.skip_full_meter_sweep else 'skipped'}, "
+        f"Table C-7 sweep {'enabled' if not args.skip_table_c7_sweep else 'skipped'})."
     )
 
     if not args.skip_ticket_out_backfill:
@@ -1218,6 +1290,7 @@ def main() -> int:
                 history,
                 db_size_warning_mb=args.db_size_warning_mb,
                 full_meter_sweep=not args.skip_full_meter_sweep,
+                table_c7_sweep=not args.skip_table_c7_sweep,
                 interval=args.interval,
                 general_poll_retries=args.general_poll_retries,
                 pool_age_alert_hours=args.pool_age_alert_hours,

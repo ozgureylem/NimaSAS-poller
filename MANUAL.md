@@ -282,19 +282,26 @@ row: the six core counters (`0x0F`), the eight cumulative ticket meters
 of the same core counters via `0x19`/`0x1C` (`0x1C` also adds games
 won/slot door opened/power reset), games since power-up/door-closure
 (`0x18`), bill meters by denomination (`0x1E`), hand-paid cancelled
-credits (`0x2D`), current hopper status (`0x4F`), and — unless
-`--skip-full-meter-sweep` is given — every other single-meter long poll
-this client implements (`0x10`-`0x51`/`0x55`, roughly 39 more). See
-`ALL_METER_FIELDS` in `sql_poll_logger.py` for the exact, current column
-list — with close to 80 columns, that source list is the one this manual
-won't try to keep a duplicate of. Several of these are deliberately
-redundant: three long polls disagreeing about "total coin in" this cycle
-is a real finding a single poll can never surface, and this is a
-reference/stress-testing tool, not one trying to economize on wire
-traffic — see §4.4 and the module docstring for the full reasoning, and
-`--skip-full-meter-sweep` if the ~39-poll sweep is too much traffic for
-your hardware. All of it lands in one row, one history table, in one of
-two modes picked with `--mode`:
+credits (`0x2D`), current hopper status (`0x4F`), unless
+`--skip-full-meter-sweep` is given every other single-meter long poll
+this client implements (`0x10`-`0x51`/`0x55`, roughly 39 more), and
+unless `--skip-table-c7-sweep` is given essentially the rest of Table
+C-7 — every remaining assigned meter code (~154 more: per-denomination
+bill-acceptor counts, SAS-validation-specific meters, AFT transfer
+meters, and more) read via `0x6F` in ~13 chunked exchanges of 12 codes
+each, self-describing size. See `ALL_METER_FIELDS` in
+`sql_poll_logger.py` for the exact, current column list — north of 230
+columns, that source list is the one this manual won't try to keep a
+duplicate of. Several of these are deliberately redundant: three long
+polls disagreeing about "total coin in" this cycle is a real finding a
+single poll can never surface, and this is a reference/stress-testing
+tool, not one trying to economize on wire traffic — see §4.4 and the
+module docstring for the full reasoning, and `--skip-full-meter-sweep`/
+`--skip-table-c7-sweep` if either sweep is too much traffic for your
+hardware — the Table C-7 sweep is much cheaper per meter (12 per
+exchange) than the single-meter one, so it's worth leaving on even
+where that one isn't affordable. All of it lands in one row, one
+history table, in one of two modes picked with `--mode`:
 
 - **`ring`** (the default) — a single always-current-value row, plus a
   history table capped at a fixed size (oldest rows evicted) and
@@ -384,7 +391,8 @@ A lab/stress-test run: logs every single poll (uncapped), polling every
 | `--skip-ticket-out-backfill` | off | Skip the one-time startup read of the full ticket-out buffer (indices 1–31). |
 | `--seed-validation-pool N` | `0` | Top up `validation_pool` to at least `N` `available` rows with random 16-digit test numbers. `0` means don't seed — do this if you're hand-inserting real numbers instead. |
 | `--db-size-warning-mb MB` | `0` | Print a warning every cycle the database file is at or above this size — an early signal, not a substitute for the loud failure a full partition already produces on its own (see §4.4). `0` disables it. |
-| `--skip-full-meter-sweep` | off | Skip the ~39 individual single-meter long polls each cycle (their columns are left `NULL`); every other meter poll (core, ticket, `0x18`/`0x19`/`0x1C`/`0x1E`/`0x2D`/`0x4F`) still runs. Lighter per-cycle wire traffic for hardware where the full sweep isn't affordable — see §4.4. |
+| `--skip-full-meter-sweep` | off | Skip the ~39 individual single-meter long polls each cycle (their columns are left `NULL`); every other meter poll (core, ticket, `0x18`/`0x19`/`0x1C`/`0x1E`/`0x2D`/`0x4F`, and the Table C-7 sweep below) still runs. Lighter per-cycle wire traffic for hardware where the full sweep isn't affordable — see §4.4. |
+| `--skip-table-c7-sweep` | off | Skip the ~154-meter Table C-7 sweep (13 chunked `0x6F` exchanges; their columns are left `NULL`); every other meter poll still runs. Much cheaper per meter than `--skip-full-meter-sweep`'s target (12 meters/exchange vs. 1), so worth leaving on even where that one isn't affordable — see §4.4. |
 | `--general-poll-retries N` | `3` | Consecutive immediate re-poll attempts on a failed general poll before waiting for the next `--interval` cycle (Decisions Annex D-09). `1` disables retrying. |
 | `--pool-age-alert-hours HOURS` | `36.0` | Print an active, repeated `ALERT:` line (and log a `PoolStale` row) every cycle the oldest available `validation_pool` number is at or above this age (Decisions Annex D-16). Never blocks dispensing. `0` or negative disables it. |
 
@@ -498,14 +506,15 @@ it.
 knows (see §4.1's list and `sql_poll_logger.py`'s `ALL_METER_FIELDS`),
 **all of which must succeed** before anything is written — the six core
 meters (`0x0F`), the eight ticket meters (`0x2F`), `0x18`/`0x19`/`0x1C`/
-`0x1E`/`0x2D`/`0x4F`, and (unless `--skip-full-meter-sweep`) the ~39
-single-meter polls. This is a deliberate, explicit design choice, not
-an accident of how the code happens to be structured: **any one poll in
-this group failing aborts the entire cycle's meter write**, the same as
-it always has for the original two. A row that's fresh in some meter
-columns and stale (or missing) in others would misrepresent what "as of
-`polled_at`" actually means, and that's just as true whether it's 2
-polls or 40.
+`0x1E`/`0x2D`/`0x4F`, (unless `--skip-full-meter-sweep`) the ~39
+single-meter polls, and (unless `--skip-table-c7-sweep`) ~13 chunked
+`0x6F` exchanges covering essentially the rest of Table C-7. This is a
+deliberate, explicit design choice, not an accident of how the code
+happens to be structured: **any one poll in this group failing aborts
+the entire cycle's meter write**, the same as it always has for the
+original two. A row that's fresh in some meter columns and stale (or
+missing) in others would misrepresent what "as of `polled_at`"
+actually means, and that's just as true whether it's 2 polls or 60.
 
 On success of every poll, `meters_current` (always exactly one row) is
 overwritten with the latest values from all of them, unconditionally,
@@ -538,14 +547,17 @@ message, and the specific poll that failed are inserted into
 before — see §6.3), and **nothing** is written to `meters_current` or
 `meters_history` that cycle. The loop continues after `--interval`
 seconds either way; one bad exchange — a timeout, a checksum failure,
-anything — never stops the run. `--skip-full-meter-sweep` is the
-practical lever if this many polls per cycle (8 grouped polls plus
-~39 single-meter ones, 47 total) is more wire traffic than your
-hardware or `--interval` can absorb — it drops the ~39-poll sweep
-specifically (leaving its columns `NULL` that cycle) while keeping
-every grouped poll.
+anything — never stops the run. `--skip-full-meter-sweep` and
+`--skip-table-c7-sweep` are the practical levers if this many polls per
+cycle (8 grouped polls, ~39 single-meter ones, and ~13 Table C-7
+chunks — 60 total by default) is more wire traffic than your hardware
+or `--interval` can absorb. They're independent and asymmetric: the
+Table C-7 sweep covers roughly four times as many meters (~154 vs.
+~39) in about a third as many exchanges (13 vs. 39), since `0x6F`
+batches 12 meters per request — so if only one has to go, drop the
+single-meter sweep first.
 
-**Is 47 exchanges a cycle actually fast enough on real hardware?**
+**Is 60 exchanges a cycle actually fast enough on real hardware?**
 This manual won't guess — every cycle's own log line answers it
 directly: `meter_poll=X.XXXs/N polls` is measured wall-clock time
 against whatever `sql_poll_logger.py` is actually talking to, not a
@@ -554,10 +566,10 @@ EGM(s) and read that number back; if it's a meaningful fraction of
 `--interval`, you'll also get an unmissable `WARNING: meter poll took
 X.XXXs ... at or above --interval Ns` line the moment the sweep alone
 doesn't leave room for the general poll and the configured sleep. At
-that point `--skip-full-meter-sweep` (drop the ~39-poll sweep) or a
-larger `--interval` are the two practical levers — which one depends on
-whether you need those columns refreshed every cycle or can live with
-them stale/`NULL`.
+that point `--skip-full-meter-sweep`, `--skip-table-c7-sweep`, or a
+larger `--interval` are the practical levers — which combination
+depends on whether you need those columns refreshed every cycle or can
+live with them stale/`NULL`.
 
 ### 4.5 Troubleshooting
 
@@ -590,6 +602,15 @@ them stale/`NULL`.
   whole sweep (leaving its columns `NULL`) while keeping every other
   meter poll working normally; that's the practical fix if this
   machine simply doesn't speak all of them.
+- **Every cycle logs a `send_extended_meters(chunk N/13)` failure**:
+  this machine doesn't answer `0x6F` at all, or rejects a specific code
+  inside that chunk — check whether `send_extended_meters_group` (LP
+  `0x1C`, a different long poll, also `0x6F`-shaped in Table 7.21 but
+  not the same request) succeeds; if it does but the Table C-7 sweep
+  doesn't, this machine likely has a narrower LP `0x6F` implementation
+  than the spec's own maximum. `--skip-table-c7-sweep` is the practical
+  fix — every other meter poll, including the single-meter sweep,
+  keeps working.
 - **`poll_errors` shows repeated `general_poll(attempt N/M)` rows**:
   expected on a flaky link — each consecutive immediate retry (up to
   `--general-poll-retries`) is logged individually, numbered, so you
@@ -835,13 +856,15 @@ CREATE TABLE IF NOT EXISTS meters_current (
     games_played INTEGER,
     ticket_in_cashable_cents INTEGER,
     ticket_in_cashable_count INTEGER,
-    -- ... and ~70 more meter columns, generated (not hand-typed) from
-    -- ALL_METER_FIELDS in sql_poll_logger.py -- see that name for the
-    -- full, current, authoritative list; this manual won't try to keep
-    -- a duplicate of a list that size in sync by hand. Covers every
-    -- ticket meter (LP 0x2F), LP 0x18/0x19/0x1C/0x1E/0x2D/0x4F, and
-    -- (unless --skip-full-meter-sweep) every other single-meter long
-    -- poll this client implements -- ~80 columns total, deliberately
+    -- ... and north of 220 more meter columns, generated (not
+    -- hand-typed) from ALL_METER_FIELDS in sql_poll_logger.py -- see
+    -- that name for the full, current, authoritative list; this manual
+    -- won't try to keep a duplicate of a list that size in sync by
+    -- hand. Covers every ticket meter (LP 0x2F), LP
+    -- 0x18/0x19/0x1C/0x1E/0x2D/0x4F, (unless --skip-full-meter-sweep)
+    -- every other single-meter long poll this client implements, and
+    -- (unless --skip-table-c7-sweep) essentially the rest of Table C-7
+    -- via chunked LP 0x6F reads -- 230+ columns total, deliberately
     -- including several that read the same underlying counter as
     -- total_coin_in above through an entirely independent long poll.
     -- meters_history has the identical column set (same generation).

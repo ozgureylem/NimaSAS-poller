@@ -181,13 +181,29 @@ class ExceptionCode(enum.IntEnum):
 
 
 class MeterCode(enum.IntEnum):
-    """Selected-meter codes for LP 2F/6F (Table C-7, Appendix C). Only the
-    codes this client actually verified against the spec table are named
-    here — Table C-7 runs to roughly 190 codes, most irrelevant to this
-    project, and a wrong meter code is a silent wrong-answer bug (the
-    machine responds normally; it's just the wrong number), so codes are
-    added here only once checked against the table, not guessed from a
-    plausible-looking name.
+    """Selected-meter codes for LP 2F/6F (Table C-7, Appendix C).
+
+    Essentially the complete table: every assigned code from 0x0000
+    through 0x00BD (the core/extended/bill-denomination range, the
+    SAS-validation-specific range, and the AFT-specific range), skipping
+    only the reserved gaps (0x003A-0x003D, 0x0079-0x007E, 0x0094-0x009F,
+    0x00B2-0x00B7) and 0x00BE-0xFFFF ("reserved for future use" per the
+    table's own closing note). Transcribed directly from the spec's
+    Table C-7, not from any secondary source — a wrong meter code is a
+    silent wrong-answer bug (the machine responds normally; it's just
+    the wrong number), so every entry here was checked against the
+    table, never guessed from a plausible-looking name.
+
+    A handful of codes are intentionally not aliased to each other even
+    where the table cross-references them as equivalent (e.g. 0x000F
+    "Total SAS restricted ticket in (cents) [same as meter 0082]") —
+    each SAS code is kept as its own named member (see
+    VALIDATION_RESTRICTED_TICKET_IN_CENTS for 0x0082's own name,
+    disambiguated from RESTRICTED_TICKET_IN_CENTS at 0x000F, which
+    would otherwise collide) rather than collapsed to one Python name,
+    because polling both independently is exactly the kind of
+    redundant cross-check this project's tooling deliberately keeps —
+    see sql_poll_logger.py's module docstring.
 
     CORRECTION: an earlier project planning document (Technical v3 draft,
     §8.2) named these as 0x1A/0x1B (cashable) and 0x35-0x3C (restricted/
@@ -213,6 +229,170 @@ class MeterCode(enum.IntEnum):
     RESTRICTED_TICKET_OUT_CENTS = 0x10  # 5 BCD; [same as 0088]
     RESTRICTED_TICKET_OUT_QUANTITY = 0x14  # 4 BCD; [same as 0089]
 
+    # --- Core meters (Table C-7, 0x00-0x0C) ---
+    TOTAL_COIN_IN_CREDITS = 0x00  # Total coin in credits
+    TOTAL_COIN_OUT_CREDITS = 0x01  # Total coin out credits
+    TOTAL_JACKPOT_CREDITS = 0x02  # Total jackpot credits
+    TOTAL_HAND_PAID_CANCELLED_CREDITS = 0x03  # Total hand paid cancelled credits
+    TOTAL_CANCELLED_CREDITS = 0x04  # Total cancelled credits
+    GAMES_PLAYED = 0x05  # Games played
+    GAMES_WON = 0x06  # Games won
+    GAMES_LOST = 0x07  # Games lost
+    TOTAL_CREDITS_FROM_COIN_ACCEPTOR = 0x08  # Total credits from coin acceptor
+    TOTAL_CREDITS_PAID_FROM_HOPPER = 0x09  # Total credits paid from hopper
+    TOTAL_CREDITS_FROM_COINS_TO_DROP = 0x0A  # Total credits from coins to drop
+    TOTAL_CREDITS_FROM_BILLS_ACCEPTED = 0x0B  # Total credits from bills accepted
+    CURRENT_CREDITS = 0x0C  # Current credits
+
+    # --- Extended/electronic-transfer meters (Table C-7, 0x15-0x39) ---
+    TOTAL_TICKET_IN_CREDITS = 0x15  # Total ticket in credits
+    TOTAL_TICKET_OUT_CREDITS = 0x16  # Total ticket out credits
+    TOTAL_ELECTRONIC_TRANSFERS_TO_GAMING_MACHINE_CREDITS = 0x17  # Total electronic transfers to gaming machine credits
+    TOTAL_ELECTRONIC_TRANSFERS_TO_HOST_CREDITS = 0x18  # Total electronic transfers to host credits
+    TOTAL_RESTRICTED_AMOUNT_PLAYED_CREDITS = 0x19  # Total restricted amount played credits
+    TOTAL_NONRESTRICTED_AMOUNT_PLAYED_CREDITS = 0x1A  # Total nonrestricted amount played credits
+    CURRENT_RESTRICTED_CREDITS = 0x1B  # Current restricted credits
+    TOTAL_MACHINE_PAID_PAYTABLE_WIN_CREDITS = 0x1C  # Total machine paid paytable win credits
+    TOTAL_MACHINE_PAID_PROGRESSIVE_WIN_CREDITS = 0x1D  # Total machine paid progressive win credits
+    TOTAL_MACHINE_PAID_EXTERNAL_BONUS_WIN_CREDITS = 0x1E  # Total machine paid external bonus win credits
+    TOTAL_ATTENDANT_PAID_PAYTABLE_WIN_CREDITS = 0x1F  # Total attendant paid paytable win credits
+    TOTAL_ATTENDANT_PAID_PROGRESSIVE_WIN_CREDITS = 0x20  # Total attendant paid progressive win credits
+    TOTAL_ATTENDANT_PAID_EXTERNAL_BONUS_WIN_CREDITS = 0x21  # Total attendant paid external bonus win credits
+    TOTAL_WON_CREDITS = 0x22  # Total won credits
+    TOTAL_HAND_PAID_CREDITS = 0x23  # Total hand paid credits
+    TOTAL_DROP_CREDITS = 0x24  # Total drop credits
+    GAMES_SINCE_LAST_POWER_RESET = 0x25  # Games since last power reset
+    GAMES_SINCE_SLOT_DOOR_CLOSURE = 0x26  # Games since slot door closure
+    TOTAL_CREDITS_FROM_EXTERNAL_COIN_ACCEPTOR = 0x27  # Total credits from external coin acceptor
+    TOTAL_CASHABLE_TICKET_IN_CREDITS = 0x28  # Total cashable ticket in credits
+    TOTAL_REGULAR_CASHABLE_TICKET_IN_CREDITS = 0x29  # Total regular cashable ticket in credits
+    TOTAL_RESTRICTED_PROMOTIONAL_TICKET_IN_CREDITS = 0x2A  # Total restricted promotional ticket in credits
+    TOTAL_NONRESTRICTED_PROMOTIONAL_TICKET_IN_CREDITS = 0x2B  # Total nonrestricted promotional ticket in credits
+    TOTAL_CASHABLE_TICKET_OUT_CREDITS = 0x2C  # Total cashable ticket out credits
+    TOTAL_RESTRICTED_PROMOTIONAL_TICKET_OUT_CREDITS = 0x2D  # Total restricted promotional ticket out credits
+    ELECTRONIC_REGULAR_CASHABLE_TRANSFERS_TO_GAMING_MACHINE_CREDITS = 0x2E  # Electronic regular cashable transfers to gaming machine credits
+    ELECTRONIC_RESTRICTED_PROMOTIONAL_TRANSFERS_TO_GAMING_MACHINE_CREDITS = 0x2F  # Electronic restricted promotional transfers to gaming machine credits
+    ELECTRONIC_NONRESTRICTED_PROMOTIONAL_TRANSFERS_TO_GAMING_MACHINE_CREDITS = 0x30  # Electronic nonrestricted promotional transfers to gaming machine credits
+    ELECTRONIC_DEBIT_TRANSFERS_TO_GAMING_MACHINE_CREDITS = 0x31  # Electronic debit transfers to gaming machine credits
+    ELECTRONIC_REGULAR_CASHABLE_TRANSFERS_TO_HOST_CREDITS = 0x32  # Electronic regular cashable transfers to host credits
+    ELECTRONIC_RESTRICTED_PROMOTIONAL_TRANSFERS_TO_HOST_CREDITS = 0x33  # Electronic restricted promotional transfers to host credits
+    ELECTRONIC_NONRESTRICTED_PROMOTIONAL_TRANSFERS_TO_HOST_CREDITS = 0x34  # Electronic nonrestricted promotional transfers to host credits
+    TOTAL_REGULAR_CASHABLE_TICKET_IN_QUANTITY = 0x35  # Total regular cashable ticket in quantity
+    TOTAL_RESTRICTED_PROMOTIONAL_TICKET_IN_QUANTITY = 0x36  # Total restricted promotional ticket in quantity
+    TOTAL_NONRESTRICTED_PROMOTIONAL_TICKET_IN_QUANTITY = 0x37  # Total nonrestricted promotional ticket in quantity
+    TOTAL_CASHABLE_TICKET_OUT_QUANTITY = 0x38  # Total cashable ticket out quantity
+    TOTAL_RESTRICTED_PROMOTIONAL_TICKET_OUT_QUANTITY = 0x39  # Total restricted promotional ticket out quantity
+    NUMBER_OF_BILLS_CURRENTLY_IN_STACKER = 0x3E  # Number of bills currently in stacker
+    TOTAL_VALUE_OF_BILLS_CURRENTLY_IN_STACKER_CREDITS = 0x3F  # Total value of bills currently in stacker credits
+
+    # --- Bill-acceptor meters by denomination (Table C-7, 0x3E-0x7F) ---
+    TOTAL_NUMBER_OF_1_00_BILLS_ACCEPTED = 0x40  # Total number of $1.00 bills accepted
+    TOTAL_NUMBER_OF_2_00_BILLS_ACCEPTED = 0x41  # Total number of $2.00 bills accepted
+    TOTAL_NUMBER_OF_5_00_BILLS_ACCEPTED = 0x42  # Total number of $5.00 bills accepted
+    TOTAL_NUMBER_OF_10_00_BILLS_ACCEPTED = 0x43  # Total number of $10.00 bills accepted
+    TOTAL_NUMBER_OF_20_00_BILLS_ACCEPTED = 0x44  # Total number of $20.00 bills accepted
+    TOTAL_NUMBER_OF_25_00_BILLS_ACCEPTED = 0x45  # Total number of $25.00 bills accepted
+    TOTAL_NUMBER_OF_50_00_BILLS_ACCEPTED = 0x46  # Total number of $50.00 bills accepted
+    TOTAL_NUMBER_OF_100_00_BILLS_ACCEPTED = 0x47  # Total number of $100.00 bills accepted
+    TOTAL_NUMBER_OF_200_00_BILLS_ACCEPTED = 0x48  # Total number of $200.00 bills accepted
+    TOTAL_NUMBER_OF_250_00_BILLS_ACCEPTED = 0x49  # Total number of $250.00 bills accepted
+    TOTAL_NUMBER_OF_500_00_BILLS_ACCEPTED = 0x4A  # Total number of $500.00 bills accepted
+    TOTAL_NUMBER_OF_1_000_00_BILLS_ACCEPTED = 0x4B  # Total number of $1,000.00 bills accepted
+    TOTAL_NUMBER_OF_2_000_00_BILLS_ACCEPTED = 0x4C  # Total number of $2,000.00 bills accepted
+    TOTAL_NUMBER_OF_2_500_00_BILLS_ACCEPTED = 0x4D  # Total number of $2,500.00 bills accepted
+    TOTAL_NUMBER_OF_5_000_00_BILLS_ACCEPTED = 0x4E  # Total number of $5,000.00 bills accepted
+    TOTAL_NUMBER_OF_10_000_00_BILLS_ACCEPTED = 0x4F  # Total number of $10,000.00 bills accepted
+    TOTAL_NUMBER_OF_20_000_00_BILLS_ACCEPTED = 0x50  # Total number of $20,000.00 bills accepted
+    TOTAL_NUMBER_OF_25_000_00_BILLS_ACCEPTED = 0x51  # Total number of $25,000.00 bills accepted
+    TOTAL_NUMBER_OF_50_000_00_BILLS_ACCEPTED = 0x52  # Total number of $50,000.00 bills accepted
+    TOTAL_NUMBER_OF_100_000_00_BILLS_ACCEPTED = 0x53  # Total number of $100,000.00 bills accepted
+    TOTAL_NUMBER_OF_200_000_00_BILLS_ACCEPTED = 0x54  # Total number of $200,000.00 bills accepted
+    TOTAL_NUMBER_OF_250_000_00_BILLS_ACCEPTED = 0x55  # Total number of $250,000.00 bills accepted
+    TOTAL_NUMBER_OF_500_000_00_BILLS_ACCEPTED = 0x56  # Total number of $500,000.00 bills accepted
+    TOTAL_NUMBER_OF_1_000_000_00_BILLS_ACCEPTED = 0x57  # Total number of $1,000,000.00 bills accepted
+    TOTAL_CREDITS_FROM_BILLS_TO_DROP = 0x58  # Total credits from bills to drop
+    TOTAL_NUMBER_OF_1_00_BILLS_TO_DROP = 0x59  # Total number of $1.00 bills to drop
+    TOTAL_NUMBER_OF_2_00_BILLS_TO_DROP = 0x5A  # Total number of $2.00 bills to drop
+    TOTAL_NUMBER_OF_5_00_BILLS_TO_DROP = 0x5B  # Total number of $5.00 bills to drop
+    TOTAL_NUMBER_OF_10_00_BILLS_TO_DROP = 0x5C  # Total number of $10.00 bills to drop
+    TOTAL_NUMBER_OF_20_00_BILLS_TO_DROP = 0x5D  # Total number of $20.00 bills to drop
+    TOTAL_NUMBER_OF_50_00_BILLS_TO_DROP = 0x5E  # Total number of $50.00 bills to drop
+    TOTAL_NUMBER_OF_100_00_BILLS_TO_DROP = 0x5F  # Total number of $100.00 bills to drop
+    TOTAL_NUMBER_OF_200_00_BILLS_TO_DROP = 0x60  # Total number of $200.00 bills to drop
+    TOTAL_NUMBER_OF_500_00_BILLS_TO_DROP = 0x61  # Total number of $500.00 bills to drop
+    TOTAL_NUMBER_OF_1000_00_BILLS_TO_DROP = 0x62  # Total number of $1000.00 bills to drop
+    TOTAL_CREDITS_FROM_BILLS_DIVERTED_TO_HOPPER = 0x63  # Total credits from bills diverted to hopper
+    TOTAL_NUMBER_OF_1_00_BILLS_DIVERTED_TO_HOPPER = 0x64  # Total number of $1.00 bills diverted to hopper
+    TOTAL_NUMBER_OF_2_00_BILLS_DIVERTED_TO_HOPPER = 0x65  # Total number of $2.00 bills diverted to hopper
+    TOTAL_NUMBER_OF_5_00_BILLS_DIVERTED_TO_HOPPER = 0x66  # Total number of $5.00 bills diverted to hopper
+    TOTAL_NUMBER_OF_10_00_BILLS_DIVERTED_TO_HOPPER = 0x67  # Total number of $10.00 bills diverted to hopper
+    TOTAL_NUMBER_OF_20_00_BILLS_DIVERTED_TO_HOPPER = 0x68  # Total number of $20.00 bills diverted to hopper
+    TOTAL_NUMBER_OF_50_00_BILLS_DIVERTED_TO_HOPPER = 0x69  # Total number of $50.00 bills diverted to hopper
+    TOTAL_NUMBER_OF_100_00_BILLS_DIVERTED_TO_HOPPER = 0x6A  # Total number of $100.00 bills diverted to hopper
+    TOTAL_NUMBER_OF_200_00_BILLS_DIVERTED_TO_HOPPER = 0x6B  # Total number of $200.00 bills diverted to hopper
+    TOTAL_NUMBER_OF_500_00_BILLS_DIVERTED_TO_HOPPER = 0x6C  # Total number of $500.00 bills diverted to hopper
+    TOTAL_NUMBER_OF_1000_00_BILLS_DIVERTED_TO_HOPPER = 0x6D  # Total number of $1000.00 bills diverted to hopper
+    TOTAL_CREDITS_FROM_BILLS_DISPENSED_FROM_HOPPER = 0x6E  # Total credits from bills dispensed from hopper
+    TOTAL_NUMBER_OF_1_00_BILLS_DISPENSED_FROM_HOPPER = 0x6F  # Total number of $1.00 bills dispensed from hopper
+    TOTAL_NUMBER_OF_2_00_BILLS_DISPENSED_FROM_HOPPER = 0x70  # Total number of $2.00 bills dispensed from hopper
+    TOTAL_NUMBER_OF_5_00_BILLS_DISPENSED_FROM_HOPPER = 0x71  # Total number of $5.00 bills dispensed from hopper
+    TOTAL_NUMBER_OF_10_00_BILLS_DISPENSED_FROM_HOPPER = 0x72  # Total number of $10.00 bills dispensed from hopper
+    TOTAL_NUMBER_OF_20_00_BILLS_DISPENSED_FROM_HOPPER = 0x73  # Total number of $20.00 bills dispensed from hopper
+    TOTAL_NUMBER_OF_50_00_BILLS_DISPENSED_FROM_HOPPER = 0x74  # Total number of $50.00 bills dispensed from hopper
+    TOTAL_NUMBER_OF_100_00_BILLS_DISPENSED_FROM_HOPPER = 0x75  # Total number of $100.00 bills dispensed from hopper
+    TOTAL_NUMBER_OF_200_00_BILLS_DISPENSED_FROM_HOPPER = 0x76  # Total number of $200.00 bills dispensed from hopper
+    TOTAL_NUMBER_OF_500_00_BILLS_DISPENSED_FROM_HOPPER = 0x77  # Total number of $500.00 bills dispensed from hopper
+    TOTAL_NUMBER_OF_1000_00_BILLS_DISPENSED_FROM_HOPPER = 0x78  # Total number of $1000.00 bills dispensed from hopper
+    WEIGHTED_AVERAGE_THEORETICAL_PAYBACK_PERCENTAGE = 0x7F  # Weighted average theoretical payback percentage
+
+    # --- Validation-specific meters (Table C-7, 0x80-0x93) ---
+    REGULAR_CASHABLE_TICKET_IN_CENTS = 0x80  # Regular cashable ticket in cents
+    REGULAR_CASHABLE_TICKET_IN_QUANTITY = 0x81  # Regular cashable ticket in quantity
+    VALIDATION_RESTRICTED_TICKET_IN_CENTS = 0x82  # Restricted ticket in cents
+    VALIDATION_RESTRICTED_TICKET_IN_QUANTITY = 0x83  # Restricted ticket in quantity
+    NONRESTRICTED_TICKET_IN_CENTS = 0x84  # Nonrestricted ticket in cents
+    NONRESTRICTED_TICKET_IN_QUANTITY = 0x85  # Nonrestricted ticket in quantity
+    REGULAR_CASHABLE_TICKET_OUT_CENTS = 0x86  # Regular cashable ticket out cents
+    REGULAR_CASHABLE_TICKET_OUT_QUANTITY = 0x87  # Regular cashable ticket out quantity
+    VALIDATION_RESTRICTED_TICKET_OUT_CENTS = 0x88  # Restricted ticket out cents
+    VALIDATION_RESTRICTED_TICKET_OUT_QUANTITY = 0x89  # Restricted ticket out quantity
+    DEBIT_TICKET_OUT_CENTS = 0x8A  # Debit ticket out cents
+    DEBIT_TICKET_OUT_QUANTITY = 0x8B  # Debit ticket out quantity
+    VALIDATED_CANCELLED_CREDIT_HANDPAY_RECEIPT_PRINTED_CENTS = 0x8C  # Validated cancelled credit handpay receipt printed cents
+    VALIDATED_CANCELLED_CREDIT_HANDPAY_RECEIPT_PRINTED_QUANTITY = 0x8D  # Validated cancelled credit handpay receipt printed quantity
+    VALIDATED_JACKPOT_HANDPAY_RECEIPT_PRINTED_CENTS = 0x8E  # Validated jackpot handpay receipt printed cents
+    VALIDATED_JACKPOT_HANDPAY_RECEIPT_PRINTED_QUANTITY = 0x8F  # Validated jackpot handpay receipt printed quantity
+    VALIDATED_CANCELLED_CREDIT_HANDPAY_NO_RECEIPT_CENTS = 0x90  # Validated cancelled credit handpay no receipt cents
+    VALIDATED_CANCELLED_CREDIT_HANDPAY_NO_RECEIPT_QUANTITY = 0x91  # Validated cancelled credit handpay no receipt quantity
+    VALIDATED_JACKPOT_HANDPAY_NO_RECEIPT_CENTS = 0x92  # Validated jackpot handpay no receipt cents
+    VALIDATED_JACKPOT_HANDPAY_NO_RECEIPT_QUANTITY = 0x93  # Validated jackpot handpay no receipt quantity
+
+    # --- AFT-specific meters (Table C-7, 0xA0-0xBD) ---
+    IN_HOUSE_CASHABLE_TRANSFERS_TO_GAMING_MACHINE_CENTS = 0xA0  # In-house cashable transfers to gaming machine cents
+    IN_HOUSE_TRANSFERS_TO_GAMING_MACHINE_THAT_INCLUDED_CASHABLE_AMOUNTS_QUANTITY = 0xA1  # In-house transfers to gaming machine that included cashable amounts quantity
+    IN_HOUSE_RESTRICTED_TRANSFERS_TO_GAMING_MACHINE_CENTS = 0xA2  # In-house restricted transfers to gaming machine cents
+    IN_HOUSE_TRANSFERS_TO_GAMING_MACHINE_THAT_INCLUDED_RESTRICTED_AMOUNTS_QUANTITY = 0xA3  # In-house transfers to gaming machine that included restricted amounts quantity
+    IN_HOUSE_NONRESTRICTED_TRANSFERS_TO_GAMING_MACHINE_CENTS = 0xA4  # In-house nonrestricted transfers to gaming machine cents
+    IN_HOUSE_TRANSFERS_TO_GAMING_MACHINE_THAT_INCLUDED_NONRESTRICTED_AMOUNTS_QUANTITY = 0xA5  # In-house transfers to gaming machine that included nonrestricted amounts quantity
+    DEBIT_TRANSFERS_TO_GAMING_MACHINE_CENTS = 0xA6  # Debit transfers to gaming machine cents
+    DEBIT_TRANSFERS_TO_GAMING_MACHINE_QUANTITY = 0xA7  # Debit transfers to gaming machine quantity
+    IN_HOUSE_CASHABLE_TRANSFERS_TO_TICKET_CENTS = 0xA8  # In-house cashable transfers to ticket cents
+    IN_HOUSE_CASHABLE_TRANSFERS_TO_TICKET_QUANTITY = 0xA9  # In-house cashable transfers to ticket quantity
+    IN_HOUSE_RESTRICTED_TRANSFERS_TO_TICKET_CENTS = 0xAA  # In-house restricted transfers to ticket cents
+    IN_HOUSE_TRANSFERS_TO_TICKET_THAT_INCLUDED_RESTRICTED_AMOUNTS_QUANTITY = 0xAB  # In-house transfers to ticket that included restricted amounts quantity
+    DEBIT_TRANSFERS_TO_TICKET_CENTS = 0xAC  # Debit transfers to ticket cents
+    DEBIT_TRANSFERS_TO_TICKET_QUANTITY = 0xAD  # Debit transfers to ticket quantity
+    BONUS_CASHABLE_TRANSFERS_TO_GAMING_MACHINE_CENTS = 0xAE  # Bonus cashable transfers to gaming machine cents
+    BONUS_TRANSFERS_TO_GAMING_MACHINE_THAT_INCLUDED_CASHABLE_AMOUNTS_QUANTITY = 0xAF  # Bonus transfers to gaming machine that included cashable amounts quantity
+    BONUS_NONRESTRICTED_TRANSFERS_TO_GAMING_MACHINE_CENTS = 0xB0  # Bonus nonrestricted transfers to gaming machine cents
+    BONUS_TRANSFERS_TO_GAMING_MACHINE_THAT_INCLUDED_NONRESTRICTED_AMOUNTS_QUANTITY = 0xB1  # Bonus transfers to gaming machine that included nonrestricted amounts quantity
+    IN_HOUSE_CASHABLE_TRANSFERS_TO_HOST_CENTS = 0xB8  # In-house cashable transfers to host cents
+    IN_HOUSE_TRANSFERS_TO_HOST_THAT_INCLUDED_CASHABLE_AMOUNTS_QUANTITY = 0xB9  # In-house transfers to host that included cashable amounts quantity
+    IN_HOUSE_RESTRICTED_TRANSFERS_TO_HOST_CENTS = 0xBA  # In-house restricted transfers to host cents
+    IN_HOUSE_TRANSFERS_TO_HOST_THAT_INCLUDED_RESTRICTED_AMOUNTS_QUANTITY = 0xBB  # In-house transfers to host that included restricted amounts quantity
+    IN_HOUSE_NONRESTRICTED_TRANSFERS_TO_HOST_CENTS = 0xBC  # In-house nonrestricted transfers to host cents
+    IN_HOUSE_TRANSFERS_TO_HOST_THAT_INCLUDED_NONRESTRICTED_AMOUNTS_QUANTITY = 0xBD  # In-house transfers to host that included nonrestricted amounts quantity
+
 
 # LP 2F ("Send Selected Meters") reports each meter using Table C-7's own
 # "Min Size" column, which is NOT the same for every meter — unlike LP 6F,
@@ -229,6 +409,160 @@ METER_CODE_SIZES_BCD: dict[int, int] = {
     MeterCode.CASHABLE_TICKET_OUT_QUANTITY: 4,
     MeterCode.RESTRICTED_TICKET_OUT_CENTS: 5,
     MeterCode.RESTRICTED_TICKET_OUT_QUANTITY: 4,
+    MeterCode.TOTAL_COIN_IN_CREDITS: 4,
+    MeterCode.TOTAL_COIN_OUT_CREDITS: 4,
+    MeterCode.TOTAL_JACKPOT_CREDITS: 4,
+    MeterCode.TOTAL_HAND_PAID_CANCELLED_CREDITS: 4,
+    MeterCode.TOTAL_CANCELLED_CREDITS: 4,
+    MeterCode.GAMES_PLAYED: 4,
+    MeterCode.GAMES_WON: 4,
+    MeterCode.GAMES_LOST: 4,
+    MeterCode.TOTAL_CREDITS_FROM_COIN_ACCEPTOR: 4,
+    MeterCode.TOTAL_CREDITS_PAID_FROM_HOPPER: 4,
+    MeterCode.TOTAL_CREDITS_FROM_COINS_TO_DROP: 4,
+    MeterCode.TOTAL_CREDITS_FROM_BILLS_ACCEPTED: 4,
+    MeterCode.CURRENT_CREDITS: 4,
+    MeterCode.TOTAL_TICKET_IN_CREDITS: 4,
+    MeterCode.TOTAL_TICKET_OUT_CREDITS: 4,
+    MeterCode.TOTAL_ELECTRONIC_TRANSFERS_TO_GAMING_MACHINE_CREDITS: 4,
+    MeterCode.TOTAL_ELECTRONIC_TRANSFERS_TO_HOST_CREDITS: 4,
+    MeterCode.TOTAL_RESTRICTED_AMOUNT_PLAYED_CREDITS: 4,
+    MeterCode.TOTAL_NONRESTRICTED_AMOUNT_PLAYED_CREDITS: 4,
+    MeterCode.CURRENT_RESTRICTED_CREDITS: 4,
+    MeterCode.TOTAL_MACHINE_PAID_PAYTABLE_WIN_CREDITS: 4,
+    MeterCode.TOTAL_MACHINE_PAID_PROGRESSIVE_WIN_CREDITS: 4,
+    MeterCode.TOTAL_MACHINE_PAID_EXTERNAL_BONUS_WIN_CREDITS: 4,
+    MeterCode.TOTAL_ATTENDANT_PAID_PAYTABLE_WIN_CREDITS: 4,
+    MeterCode.TOTAL_ATTENDANT_PAID_PROGRESSIVE_WIN_CREDITS: 4,
+    MeterCode.TOTAL_ATTENDANT_PAID_EXTERNAL_BONUS_WIN_CREDITS: 4,
+    MeterCode.TOTAL_WON_CREDITS: 4,
+    MeterCode.TOTAL_HAND_PAID_CREDITS: 4,
+    MeterCode.TOTAL_DROP_CREDITS: 4,
+    MeterCode.GAMES_SINCE_LAST_POWER_RESET: 4,
+    MeterCode.GAMES_SINCE_SLOT_DOOR_CLOSURE: 4,
+    MeterCode.TOTAL_CREDITS_FROM_EXTERNAL_COIN_ACCEPTOR: 4,
+    MeterCode.TOTAL_CASHABLE_TICKET_IN_CREDITS: 4,
+    MeterCode.TOTAL_REGULAR_CASHABLE_TICKET_IN_CREDITS: 4,
+    MeterCode.TOTAL_RESTRICTED_PROMOTIONAL_TICKET_IN_CREDITS: 4,
+    MeterCode.TOTAL_NONRESTRICTED_PROMOTIONAL_TICKET_IN_CREDITS: 4,
+    MeterCode.TOTAL_CASHABLE_TICKET_OUT_CREDITS: 4,
+    MeterCode.TOTAL_RESTRICTED_PROMOTIONAL_TICKET_OUT_CREDITS: 4,
+    MeterCode.ELECTRONIC_REGULAR_CASHABLE_TRANSFERS_TO_GAMING_MACHINE_CREDITS: 4,
+    MeterCode.ELECTRONIC_RESTRICTED_PROMOTIONAL_TRANSFERS_TO_GAMING_MACHINE_CREDITS: 4,
+    MeterCode.ELECTRONIC_NONRESTRICTED_PROMOTIONAL_TRANSFERS_TO_GAMING_MACHINE_CREDITS: 4,
+    MeterCode.ELECTRONIC_DEBIT_TRANSFERS_TO_GAMING_MACHINE_CREDITS: 4,
+    MeterCode.ELECTRONIC_REGULAR_CASHABLE_TRANSFERS_TO_HOST_CREDITS: 4,
+    MeterCode.ELECTRONIC_RESTRICTED_PROMOTIONAL_TRANSFERS_TO_HOST_CREDITS: 4,
+    MeterCode.ELECTRONIC_NONRESTRICTED_PROMOTIONAL_TRANSFERS_TO_HOST_CREDITS: 4,
+    MeterCode.TOTAL_REGULAR_CASHABLE_TICKET_IN_QUANTITY: 4,
+    MeterCode.TOTAL_RESTRICTED_PROMOTIONAL_TICKET_IN_QUANTITY: 4,
+    MeterCode.TOTAL_NONRESTRICTED_PROMOTIONAL_TICKET_IN_QUANTITY: 4,
+    MeterCode.TOTAL_CASHABLE_TICKET_OUT_QUANTITY: 4,
+    MeterCode.TOTAL_RESTRICTED_PROMOTIONAL_TICKET_OUT_QUANTITY: 4,
+    MeterCode.NUMBER_OF_BILLS_CURRENTLY_IN_STACKER: 4,
+    MeterCode.TOTAL_VALUE_OF_BILLS_CURRENTLY_IN_STACKER_CREDITS: 4,
+    MeterCode.TOTAL_NUMBER_OF_1_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_2_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_5_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_10_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_20_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_25_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_50_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_100_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_200_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_250_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_500_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_1_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_2_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_2_500_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_5_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_10_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_20_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_25_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_50_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_100_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_200_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_250_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_500_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_NUMBER_OF_1_000_000_00_BILLS_ACCEPTED: 4,
+    MeterCode.TOTAL_CREDITS_FROM_BILLS_TO_DROP: 4,
+    MeterCode.TOTAL_NUMBER_OF_1_00_BILLS_TO_DROP: 4,
+    MeterCode.TOTAL_NUMBER_OF_2_00_BILLS_TO_DROP: 4,
+    MeterCode.TOTAL_NUMBER_OF_5_00_BILLS_TO_DROP: 4,
+    MeterCode.TOTAL_NUMBER_OF_10_00_BILLS_TO_DROP: 4,
+    MeterCode.TOTAL_NUMBER_OF_20_00_BILLS_TO_DROP: 4,
+    MeterCode.TOTAL_NUMBER_OF_50_00_BILLS_TO_DROP: 4,
+    MeterCode.TOTAL_NUMBER_OF_100_00_BILLS_TO_DROP: 4,
+    MeterCode.TOTAL_NUMBER_OF_200_00_BILLS_TO_DROP: 4,
+    MeterCode.TOTAL_NUMBER_OF_500_00_BILLS_TO_DROP: 4,
+    MeterCode.TOTAL_NUMBER_OF_1000_00_BILLS_TO_DROP: 4,
+    MeterCode.TOTAL_CREDITS_FROM_BILLS_DIVERTED_TO_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_1_00_BILLS_DIVERTED_TO_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_2_00_BILLS_DIVERTED_TO_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_5_00_BILLS_DIVERTED_TO_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_10_00_BILLS_DIVERTED_TO_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_20_00_BILLS_DIVERTED_TO_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_50_00_BILLS_DIVERTED_TO_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_100_00_BILLS_DIVERTED_TO_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_200_00_BILLS_DIVERTED_TO_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_500_00_BILLS_DIVERTED_TO_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_1000_00_BILLS_DIVERTED_TO_HOPPER: 4,
+    MeterCode.TOTAL_CREDITS_FROM_BILLS_DISPENSED_FROM_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_1_00_BILLS_DISPENSED_FROM_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_2_00_BILLS_DISPENSED_FROM_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_5_00_BILLS_DISPENSED_FROM_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_10_00_BILLS_DISPENSED_FROM_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_20_00_BILLS_DISPENSED_FROM_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_50_00_BILLS_DISPENSED_FROM_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_100_00_BILLS_DISPENSED_FROM_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_200_00_BILLS_DISPENSED_FROM_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_500_00_BILLS_DISPENSED_FROM_HOPPER: 4,
+    MeterCode.TOTAL_NUMBER_OF_1000_00_BILLS_DISPENSED_FROM_HOPPER: 4,
+    MeterCode.WEIGHTED_AVERAGE_THEORETICAL_PAYBACK_PERCENTAGE: 4,
+    MeterCode.REGULAR_CASHABLE_TICKET_IN_CENTS: 5,
+    MeterCode.REGULAR_CASHABLE_TICKET_IN_QUANTITY: 4,
+    MeterCode.VALIDATION_RESTRICTED_TICKET_IN_CENTS: 5,
+    MeterCode.VALIDATION_RESTRICTED_TICKET_IN_QUANTITY: 4,
+    MeterCode.NONRESTRICTED_TICKET_IN_CENTS: 5,
+    MeterCode.NONRESTRICTED_TICKET_IN_QUANTITY: 4,
+    MeterCode.REGULAR_CASHABLE_TICKET_OUT_CENTS: 5,
+    MeterCode.REGULAR_CASHABLE_TICKET_OUT_QUANTITY: 4,
+    MeterCode.VALIDATION_RESTRICTED_TICKET_OUT_CENTS: 5,
+    MeterCode.VALIDATION_RESTRICTED_TICKET_OUT_QUANTITY: 4,
+    MeterCode.DEBIT_TICKET_OUT_CENTS: 5,
+    MeterCode.DEBIT_TICKET_OUT_QUANTITY: 4,
+    MeterCode.VALIDATED_CANCELLED_CREDIT_HANDPAY_RECEIPT_PRINTED_CENTS: 5,
+    MeterCode.VALIDATED_CANCELLED_CREDIT_HANDPAY_RECEIPT_PRINTED_QUANTITY: 4,
+    MeterCode.VALIDATED_JACKPOT_HANDPAY_RECEIPT_PRINTED_CENTS: 5,
+    MeterCode.VALIDATED_JACKPOT_HANDPAY_RECEIPT_PRINTED_QUANTITY: 4,
+    MeterCode.VALIDATED_CANCELLED_CREDIT_HANDPAY_NO_RECEIPT_CENTS: 5,
+    MeterCode.VALIDATED_CANCELLED_CREDIT_HANDPAY_NO_RECEIPT_QUANTITY: 4,
+    MeterCode.VALIDATED_JACKPOT_HANDPAY_NO_RECEIPT_CENTS: 5,
+    MeterCode.VALIDATED_JACKPOT_HANDPAY_NO_RECEIPT_QUANTITY: 4,
+    MeterCode.IN_HOUSE_CASHABLE_TRANSFERS_TO_GAMING_MACHINE_CENTS: 5,
+    MeterCode.IN_HOUSE_TRANSFERS_TO_GAMING_MACHINE_THAT_INCLUDED_CASHABLE_AMOUNTS_QUANTITY: 4,
+    MeterCode.IN_HOUSE_RESTRICTED_TRANSFERS_TO_GAMING_MACHINE_CENTS: 5,
+    MeterCode.IN_HOUSE_TRANSFERS_TO_GAMING_MACHINE_THAT_INCLUDED_RESTRICTED_AMOUNTS_QUANTITY: 4,
+    MeterCode.IN_HOUSE_NONRESTRICTED_TRANSFERS_TO_GAMING_MACHINE_CENTS: 5,
+    MeterCode.IN_HOUSE_TRANSFERS_TO_GAMING_MACHINE_THAT_INCLUDED_NONRESTRICTED_AMOUNTS_QUANTITY: 4,
+    MeterCode.DEBIT_TRANSFERS_TO_GAMING_MACHINE_CENTS: 5,
+    MeterCode.DEBIT_TRANSFERS_TO_GAMING_MACHINE_QUANTITY: 4,
+    MeterCode.IN_HOUSE_CASHABLE_TRANSFERS_TO_TICKET_CENTS: 5,
+    MeterCode.IN_HOUSE_CASHABLE_TRANSFERS_TO_TICKET_QUANTITY: 4,
+    MeterCode.IN_HOUSE_RESTRICTED_TRANSFERS_TO_TICKET_CENTS: 5,
+    MeterCode.IN_HOUSE_TRANSFERS_TO_TICKET_THAT_INCLUDED_RESTRICTED_AMOUNTS_QUANTITY: 4,
+    MeterCode.DEBIT_TRANSFERS_TO_TICKET_CENTS: 5,
+    MeterCode.DEBIT_TRANSFERS_TO_TICKET_QUANTITY: 4,
+    MeterCode.BONUS_CASHABLE_TRANSFERS_TO_GAMING_MACHINE_CENTS: 5,
+    MeterCode.BONUS_TRANSFERS_TO_GAMING_MACHINE_THAT_INCLUDED_CASHABLE_AMOUNTS_QUANTITY: 4,
+    MeterCode.BONUS_NONRESTRICTED_TRANSFERS_TO_GAMING_MACHINE_CENTS: 5,
+    MeterCode.BONUS_TRANSFERS_TO_GAMING_MACHINE_THAT_INCLUDED_NONRESTRICTED_AMOUNTS_QUANTITY: 4,
+    MeterCode.IN_HOUSE_CASHABLE_TRANSFERS_TO_HOST_CENTS: 5,
+    MeterCode.IN_HOUSE_TRANSFERS_TO_HOST_THAT_INCLUDED_CASHABLE_AMOUNTS_QUANTITY: 4,
+    MeterCode.IN_HOUSE_RESTRICTED_TRANSFERS_TO_HOST_CENTS: 5,
+    MeterCode.IN_HOUSE_TRANSFERS_TO_HOST_THAT_INCLUDED_RESTRICTED_AMOUNTS_QUANTITY: 4,
+    MeterCode.IN_HOUSE_NONRESTRICTED_TRANSFERS_TO_HOST_CENTS: 5,
+    MeterCode.IN_HOUSE_TRANSFERS_TO_HOST_THAT_INCLUDED_NONRESTRICTED_AMOUNTS_QUANTITY: 4,
 }
 
 

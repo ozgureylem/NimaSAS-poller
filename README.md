@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 168 tests, all against fake serial ports; run them with
+- **`tests/`** — 173 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -36,9 +36,12 @@ step-by-step guide to structuring a local SQL layer around a poller.
   `gateway.ini` the other tools can load. Optional — a config file can
   always be hand-written.
 - **`examples/sql_poll_logger.py`** — one poll loop, one SQLite database:
-  a wide, deliberately redundant meter sweep (~80 columns across every
-  meter long poll this client implements — core, ticket, and ~39
-  single-meter polls, `--skip-full-meter-sweep` to lighten it), full
+  a wide, deliberately redundant meter sweep (230+ columns across every
+  meter long poll this client implements — core, ticket, ~39
+  single-meter polls, and essentially the rest of Table C-7 via chunked
+  extended-meter reads; `--skip-full-meter-sweep`/`--skip-table-c7-sweep`
+  to lighten either), immediate re-poll on a failed general poll and a
+  validation-pool age alert (Decisions Annex D-09/D-16), full
   ticket-out history (buffer backfill at startup plus live capture),
   read-only ticket-in capture, and gateway-local cashout validation
   against a seeded local pool, all from a single general-poll stream
@@ -80,8 +83,9 @@ docstring explains the scope boundary below.
   isn't literally "11 through 15" despite an earlier misleading name),
   single-meter reads (0x10-0x18, 0x1A, 0x20, 0x2A-0x2C, bill/stacker
   meters 0x31-0x4A) via `send_meter()`, selected/extended meters (0x2F,
-  0x6F, 0xAF — the only way to reach ticket meters such as Cashable
-  Tickets In, since the core-meter polls cannot), per-game meters and
+  0x6F, 0xAF — 0x6F/0xAF reach essentially the whole of Table C-7, 162
+  codes, including ticket meters such as Cashable Tickets In that the
+  core-meter polls cannot reach at all), per-game meters and
   configuration (0x52, 0x53), hand-paid cancelled credits (0x2D), total
   bill meters (0x1E), current hopper status (0x4F).
 - **Machine identity/config**: gaming machine ID (0x1F), SAS version and
@@ -110,12 +114,18 @@ implementing it. Component authentication (0x6E, Section 17) and the
 multi-denom preamble (0xB0, a request-wrapping mechanism rather than a
 standalone poll) — real gaps, not scoped out, just not yet built.
 
-Meter codes for 0x2F/0x6F are transcribed directly from the spec's own
-Table C-7, not from any secondary source — an earlier project planning
-document had the ticket-meter codes wrong (off by more than a naming
-slip: 0x1A/0x1B are unrelated meters in the real table), which is worth
-knowing if you're cross-checking against project docs rather than the
-spec itself.
+`MeterCode` (in `constants.py`) covers essentially the whole of Table
+C-7 — 162 codes: the ticket meters, the core/extended/bill-denomination
+range, SAS-validation-specific meters, and AFT-specific meters — every
+assigned code except the table's own reserved gaps. All transcribed
+directly from the spec's own table, not from any secondary source — an
+earlier project planning document had the ticket-meter codes wrong (off
+by more than a naming slip: 0x1A/0x1B are unrelated meters in the real
+table), which is worth knowing if you're cross-checking against project
+docs rather than the spec itself. `examples/sql_poll_logger.py` reads
+essentially all of it every cycle by default (`--skip-table-c7-sweep`
+to opt out) via `send_extended_meters()` (LP 0x6F), 12 codes per
+exchange.
 
 ## Multi-version SAS (6.0 / 6.01 / 6.02)
 

@@ -8,7 +8,10 @@ import pytest
 
 from examples.sql_poll_logger import (
     ALL_METER_FIELDS,
+    GROUPED_METER_POLL_COUNT,
     SCHEMA,
+    SINGLE_METER_COLUMNS,
+    TABLE_C7_CHUNK_COUNT,
     TICKET_METER_CODES,
     TICKET_METER_COLUMNS,
     HistoryConfig,
@@ -21,7 +24,7 @@ from examples.sql_poll_logger import (
     poll_and_log,
     seed_validation_pool,
 )
-from saspy.constants import ExceptionCode, LongPoll
+from saspy.constants import ExceptionCode, LongPoll, MeterCode
 from saspy.exceptions import SASTimeoutError
 from saspy.models import (
     BasicMeters,
@@ -145,6 +148,7 @@ class ScriptedClient:
         hand_paid_cancelled_credits=None,
         hopper_status=None,
         single_meter_values=None,
+        table_c7_values=None,
     ):
         self._meters_script = list(meters_script)
         self._exception_script = list(exception_script) if exception_script is not None else None
@@ -165,6 +169,7 @@ class ScriptedClient:
         self._hand_paid_cancelled_credits = hand_paid_cancelled_credits
         self._hopper_status = hopper_status
         self._single_meter_values = dict(single_meter_values) if single_meter_values else {}
+        self._table_c7_values = dict(table_c7_values) if table_c7_values else {}
         self.validation_number_calls = []
 
     def general_poll(self):
@@ -238,6 +243,15 @@ class ScriptedClient:
         if isinstance(value, Exception):
             raise value
         return value
+
+    def send_extended_meters(self, meter_codes, *, game_number=0):
+        meters = {}
+        for code in meter_codes:
+            value = self._table_c7_values.get(code, 0)
+            if isinstance(value, Exception):
+                raise value
+            meters[code] = value
+        return SelectedMeters(game_number=game_number, meters=meters)
 
     def send_ticket_validation_data(self):
         item = self._ticket_script.pop(0)
@@ -523,6 +537,59 @@ def test_single_meter_sweep_failure_aborts_the_whole_cycle():
     assert conn.execute("SELECT COUNT(*) FROM meters_current").fetchone()[0] == 0
 
 
+# --- Table C-7 extended sweep (LP 0x6F, ~154 meters in 13 chunks) ----------
+
+
+def test_table_c7_sweep_writes_values_from_multiple_chunks():
+    """MeterCode.TOTAL_COIN_IN_CREDITS (0x00) is in the first chunk;
+    MeterCode.IN_HOUSE_TRANSFERS_TO_HOST_THAT_INCLUDED_NONRESTRICTED_AMOUNTS_QUANTITY
+    (0xBD, the very last Table C-7 entry) is in the last -- covering both
+    exercises more than just the first send_extended_meters() call.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        table_c7_values={MeterCode.TOTAL_COIN_IN_CREDITS: 12345, MeterCode.IN_HOUSE_TRANSFERS_TO_HOST_THAT_INCLUDED_NONRESTRICTED_AMOUNTS_QUANTITY: 7},
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    row = conn.execute(
+        "SELECT c7_total_coin_in_credits, c7_in_house_transfers_to_host_that_included_nonrestricted_amounts_quantity "
+        "FROM meters_current"
+    ).fetchone()
+    assert row == (12345, 7)
+
+
+def test_table_c7_sweep_failure_aborts_the_whole_cycle():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        table_c7_values={MeterCode.GAMES_WON: SASTimeoutError("no response")},
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    rows = conn.execute("SELECT poll_name, error_type FROM poll_errors").fetchall()
+    assert rows == [("send_extended_meters(chunk 1/13)", "SASTimeoutError")]
+    assert conn.execute("SELECT COUNT(*) FROM meters_current").fetchone()[0] == 0
+
+
+def test_skip_table_c7_sweep_leaves_its_columns_null_but_other_groups_populate():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters(total_coin_in=7)])
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, table_c7_sweep=False)
+    row = conn.execute(
+        "SELECT total_coin_in, c7_total_coin_in_credits, sm_true_coin_in FROM meters_current"
+    ).fetchone()
+    assert row == (7, None, 0)
+
+
 def test_gauge_fields_decreasing_does_not_arm_the_burst_window():
     """Current credits, current hopper level/status, and selected game
     number go up and down in normal operation -- a decrease there is not
@@ -559,7 +626,8 @@ def test_meter_poll_timing_is_reported(capsys):
     client = ScriptedClient([make_meters()])
     times = iter([0.0, 2.5])
     poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times))
-    assert "meter_poll=2.500s/47polls" in capsys.readouterr().out
+    full_count = GROUPED_METER_POLL_COUNT + len(SINGLE_METER_COLUMNS) + TABLE_C7_CHUNK_COUNT
+    assert f"meter_poll=2.500s/{full_count}polls" in capsys.readouterr().out
 
 
 def test_meter_poll_count_reflects_skip_full_meter_sweep(capsys):
@@ -569,7 +637,19 @@ def test_meter_poll_count_reflects_skip_full_meter_sweep(capsys):
     client = ScriptedClient([make_meters()])
     times = iter([0.0, 0.05])
     poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), full_meter_sweep=False)
-    assert "meter_poll=0.050s/8polls" in capsys.readouterr().out
+    expected_count = GROUPED_METER_POLL_COUNT + TABLE_C7_CHUNK_COUNT  # single-meter sweep skipped, C-7 sweep still on
+    assert f"meter_poll=0.050s/{expected_count}polls" in capsys.readouterr().out
+
+
+def test_meter_poll_count_reflects_skip_table_c7_sweep(capsys):
+    conn = make_db()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()])
+    times = iter([0.0, 0.05])
+    poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), table_c7_sweep=False)
+    expected_count = GROUPED_METER_POLL_COUNT + len(SINGLE_METER_COLUMNS)  # C-7 sweep skipped, single-meter sweep still on
+    assert f"meter_poll=0.050s/{expected_count}polls" in capsys.readouterr().out
 
 
 def test_meter_poll_at_or_above_interval_warns(capsys):
@@ -580,7 +660,8 @@ def test_meter_poll_at_or_above_interval_warns(capsys):
     times = iter([0.0, 2.5])
     poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), interval=2.0)
     out = capsys.readouterr().out
-    assert "WARNING: meter poll took 2.500s across 47 long-poll exchanges" in out
+    full_count = GROUPED_METER_POLL_COUNT + len(SINGLE_METER_COLUMNS) + TABLE_C7_CHUNK_COUNT
+    assert f"WARNING: meter poll took 2.500s across {full_count} long-poll exchanges" in out
     assert "--interval 2.0s" in out
 
 

@@ -417,6 +417,27 @@ def test_send_extended_meters_skips_unsupported_meter():
     assert result.meters == {}
 
 
+def test_send_extended_meters_reads_table_c7_codes_beyond_the_ticket_range():
+    """MeterCode now covers essentially all of Table C-7 (0x00-0x0C,
+    0x15-0x93, 0xA0-0xBD), not just the 8 ticket meters -- spot-check one
+    code from each of the three ranges added: a core meter (0x00, size 4),
+    an AFT-specific meter (0xA0, size 5), and a gauge (0x0C current
+    credits, size 4), all reachable via LP 6F exactly like the ticket
+    meters already were.
+    """
+    data = encode_bcd(0, 2)
+    data += encode_binary_le(MeterCode.TOTAL_COIN_IN_CREDITS, 2) + bytes([4]) + encode_bcd(112233, 4)
+    data += encode_binary_le(MeterCode.CURRENT_CREDITS, 2) + bytes([4]) + encode_bcd(4500, 4)
+    data += encode_binary_le(MeterCode.IN_HOUSE_CASHABLE_TRANSFERS_TO_GAMING_MACHINE_CENTS, 2) + bytes([5]) + encode_bcd(9900, 5)
+    body = bytes([ADDRESS, 0x6F, len(data)]) + data
+    result = make_client(body).send_extended_meters(
+        [MeterCode.TOTAL_COIN_IN_CREDITS, MeterCode.CURRENT_CREDITS, MeterCode.IN_HOUSE_CASHABLE_TRANSFERS_TO_GAMING_MACHINE_CENTS]
+    )
+    assert result.meters[MeterCode.TOTAL_COIN_IN_CREDITS] == 112233
+    assert result.meters[MeterCode.CURRENT_CREDITS] == 4500
+    assert result.meters[MeterCode.IN_HOUSE_CASHABLE_TRANSFERS_TO_GAMING_MACHINE_CENTS] == 9900
+
+
 # -- Secure enhanced validation ID (0x4C) -----------------------------------
 
 
