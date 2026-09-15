@@ -25,10 +25,19 @@ step-by-step guide to structuring a local SQL layer around a poller.
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
   address and it general-polls, then tries a few read-only long polls.
-  Changes nothing on the machine. Start here for wiring/connectivity
-  checks:
+  Changes nothing on the machine by default. Start here for
+  wiring/connectivity checks:
   ```
   python3 examples/connectivity_check.py /dev/ttyUSB0 --address 1
+  ```
+  `--test-shutdown` opts into round-tripping LP 0x01/0x02 (Shutdown
+  then Startup) against the address — a real state change, unlike
+  everything else this script does — with a confirmation prompt
+  (`--yes` to skip it) and a Startup attempt no matter how the
+  Shutdown call itself went, so a flaky exchange can't leave the
+  machine disabled:
+  ```
+  python3 examples/connectivity_check.py /dev/ttyUSB0 --address 1 --test-shutdown
   ```
 - **`examples/commission_gateway.py`** — run this once when a gateway is
   attached to a new EGM: scans ports/addresses, confirms a find by
