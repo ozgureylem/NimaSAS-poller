@@ -13,31 +13,44 @@ The point is the second half. When an unknown code turns out to work, the
 exchange can be exported as a ready-made test vector and folded into
 saspy properly, with a real test behind it.
 
-    python3 examples/poll_test_tool.py /dev/ttyUSB0 --address 1
-    python3 examples/poll_test_tool.py /dev/ttyUSB0 --address 1 --port-http 8080
+Runs on Linux, Windows and macOS -- pyserial handles the port, and the
+UI is just a browser. Two deployment shapes, both supported:
 
-Then open http://localhost:8080 (or http://<this-machine>:8080 from a
-laptop on the bench).
+  On a laptop, adapter plugged into the laptop:
+    python3 examples/poll_test_tool.py COM3 --address 1              (Windows)
+    python3 examples/poll_test_tool.py /dev/cu.usbserial-10 --address 1   (macOS)
+    python3 examples/poll_test_tool.py /dev/ttyUSB0 --address 1      (Linux)
 
-SAFETY -- read this before pointing it at anything with money in it.
-=================================================================
+  On the gateway / micro PC, driven from a laptop's browser:
+    python3 examples/poll_test_tool.py /dev/ttyUSB0 --bind 0.0.0.0
+    then open http://<gateway-ip>:8080 from the laptop
+
+Not sure which port? ``--list-ports`` enumerates them on any OS, and the
+UI shows the same list. On macOS prefer the ``/dev/cu.*`` name over
+``/dev/tty.*``; the tty variant blocks waiting for carrier detect.
+
+SAFETY
+======
 This sends whatever you tell it to send. SAS long polls are not all
 reads: some move funds (AFT 0x72), pay out a ticket (0x71), lock or
 disable the machine (0x01/0x74), or rewrite ticket/validation
 configuration (0x4C/0x7B/0x7C/0x7D). A code copied from the internet
 may be any of those, or may not be what the post claimed at all.
 
-So every command is classified, and the classification is enforced in
-the backend, not merely displayed:
+Every command is classified, and by default the classification is
+enforced in the backend rather than merely displayed:
 
   read          Known-safe read. Sends on one click.
   state-change  Known to alter machine state. Requires typed confirmation.
-  custom        Anything hand-entered. ALWAYS requires typed confirmation,
+  custom        Anything hand-entered. Requires typed confirmation,
                 because we cannot know what it does.
 
-Use a machine with no money and no players on it. The confirmation step
-is not decoration -- it is the only thing standing between a pasted hex
-string and a real cashout.
+``--lab-mode`` drops the confirmation step for a bench where locking a
+machine is a non-event and a RAM-clear is on hand. It is a deliberate
+startup flag and never the default, so the tool stays safe if it is
+ever run somewhere it shouldn't be. Even in lab mode, prefer a machine
+with no credits on it: a RAM-clear undoes a lockup, but an AFT transfer
+that actually moved money is a different kind of problem.
 
 Only one process may hold the serial port (see MANUAL.md 4.5), so stop
 sql_poll_logger.py before starting this.
@@ -161,6 +174,28 @@ def classify(code: int) -> str:
     return "state-change" if code in STATE_CHANGING else "read"
 
 
+def list_serial_ports() -> list[dict]:
+    """Enumerate serial ports on whatever OS this is. Works the same on
+    Linux (/dev/ttyUSB0), Windows (COM3) and macOS (/dev/cu.usbserial-*).
+    """
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return []
+    out = []
+    for p in sorted(list_ports.comports(), key=lambda p: p.device):
+        hint = ""
+        if sys.platform == "darwin" and "/tty." in p.device:
+            hint = "on macOS prefer the matching /dev/cu.* name -- /dev/tty.* blocks on carrier detect"
+        out.append({
+            "device": p.device,
+            "description": (p.description or "").strip() or "n/a",
+            "hwid": (p.hwid or "").strip() or "n/a",
+            "hint": hint,
+        })
+    return out
+
+
 def tag_for(poll: LongPoll) -> str:
     if poll.value in FRIENDLY_TAGS:
         return FRIENDLY_TAGS[poll.value]
@@ -196,10 +231,12 @@ class Bench:
     interleave two commands on the wire.
     """
 
-    def __init__(self, port: str, address: int, baud: int, timeout: float, simulate: bool = False):
+    def __init__(self, port: str, address: int, baud: int, timeout: float,
+                 simulate: bool = False, lab_mode: bool = False):
         self.address = address
         self.timeout = timeout
         self.simulate = simulate
+        self.lab_mode = lab_mode
         self._lock = threading.Lock()
         self.log: list[dict] = []
         if simulate:
@@ -342,7 +379,10 @@ def make_handler(bench: Bench, catalog: list[dict], html: str):
                 self._send(200, html.encode(), "text/html; charset=utf-8")
             elif self.path == "/api/catalog":
                 self._json({"catalog": catalog, "address": bench.address,
-                            "simulate": bench.simulate})
+                            "simulate": bench.simulate, "lab_mode": bench.lab_mode,
+                            "ports": list_serial_ports(), "platform": sys.platform})
+            elif self.path == "/api/ports":
+                self._json({"ports": list_serial_ports(), "platform": sys.platform})
             elif self.path == "/api/log":
                 self._json({"log": bench.log[-100:]})
             else:
@@ -366,7 +406,7 @@ def make_handler(bench: Bench, catalog: list[dict], html: str):
 
             # Server-side enforcement. The UI also gates these, but a tool
             # that can pay out a ticket must not rely on its own frontend.
-            if safety in ("state-change", "custom") and not confirmed:
+            if safety in ("state-change", "custom") and not confirmed and not bench.lab_mode:
                 self._json({"ok": False, "error":
                             "refused: this command is not a known-safe read and "
                             "was not confirmed"}, 403)
@@ -403,6 +443,11 @@ HTML = """<!doctype html>
   h1{font-size:16px;margin:0;letter-spacing:-.01em}
   .meta{font-size:12px;color:var(--ink2)}
   .sim{background:var(--warn-bg);color:var(--warn);padding:2px 8px;border-radius:3px;font-size:12px;font-weight:600}
+  .lab{background:var(--risk);color:#fff;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:700;letter-spacing:.04em}
+  .labbar{background:var(--risk-bg);border-bottom:1px solid var(--risk);color:var(--risk);
+          padding:8px 20px;font-size:13px;font-weight:600}
+  .ports{padding:10px 14px;font-size:12px;color:var(--ink2);border-bottom:1px solid var(--rule)}
+  .ports b{color:var(--ink);font-family:ui-monospace,Menlo,monospace}
   main{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:16px;padding:16px;align-items:start}
   @media (max-width:860px){main{grid-template-columns:1fr}}
   section{background:var(--surface);border:1px solid var(--rule);border-radius:4px;overflow:hidden}
@@ -448,9 +493,11 @@ HTML = """<!doctype html>
   <span class="meta">one process owns the port &mdash; stop the poll logger first</span>
   <span id="simbadge"></span>
 </header>
+<div id="labbar"></div>
 <main>
   <section>
     <h2>Implemented long polls</h2>
+    <div class="ports" id="ports"></div>
     <div id="catalog"></div>
   </section>
   <section>
@@ -465,7 +512,7 @@ HTML = """<!doctype html>
         <span class="note">address <b id="addr2">-</b> is prepended automatically</span>
       </div>
       <div><label>Exactly these bytes go on the wire</label><div class="preview" id="preview">-</div></div>
-      <div class="danger-box">
+      <div class="danger-box" id="customwarn">
         <b>Unknown commands can move money, pay a ticket, or disable the machine.</b>
         Use a machine with no cash and no players. You will be asked to confirm.
       </div>
@@ -478,7 +525,7 @@ HTML = """<!doctype html>
   </section>
 </main>
 <script>
-let ADDR = 1;
+let ADDR = 1, LAB = false;
 const $ = s => document.querySelector(s);
 
 function preview() {
@@ -496,6 +543,20 @@ async function load() {
   ADDR = r.address;
   $('#addr').textContent = r.address; $('#addr2').textContent = r.address;
   if (r.simulate) $('#simbadge').innerHTML = '<span class="sim">SIMULATE &mdash; no real port open</span>';
+  LAB = !!r.lab_mode;
+  if (LAB) {
+    $('#simbadge').innerHTML += ' <span class="lab">LAB MODE</span>';
+    $('#labbar').className = 'labbar';
+    $('#labbar').textContent = 'LAB MODE — confirmations are off. Every command sends on one click, '
+      + 'including AFT transfers and machine lockouts.';
+    $('#customwarn').innerHTML = '<b>Unknown commands can move money, pay a ticket, or disable '
+      + 'the machine.</b> Lab mode is on, so this sends immediately with no confirmation.';
+  }
+  const ports = r.ports || [];
+  $('#ports').innerHTML = ports.length
+    ? 'Ports on this machine (' + r.platform + '): ' + ports.map(p=>'<b>'+p.device+'</b>'
+        + (p.description && p.description!=='n/a' ? ' <span>'+p.description+'</span>' : '')).join(' &nbsp;·&nbsp; ')
+    : 'No serial ports detected on this machine (' + r.platform + ').';
   const byGroup = {};
   r.catalog.forEach(c => (byGroup[c.group] = byGroup[c.group] || []).push(c));
   const el = $('#catalog'); el.innerHTML = '';
@@ -524,7 +585,7 @@ async function send(codeHex, label, safety, warning, takesData) {
     if (extra === null) return;
     cmd = codeHex + extra.replace(/[^0-9a-fA-F]/g,'');
   }
-  if (safety !== 'read') {
+  if (safety !== 'read' && !LAB) {
     const typed = prompt(`STATE-CHANGING COMMAND\n\n${codeHex}: ${warning || label}\n\n`
       + `This alters the machine. Type SEND to confirm:`);
     if (typed !== 'SEND') return;
@@ -535,10 +596,12 @@ async function send(codeHex, label, safety, warning, takesData) {
 $('#sendcustom').onclick = async () => {
   const cmd = $('#cmd').value.replace(/[^0-9a-fA-F]/g,'');
   if (!cmd) return alert('Enter some hex first.');
-  const typed = prompt(`CUSTOM COMMAND\n\nAbout to send: ${$('#preview').textContent}\n\n`
-    + `We cannot know what this does. It may move money, pay a ticket, or disable the machine.\n\n`
-    + `Type SEND to confirm:`);
-  if (typed !== 'SEND') return;
+  if (!LAB) {
+    const typed = prompt(`CUSTOM COMMAND\n\nAbout to send: ${$('#preview').textContent}\n\n`
+      + `We cannot know what this does. It may move money, pay a ticket, or disable the machine.\n\n`
+      + `Type SEND to confirm:`);
+    if (typed !== 'SEND') return;
+  }
   await post({command: cmd, label: 'custom ' + cmd.toUpperCase(), safety: 'custom',
               auto_crc: $('#autocrc').checked, confirmed: true});
 };
@@ -592,16 +655,44 @@ def main() -> int:
                    help="interface to serve on. Default localhost; use 0.0.0.0 to reach it "
                         "from a laptop on the bench (there is no authentication, so only do "
                         "that on a trusted lab network)")
+    p.add_argument("--list-ports", action="store_true",
+                   help="list the serial ports this machine can see, and exit. Works on "
+                        "Linux, Windows and macOS")
+    p.add_argument("--lab-mode", action="store_true",
+                   help="skip the typed confirmation for state-changing and custom commands. "
+                        "For a bench where a locked machine is a non-event and a RAM-clear is "
+                        "on hand. Never the default")
+    p.add_argument("--open-browser", action="store_true",
+                   help="open the UI in this machine's default browser once it is serving")
     p.add_argument("--simulate", action="store_true",
                    help="don't open a port; fabricate responses so the UI can be explored "
                         "with no hardware attached")
     args = p.parse_args()
 
+    if args.list_ports:
+        ports = list_serial_ports()
+        if not ports:
+            print("No serial ports detected.")
+            print("  Linux:   is the adapter plugged in? check `dmesg | tail` and group perms (dialout)")
+            print("  Windows: check Device Manager > Ports (COM & LPT)")
+            print("  macOS:   look for /dev/cu.usbserial-* ; install the adapter's driver if absent")
+            return 1
+        print(f"Serial ports visible to this machine ({sys.platform}):\n")
+        for prt in ports:
+            print(f"  {prt['device']}")
+            print(f"      {prt['description']}")
+            if prt["hwid"] != "n/a":
+                print(f"      {prt['hwid']}")
+            if prt["hint"]:
+                print(f"      note: {prt['hint']}")
+        return 0
+
     if not args.port and not args.simulate:
         p.error("give a serial port, or --simulate to explore the UI without hardware")
 
     try:
-        bench = Bench(args.port or "", args.address, args.baud, args.timeout, simulate=args.simulate)
+        bench = Bench(args.port or "", args.address, args.baud, args.timeout,
+                      simulate=args.simulate, lab_mode=args.lab_mode)
     except Exception as e:  # noqa: BLE001 - turn any port failure into something actionable
         print(f"Could not open {args.port}:\n  {type(e).__name__}: {e}\n", file=sys.stderr)
         msg = str(e).lower()
@@ -627,7 +718,17 @@ def main() -> int:
     print(f"  {len(catalog)} long polls in the catalog ({reads} read, {len(catalog)-reads} state-changing)")
     if not args.simulate:
         print("  This port is now held exclusively — stop sql_poll_logger.py if it is running.")
-    print(f"\n  open  http://{'localhost' if args.bind == '127.0.0.1' else args.bind}:{args.port_http}\n")
+    if args.lab_mode:
+        print("  LAB MODE: confirmations are OFF. Every command sends on one click,\n"
+              "            including AFT transfers and machine lockouts.")
+    if args.bind == "127.0.0.1":
+        print("  Serving on localhost only. Use --bind 0.0.0.0 to reach this from a laptop\n"
+              "  (no authentication -- trusted lab networks only).")
+    url = f"http://{'localhost' if args.bind == '127.0.0.1' else args.bind}:{args.port_http}"
+    print(f"\n  open  {url}\n")
+    if args.open_browser:
+        import webbrowser
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
 
     # Threaded: TCPServer is single-threaded, and with HTTP/1.1 keep-alive a
     # single open browser tab would hold the connection and block every other
