@@ -58,15 +58,22 @@ step-by-step guide to structuring a local SQL layer around a poller.
   python3 examples/poll_test_tool.py /dev/ttyUSB0 --bind 0.0.0.0   # on the gateway, browse from a laptop
   python3 examples/poll_test_tool.py --simulate                    # explore the UI, no hardware
   ```
-  **It sends whatever you tell it to.** SAS long polls are not all
-  reads — some move funds (`0x72`), pay out a ticket (`0x71`), or take
-  the machine out of service (`0x01`). Every command is classified
-  read / state-change / custom, and anything that isn't a known-safe
-  read needs a typed confirmation that the **backend** enforces, not
-  just the UI. `--lab-mode` drops that confirmation for a bench where a
-  locked machine is a non-event and a RAM-clear is on hand — a
-  deliberate startup flag, never the default. Either way, prefer a
-  machine with no credits on it.
+  ⚠ **Lab gateways only — read
+  [POLL_TEST_TOOL_WARNING.md](POLL_TEST_TOOL_WARNING.md) before running
+  it**, and [POLL_TEST_TOOL_MANUAL.md](POLL_TEST_TOOL_MANUAL.md) for how
+  to use it. It sends whatever you tell it to: SAS long polls are not
+  all reads — some move funds (`0x72`), pay out a ticket (`0x71`), or
+  take the machine out of service (`0x01`). Recovering a stuck machine
+  often ends in a **RAM clear, which permanently zeroes that machine's
+  meters**. This must never be installed on a gateway serving live
+  machines, and must be erased and verified gone before a lab gateway is
+  redeployed to a floor.
+
+  Every command is classified read / state-change / custom, and anything
+  that isn't a known-safe read needs a typed confirmation the
+  **backend** enforces, not just the UI. `--lab-mode` drops that
+  confirmation for a bench where a locked machine is a non-event — a
+  deliberate startup flag, never the default.
 - **`examples/commission_gateway.py`** — run this once when a gateway is
   attached to a new EGM: scans ports/addresses, confirms a find by
   querying the machine's SAS version and serial number, and writes a

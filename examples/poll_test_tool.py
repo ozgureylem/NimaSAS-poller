@@ -52,6 +52,14 @@ ever run somewhere it shouldn't be. Even in lab mode, prefer a machine
 with no credits on it: a RAM-clear undoes a lockup, but an AFT transfer
 that actually moved money is a different kind of problem.
 
+LAB GATEWAYS ONLY. This must not be installed on a gateway serving live
+machines, and must be erased and verified gone before a lab gateway is
+redeployed to a floor. Recovering a stuck machine often ends in a RAM
+clear, which PERMANENTLY ZEROES ITS METERS.
+
+    POLL_TEST_TOOL_WARNING.md   consequences, RAM clear, erasure checklist
+    POLL_TEST_TOOL_MANUAL.md    how to use it
+
 Only one process may hold the serial port (see MANUAL.md 4.5), so stop
 sql_poll_logger.py before starting this.
 """
@@ -491,6 +499,8 @@ HTML = """<!doctype html>
   <h1>SAS Poll Bench</h1>
   <span class="meta">address <b id="addr">-</b></span>
   <span class="meta">one process owns the port &mdash; stop the poll logger first</span>
+  <span class="meta"><b>lab gateways only</b> &mdash; a stuck machine may need a RAM clear, which
+    permanently zeroes its meters (POLL_TEST_TOOL_WARNING.md)</span>
   <span id="simbadge"></span>
 </header>
 <div id="labbar"></div>
@@ -718,6 +728,10 @@ def main() -> int:
     print(f"  {len(catalog)} long polls in the catalog ({reads} read, {len(catalog)-reads} state-changing)")
     if not args.simulate:
         print("  This port is now held exclusively — stop sql_poll_logger.py if it is running.")
+    if not args.simulate:
+        print("  LAB GATEWAYS ONLY — never install this on a gateway serving live machines.")
+        print("  Recovering a stuck machine may require a RAM clear, which PERMANENTLY")
+        print("  ZEROES ITS METERS. See POLL_TEST_TOOL_WARNING.md before you start.")
     if args.lab_mode:
         print("  LAB MODE: confirmations are OFF. Every command sends on one click,\n"
               "            including AFT transfers and machine lockouts.")
