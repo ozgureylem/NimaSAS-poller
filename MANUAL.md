@@ -669,12 +669,24 @@ columns refreshed every cycle or can live with them stale/`NULL`.
 - **Starts, then immediately exits with a `SASError`**: this is
   `connect_from_config()` failing to open the port — check the config
   file's `port` value and that nothing else has the port open.
+- **"Could not exclusively lock port"**: something else already has that
+  port open — almost always another copy of one of these tools. **Only
+  one process may use a port at a time.** SASTransport's single-flight
+  lock is a threading lock, so it only serializes callers inside one
+  process; two processes on one port interleave their bytes mid-frame,
+  and the symptom is *not* an obvious "port busy" but garbled responses,
+  checksum failures and protocol bugs that don't exist. The port is
+  therefore opened with `exclusive=True` so the second process fails
+  immediately and unmistakably instead. If you want to run
+  `connectivity_check.py` against a machine this poller is watching,
+  stop the poller first.
 - **Runs but every cycle logs to `poll_errors`**: the config's address
   or port is wrong, or the machine stopped responding after
   commissioning (loose cable, power-cycled EGM). Run
   `connectivity_check.py` against the same port/address to isolate
   whether this is a `sql_poll_logger.py` problem or a wiring problem —
-  it usually isn't the former.
+  it usually isn't the former (stop this poller first; see the
+  exclusive-lock note above).
 - **`meters_history` looks sparse compared to how often it's polling**:
   expected, in `ring` mode — history is written on its own
   `--history-interval` cadence, not every poll. `meters_current` is
@@ -758,6 +770,24 @@ columns refreshed every cycle or can live with them stale/`NULL`.
   machine not configured for the validation mode this tool expects
   (or one being polled by a different, competing host) may not report
   the exception this tool is watching for.
+- **Every ticket in `ticket_in_history` says `awaiting completion`, and
+  `ticket_in_completions` stays empty**: expected, and probably not a
+  bug — read this before reporting one. This tool never authorizes a
+  redemption, so it never sends the redeeming long poll `0x71`. Per
+  §15.12, a gaming machine that doesn't receive a `0x71` within 30
+  seconds of the ticket going in simply returns it to the player. The
+  spec describes exception `0x68` as what the machine issues once a
+  transfer *the host accepted* has been stacked or rejected — so on a
+  read-only host like this one, there may be no `0x68` to capture at
+  all, leaving the insert half recorded and the completion half
+  genuinely absent. `awaiting completion` is the view reporting that
+  accurately rather than inventing an ending. Whether a real EGM fires
+  `0x68` on the 30-second timeout-return path is an open question the
+  spec doesn't settle plainly — if you *do* see completions appear on
+  that path, that's a genuine finding worth reporting upstream, not a
+  malfunction. Seeing `redeemed`/`rejected` outcomes requires a host
+  that actually authorizes redemption, which this tool deliberately
+  is not (§4.4).
 - **A cashout never gets a validation number and the machine falls back
   to another payout method**: check `validation_pool` for any
   `available` rows first — `--seed-validation-pool` has to actually be
