@@ -182,6 +182,86 @@ def classify(code: int) -> str:
     return "state-change" if code in STATE_CHANGING else "read"
 
 
+class _RecordingTransport:
+    """Wraps SASTransport and remembers the last frame written and the last
+    response read, so a command can be sent through SASClient's own method
+    -- getting saspy's real parser, with named fields -- while the bench
+    still shows the raw bytes both ways.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.last_tx = b""
+        self.last_rx = b""
+
+    def write_with_wakeup(self, frame):
+        self.last_tx = bytes(frame)
+        return self._inner.write_with_wakeup(frame)
+
+    def exchange_fixed(self, frame, response_length, *, timeout):
+        self.last_tx = bytes(frame)
+        rx = self._inner.exchange_fixed(frame, response_length, timeout=timeout)
+        self.last_rx = bytes(rx)
+        return rx
+
+    def exchange_length_prefixed(self, frame, **kwargs):
+        self.last_tx = bytes(frame)
+        rx = self._inner.exchange_length_prefixed(frame, **kwargs)
+        self.last_rx = bytes(rx)
+        return rx
+
+    def general_poll(self, address, *, timeout):
+        rx = self._inner.general_poll(address, timeout=timeout)
+        self.last_tx, self.last_rx = bytes([address | 0x80]), bytes(rx)
+        return rx
+
+
+def build_parser_map() -> dict[int, str]:
+    """long poll code -> SASClient method that needs no required arguments.
+
+    Derived by inspection rather than hand-listed, so it cannot drift from
+    the client. These are the commands the bench can send through saspy's
+    own parser and show with field names instead of raw BCD.
+    """
+    import inspect
+    import re
+
+    out: dict[int, str] = {}
+    for name, fn in inspect.getmembers(SASClient, inspect.isfunction):
+        if name.startswith("_") or name == "general_poll":
+            continue
+        sig = inspect.signature(fn)
+        required = [
+            p for p in sig.parameters.values()
+            if p.name != "self" and p.default is inspect.Parameter.empty
+            and p.kind not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+        ]
+        if required:
+            continue
+        m = re.search(r"LongPoll\.([A-Z_0-9]+)", inspect.getsource(fn))
+        if m:
+            out.setdefault(LongPoll[m.group(1)].value, name)
+    return out
+
+
+PARSER_FOR = build_parser_map()
+
+
+def jsonable(value):
+    """Models carry bytes fields (validation data); render them as hex."""
+    import dataclasses
+
+    if dataclasses.is_dataclass(value):
+        return {k: jsonable(v) for k, v in dataclasses.asdict(value).items()}
+    if isinstance(value, (bytes, bytearray)):
+        return value.hex(" ").upper() or "(empty)"
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    return value
+
+
 def list_serial_ports() -> list[dict]:
     """Enumerate serial ports on whatever OS this is. Works the same on
     Linux (/dev/ttyUSB0), Windows (COM3) and macOS (/dev/cu.usbserial-*).
@@ -253,7 +333,7 @@ class Bench:
             self.client = None
         else:
             self.serial = open_serial_port(port, baudrate=baud)
-            self.transport = SASTransport(self.serial, byte_timeout=timeout)
+            self.transport = _RecordingTransport(SASTransport(self.serial, byte_timeout=timeout))
             self.client = SASClient(self.transport, address, timeout=timeout)
 
     def _record(self, entry: dict) -> dict:
@@ -271,7 +351,7 @@ class Bench:
             time.sleep(0.05)
             body = bytes([self.address, frame[1] if len(frame) > 1 else 0x00, 0x02, 0x12, 0x34])
             return body + crc16_bytes(body)
-        self.transport.write_with_wakeup(frame)
+        self.transport.write_with_wakeup(frame)  # recorded
         deadline = time.monotonic() + self.timeout
         buf = bytearray()
         last = None
@@ -301,10 +381,24 @@ class Bench:
         if auto_crc:
             frame += crc16_bytes(frame)
 
+        # A bare catalog command we have a parser for goes through SASClient's
+        # own method, so the bench reports named fields (ticket_number=1234)
+        # instead of leaving the operator to decode BCD by eye -- and so what
+        # is exercised is saspy's real parser against this machine, not a
+        # second decoder written for the bench.
+        parser = PARSER_FOR.get(payload[0]) if len(payload) == 1 else None
+        parsed = None
+
         with self._lock:
             started = time.monotonic()
             try:
-                reply = self.raw_exchange(frame)
+                if parser and not self.simulate:
+                    result = getattr(self.client, parser)()
+                    reply = self.transport.last_rx
+                    frame = self.transport.last_tx or frame
+                    parsed = {"method": f"{parser}()", "fields": jsonable(result)}
+                else:
+                    reply = self.raw_exchange(frame)
                 err = None
             except SASError as e:
                 reply, err = b"", f"{type(e).__name__}: {e}"
@@ -321,6 +415,7 @@ class Bench:
             "elapsed_ms": round(elapsed * 1000, 1),
             "error": err or ("no response (timeout)" if not reply else None),
             "decode": decode_response(reply, self.address) if reply else None,
+            "parsed": parsed,
         })
 
 
@@ -636,6 +731,13 @@ async function refresh() {
       if (d.payload) rows += `<tr><td>payload</td><td>${d.payload}</td></tr>`;
       if ('crc_ok' in d) rows += `<tr><td>CRC</td><td class="${d.crc_ok?'ok':'bad'}">${d.crc_on_wire} ${d.crc_ok?'valid':'INVALID (computed '+d.crc_computed+')'}</td></tr>`;
       if (d.hint) rows += `<tr><td>note</td><td>${d.hint}</td></tr>`;
+    }
+    if (e.parsed) {
+      const f = e.parsed.fields;
+      const pretty = (f && typeof f === 'object')
+        ? Object.entries(f).map(([k,v])=>`<tr><td>&nbsp;&nbsp;${k}</td><td><b>${v}</b></td></tr>`).join('')
+        : `<tr><td>&nbsp;&nbsp;value</td><td><b>${f}</b></td></tr>`;
+      rows += `<tr><td>parsed</td><td class="kv">via saspy ${e.parsed.method}</td></tr>` + pretty;
     }
     return `<div class="entry">
       <div class="hd"><b>${e.label}</b><span class="kv">${e.at} &middot; ${e.elapsed_ms} ms</span></div>

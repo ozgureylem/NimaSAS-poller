@@ -117,13 +117,21 @@ before you send anything. Read that box. It is the last checkpoint.
 Untick **append CRC** only if your pasted string already includes one.
 
 **Bottom — exchange log.** Every send, newest first: TX bytes, RX bytes,
-decoded address/command/payload, and whether the **CRC validates**.
+decoded address/command/payload, whether the **CRC validates**, and — for
+commands `saspy` implements — the response decoded into named fields. See
+§5.
 
 ## 5. Reading a response
 
-The decoder is deliberately conservative. It reports what is
-*structurally* true and refuses to invent field layouts for commands it
-does not know:
+**You always see every byte the machine sent.** The exchange log prints
+the full RX frame, raw, before it interprets anything. Nothing is hidden
+or summarised away.
+
+On top of that, the tool says as much about the bytes as it can honestly
+establish, in two layers.
+
+**Layer 1 — structure.** This applies to every response, known command or
+not:
 
 - **`CRC valid`** — the machine sent a well-formed, framed response. This
   is the signal that a command is real and worth keeping.
@@ -132,12 +140,51 @@ does not know:
   different shape than address + data + CRC. Not automatically a failure:
   some responses genuinely are not framed that way (an ACK to `0x01` is a
   bare address byte with no CRC at all).
-- **single byte** — the tool tells you whether it is your address (ACK),
-  your address OR `0x80` (NACK), or something else.
+- **single byte** — when the whole response *is* one byte, that byte is
+  the answer, and the tool tells you which one it is: your address (ACK),
+  your address OR `0x80` (NACK), or something else. This is the shape
+  Table 7.4b defines for Shutdown/Startup — it is not a summary of a
+  longer reply.
 - **no response (timeout)** — per §4.4 of the spec, a machine that does
   not support a long poll must **ignore it silently**, not NACK it. So
   silence usually means "this machine doesn't implement that", not "the
   wiring is broken" — as long as other polls are answering.
+
+**Layer 2 — named fields.** For the commands `saspy` already implements
+and that take no data bytes, the bench sends the poll through the
+client's own method and prints the decoded fields under the raw bytes.
+Asking a machine for the last ticket it printed (`0x3D`) looks like this:
+
+```
+TX      01 3D
+RX      01 3D 00 00 12 34 00 00 00 25 00 61 D6
+command 0x3D | CRC 61 D6 valid
+payload 00 00 12 34 00 00 00 25 00
+parsed  via saspy send_cash_out_ticket_information()
+          ticket_number   1234
+          amount_cents    2500
+```
+
+The raw frame is still right there; the parse is additional. That matters
+because the payload above is BCD — without the field names you would be
+decoding `00 00 12 34` by eye to get ticket 1234.
+
+Note what this is doing: the parse comes from `saspy`'s real parser, not
+a second decoder written for this tool. So a field that comes out wrong
+here is a genuine finding about the client against that machine, not a
+bench artefact — which is the whole reason it is wired this way.
+
+**Where layer 2 does not apply**, you get layer 1 only — raw bytes, CRC
+verdict, payload:
+
+- custom commands (the tool has no idea what they mean — that is the
+  point of trying them);
+- polls that need data bytes (game number, meter code, validation type);
+- anything `saspy` does not implement.
+
+That is deliberate. The decoder refuses to invent a field layout for a
+command it does not know, because a confidently-wrong decode of an
+unknown code is worse than no decode at all.
 
 ## 6. Lab mode
 
