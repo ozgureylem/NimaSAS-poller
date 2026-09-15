@@ -39,6 +39,26 @@ step-by-step guide to structuring a local SQL layer around a poller.
   ```
   python3 examples/connectivity_check.py /dev/ttyUSB0 --address 1 --test-shutdown
   ```
+- **`examples/poll_test_tool.py`** — a bench tool for trying long polls
+  against a real EGM and watching what comes back. Serves a small local
+  web UI: one panel lists every long poll this client implements, tagged
+  in plain language ("Total value of bills in"), built from
+  `saspy.constants` so it can't drift from the code; the other is a
+  free-form hex box for codes found in a forum post or vendor doc — it
+  shows the exact bytes (CRC computed for you), sends, and decodes the
+  reply as far as it structurally can, flagging whether the CRC checks
+  out. When an unknown code turns out to work, that exchange is the
+  test vector for adding it to `saspy` properly.
+  ```
+  python3 examples/poll_test_tool.py /dev/ttyUSB0 --address 1   # then open localhost:8080
+  python3 examples/poll_test_tool.py --simulate                 # explore the UI, no hardware
+  ```
+  **It sends whatever you tell it to.** SAS long polls are not all
+  reads — some move funds (`0x72`), pay out a ticket (`0x71`), or take
+  the machine out of service (`0x01`). Every command is classified
+  read / state-change / custom, and anything that isn't a known-safe
+  read needs a typed confirmation that the **backend** enforces, not
+  just the UI. Use a machine with no money and no players on it.
 - **`examples/commission_gateway.py`** — run this once when a gateway is
   attached to a new EGM: scans ports/addresses, confirms a find by
   querying the machine's SAS version and serial number, and writes a
