@@ -25,8 +25,8 @@ monitoring hardware ("the gateway") talk to each other over a serial
 cable using a protocol called SAS — Slot Accounting System. The gateway
 asks questions ("what are your meters right now?", "any new events?")
 and the EGM answers. `saspy` is a Python library that speaks the
-gateway's half of that conversation. The three example scripts are
-small, complete programs built on top of it:
+gateway's half of that conversation. The example scripts are small,
+complete programs built on top of it:
 
 - **`connectivity_check.py`** — "is this cable/port/address actually
   talking to a machine?" Run this first, on a new setup, before
@@ -38,12 +38,19 @@ small, complete programs built on top of it:
 - **`sql_poll_logger.py`** — polls a machine on a timer and saves what
   it reads into a local SQLite database file, so you have a running
   history instead of a single snapshot.
+- **`poll_test_tool.py`** — ⚠ **lab gateways only.** A bench tool for
+  sending long polls to a machine by hand — the ones this client
+  implements, and codes of unknown provenance found elsewhere — and
+  reading the raw response. See §8, and **do not run it before reading
+  [POLL_TEST_TOOL_WARNING.md](POLL_TEST_TOOL_WARNING.md) and
+  [POLL_TEST_TOOL_MANUAL.md](POLL_TEST_TOOL_MANUAL.md)**.
 
-You do not need to use all three. A lot of people will only ever run
+You do not need to use all of them. A lot of people will only ever run
 `connectivity_check.py` once to confirm wiring, then write their own
-program using the `saspy` library directly. The other two are there
+program using the `saspy` library directly. The others are there
 because they solve problems that come up often enough to be worth
-sharing.
+sharing — except the last, which is a lab instrument and is deliberately
+kept apart from the rest.
 
 ### 1.1 Before you start
 
@@ -1369,3 +1376,40 @@ see.
 - `saspy/crc.py` and `saspy/framing.py` — the module docstrings there
   document the CRC-16 wire-byte-order finding and general frame
   layout, for anyone extending the protocol coverage.
+
+---
+
+## 8. `poll_test_tool.py` — lab gateways only
+
+> ⚠ **Do not run this before reading
+> [POLL_TEST_TOOL_WARNING.md](POLL_TEST_TOOL_WARNING.md) and
+> [POLL_TEST_TOOL_MANUAL.md](POLL_TEST_TOOL_MANUAL.md).** Both live
+> beside this file in the repo root.
+
+A bench instrument, not a gateway program. It serves a small local web
+UI with two panels: one lists every long poll this client implements,
+tagged in plain language ("Total value of bills in"), so you can fire
+them at a machine by hand and see the raw reply; the other takes
+free-form hex, so a code found in a forum post or a vendor doc can be
+tried against real hardware. When an unknown code turns out to work, the
+captured exchange is what lets it be added to `saspy` properly, with a
+test behind it.
+
+It is documented in its own two files rather than here because the
+warnings are the larger part of it, and they should not be something you
+scroll past on the way to something else. In short:
+
+- **It sends whatever you tell it to.** Some SAS long polls move funds,
+  pay out a ticket, or take a machine out of service. An unverified code
+  may be any of those.
+- **Recovering a stuck machine often ends in a RAM clear**, which
+  permanently zeroes that machine's meters. Use machines whose meter
+  history you are willing to lose, with no credits in them.
+- **It must never be installed on a gateway serving live machines.** It
+  belongs only on a gateway dedicated to laboratory use, and must be
+  erased — and verified erased, `__pycache__` included — before a lab
+  gateway is redeployed to a floor.
+
+The two documents cover the consequences in full, the erase-before-
+redeploy checklist, and how to actually drive the tool on Linux, Windows
+or macOS.
