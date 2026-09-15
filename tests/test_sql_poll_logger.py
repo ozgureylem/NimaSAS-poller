@@ -16,6 +16,7 @@ from examples.sql_poll_logger import (
     TABLE_C7_CHUNK_COUNT,
     TICKET_METER_CODES,
     TICKET_METER_COLUMNS,
+    VALIDATION_METER_TYPES,
     HistoryConfig,
     PollState,
     _db_file_size_bytes,
@@ -27,7 +28,7 @@ from examples.sql_poll_logger import (
     poll_and_log,
     seed_validation_pool,
 )
-from saspy.constants import ExceptionCode, LongPoll, MeterCode
+from saspy.constants import ExceptionCode, LongPoll, MeterCode, ValidationType
 from saspy.exceptions import SASTimeoutError
 from saspy.models import (
     BasicMeters,
@@ -36,11 +37,13 @@ from saspy.models import (
     ExtendedMeters,
     GamesSincePowerUpAndDoorClosure,
     HopperStatus,
+    LastAcceptedBillInfo,
     Meters11Through15,
     PendingCashoutInfo,
     RedeemTicketResult,
     SelectedMeters,
     TicketValidationData,
+    ValidationMeters,
 )
 
 
@@ -134,6 +137,13 @@ def make_ticket_completion(**overrides) -> RedeemTicketResult:
     return RedeemTicketResult(**base)
 
 
+# Sentinel for table_c7_values: marks a meter code as genuinely unsupported
+# by the simulated machine (size=0, §7.21b) -- absent from the response
+# entirely, not present with value 0. Distinct from an Exception (a failed
+# exchange) and from a plain int (a supported meter's value).
+UNSUPPORTED_METER = object()
+
+
 class ScriptedClient:
     """Returns scripted sequences per method, one item per call. Methods
     with no script default to the harmless no-op response
@@ -160,6 +170,8 @@ class ScriptedClient:
         hopper_status=None,
         single_meter_values=None,
         table_c7_values=None,
+        last_accepted_bill_info=None,
+        validation_meters_values=None,
     ):
         self._meters_script = list(meters_script)
         self._exception_script = list(exception_script) if exception_script is not None else None
@@ -182,6 +194,8 @@ class ScriptedClient:
         self._hopper_status = hopper_status
         self._single_meter_values = dict(single_meter_values) if single_meter_values else {}
         self._table_c7_values = dict(table_c7_values) if table_c7_values else {}
+        self._last_accepted_bill_info = last_accepted_bill_info
+        self._validation_meters_values = dict(validation_meters_values) if validation_meters_values else {}
         self.validation_number_calls = []
 
     def general_poll(self):
@@ -250,6 +264,23 @@ class ScriptedClient:
     def send_current_hopper_status(self):
         return self._fixed_or_raise(self._hopper_status, HopperStatus(status=0, percent_full=0, level=0))
 
+    def send_last_accepted_bill_information(self):
+        return self._fixed_or_raise(
+            self._last_accepted_bill_info,
+            LastAcceptedBillInfo(country_code=0, denomination_code=0, bill_meter=0),
+        )
+
+    def send_validation_meters(self, validation_type):
+        """``validation_meters_values`` maps ValidationType -> an int (used
+        for both fields), a (total_validations, cumulative_amount_cents)
+        tuple, or an Exception to raise. Unscripted types default to 0/0.
+        """
+        value = self._validation_meters_values.get(validation_type, 0)
+        if isinstance(value, Exception):
+            raise value
+        total, amount = value if isinstance(value, tuple) else (value, value)
+        return ValidationMeters(validation_type=validation_type, total_validations=total, cumulative_amount_cents=amount)
+
     def send_meter(self, poll):
         value = self._single_meter_values.get(poll, 0)
         if isinstance(value, Exception):
@@ -262,6 +293,8 @@ class ScriptedClient:
             value = self._table_c7_values.get(code, 0)
             if isinstance(value, Exception):
                 raise value
+            if value is UNSUPPORTED_METER:
+                continue  # matches the real client: an unsupported code is silently absent, not zero
             meters[code] = value
         return SelectedMeters(game_number=game_number, meters=meters)
 
@@ -595,6 +628,37 @@ def test_table_c7_sweep_failure_aborts_the_whole_cycle():
     assert conn.execute("SELECT COUNT(*) FROM meters_current").fetchone()[0] == 0
 
 
+def test_table_c7_sweep_meter_unsupported_by_the_machine_is_null_not_a_crash():
+    """A meter the EGM doesn't implement is answered with size=0 (§7.21b)
+    -- send_extended_meters() silently omits it from result.meters, which
+    is a normal, known outcome, not a failure. Regression test: an
+    earlier version indexed result.meters[code] directly, which raised
+    an uncaught KeyError (crashing the whole tool, not just that column)
+    the moment any real EGM was missing even one of Table C-7's ~154
+    optional meters -- close to guaranteed on real hardware, since almost
+    no machine implements the entire table. The row must still be
+    written, with NULL for exactly the unsupported meter and real values
+    for every other one in the same chunk.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        table_c7_values={
+            MeterCode.TOTAL_COIN_IN_CREDITS: UNSUPPORTED_METER,
+            MeterCode.GAMES_WON: 42,
+        },
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    row = conn.execute(
+        "SELECT c7_total_coin_in_credits, c7_games_won FROM meters_current"
+    ).fetchone()
+    assert row == (None, 42)
+    assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
+
+
 def test_skip_table_c7_sweep_leaves_its_columns_null_but_other_groups_populate():
     conn = make_db()
     clock = FakeClock()
@@ -606,6 +670,121 @@ def test_skip_table_c7_sweep_leaves_its_columns_null_but_other_groups_populate()
         "SELECT total_coin_in, c7_total_coin_in_credits, sm_true_coin_in FROM meters_current"
     ).fetchone()
     assert row == (7, None, 0)
+
+
+# --- Last accepted bill information (LP 0x48) -------------------------------
+
+
+def test_last_accepted_bill_information_writes_values():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        last_accepted_bill_info=LastAcceptedBillInfo(country_code=1, denomination_code=4, bill_meter=37),
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    row = conn.execute(
+        "SELECT lp48_last_bill_country_code, lp48_last_bill_denomination_code, lp48_last_bill_meter "
+        "FROM meters_current"
+    ).fetchone()
+    assert row == (1, 4, 37)
+
+
+def test_last_accepted_bill_information_failure_aborts_the_whole_cycle():
+    """Unlike LP 0x6F's per-meter size=0 signal, a machine that doesn't
+    support LP 0x48 at all (§7.11) fails the whole exchange -- a genuine
+    SASError, not a soft skip. On by default, so this must still abort
+    the cycle the same as every other grouped poll; see
+    --skip-last-accepted-bill-poll for the actual opt-out.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()], last_accepted_bill_info=SASTimeoutError("no response"))
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    rows = conn.execute("SELECT poll_name, error_type FROM poll_errors").fetchall()
+    assert rows == [("send_last_accepted_bill_information", "SASTimeoutError")]
+    assert conn.execute("SELECT COUNT(*) FROM meters_current").fetchone()[0] == 0
+
+
+def test_skip_last_accepted_bill_poll_leaves_its_columns_null_but_other_groups_populate():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters(total_coin_in=7)],
+        last_accepted_bill_info=SASTimeoutError("would abort if this ran"),
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, last_accepted_bill_poll=False)
+    row = conn.execute(
+        "SELECT total_coin_in, lp48_last_bill_country_code, lp48_last_bill_denomination_code, lp48_last_bill_meter "
+        "FROM meters_current"
+    ).fetchone()
+    assert row == (7, None, None, None)
+    assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
+
+
+# --- Validation meters (LP 0x50) ---------------------------------------------
+
+
+def test_validation_meters_sweep_writes_values_for_each_type():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        validation_meters_values={
+            ValidationType.CASHABLE_TICKET_REDEEMED: (12, 4750),
+            ValidationType.JACKPOT_HANDPAY_RECEIPT_PRINTED: (3, 90000),
+        },
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    row = conn.execute(
+        "SELECT lp50_cashable_ticket_redeemed_total_validations, "
+        "lp50_cashable_ticket_redeemed_cumulative_amount_cents, "
+        "lp50_jackpot_handpay_receipt_printed_total_validations, "
+        "lp50_jackpot_handpay_receipt_printed_cumulative_amount_cents "
+        "FROM meters_current"
+    ).fetchone()
+    assert row == (12, 4750, 3, 90000)
+
+
+def test_validation_meters_sweep_failure_aborts_the_whole_cycle():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        validation_meters_values={ValidationType.CASHABLE_TICKET_REDEEMED: SASTimeoutError("no response")},
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    rows = conn.execute("SELECT poll_name, error_type FROM poll_errors").fetchall()
+    assert rows == [(f"send_validation_meters({ValidationType.CASHABLE_TICKET_REDEEMED.name})", "SASTimeoutError")]
+    assert conn.execute("SELECT COUNT(*) FROM meters_current").fetchone()[0] == 0
+
+
+def test_skip_validation_meters_sweep_leaves_its_columns_null_but_other_groups_populate():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters(total_coin_in=7)],
+        validation_meters_values={ValidationType.CASHABLE_TICKET_REDEEMED: SASTimeoutError("would abort if this ran")},
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock, validation_meters_sweep=False)
+    row = conn.execute(
+        "SELECT total_coin_in, lp50_cashable_ticket_redeemed_total_validations, "
+        "lp50_cashable_ticket_redeemed_cumulative_amount_cents FROM meters_current"
+    ).fetchone()
+    assert row == (7, None, None)
+    assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
 
 
 def test_gauge_fields_decreasing_does_not_arm_the_burst_window():
@@ -644,7 +823,13 @@ def test_meter_poll_timing_is_reported(capsys):
     client = ScriptedClient([make_meters()])
     times = iter([0.0, 2.5])
     poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times))
-    full_count = GROUPED_METER_POLL_COUNT + len(SINGLE_METER_COLUMNS) + TABLE_C7_CHUNK_COUNT
+    full_count = (
+        GROUPED_METER_POLL_COUNT
+        + 1  # send_last_accepted_bill_information (LP 0x48)
+        + len(SINGLE_METER_COLUMNS)
+        + TABLE_C7_CHUNK_COUNT
+        + len(VALIDATION_METER_TYPES)  # LP 0x50, one exchange per validation type
+    )
     assert f"meter_poll=2.500s/{full_count}polls" in capsys.readouterr().out
 
 
@@ -655,7 +840,8 @@ def test_meter_poll_count_reflects_skip_full_meter_sweep(capsys):
     client = ScriptedClient([make_meters()])
     times = iter([0.0, 0.05])
     poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), full_meter_sweep=False)
-    expected_count = GROUPED_METER_POLL_COUNT + TABLE_C7_CHUNK_COUNT  # single-meter sweep skipped, C-7 sweep still on
+    # single-meter sweep skipped; LP 0x48, C-7 sweep, and validation-meters sweep still on
+    expected_count = GROUPED_METER_POLL_COUNT + 1 + TABLE_C7_CHUNK_COUNT + len(VALIDATION_METER_TYPES)
     assert f"meter_poll=0.050s/{expected_count}polls" in capsys.readouterr().out
 
 
@@ -666,7 +852,8 @@ def test_meter_poll_count_reflects_skip_table_c7_sweep(capsys):
     client = ScriptedClient([make_meters()])
     times = iter([0.0, 0.05])
     poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), table_c7_sweep=False)
-    expected_count = GROUPED_METER_POLL_COUNT + len(SINGLE_METER_COLUMNS)  # C-7 sweep skipped, single-meter sweep still on
+    # C-7 sweep skipped; LP 0x48, single-meter sweep, and validation-meters sweep still on
+    expected_count = GROUPED_METER_POLL_COUNT + 1 + len(SINGLE_METER_COLUMNS) + len(VALIDATION_METER_TYPES)
     assert f"meter_poll=0.050s/{expected_count}polls" in capsys.readouterr().out
 
 
@@ -678,7 +865,9 @@ def test_meter_poll_at_or_above_interval_warns(capsys):
     times = iter([0.0, 2.5])
     poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), interval=2.0)
     out = capsys.readouterr().out
-    full_count = GROUPED_METER_POLL_COUNT + len(SINGLE_METER_COLUMNS) + TABLE_C7_CHUNK_COUNT
+    full_count = (
+        GROUPED_METER_POLL_COUNT + 1 + len(SINGLE_METER_COLUMNS) + TABLE_C7_CHUNK_COUNT + len(VALIDATION_METER_TYPES)
+    )
     assert f"WARNING: meter poll took 2.500s across {full_count} long-poll exchanges" in out
     assert "--interval 2.0s" in out
 

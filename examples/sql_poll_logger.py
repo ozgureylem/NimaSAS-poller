@@ -76,6 +76,20 @@ What each cycle does, in order:
    saving a row that's fresh in some columns and stale or missing in
    others.
 
+   "Poll failure" here means the exchange itself didn't succeed —
+   SASTimeoutError, a checksum failure, anything the machine never
+   coherently answered — not "the machine doesn't have this meter."
+   Those are different outcomes and are handled differently. The Table
+   C-7 sweep (LP 0x6F) is self-describing per meter (§7.21b): a code
+   the machine doesn't implement comes back with size=0, which
+   send_extended_meters() treats as a normal, present-but-absent
+   result, not an error. This tool follows that: an unsupported meter
+   writes NULL to just that one column and the cycle continues
+   normally — it does NOT abort the write. Almost no real EGM
+   implements literally all ~154 of these codes, so treating "doesn't
+   have this meter" as equivalent to "communication failed" would make
+   the sweep fail on essentially every real machine it's run against.
+
 Every cycle's log line reports how long the meter poll took and across
 how many long-poll exchanges (``meter_poll=X.XXXs/N polls``) — measured
 wall-clock time against whatever this ran against, not a theoretical
@@ -208,7 +222,7 @@ import time
 from dataclasses import dataclass
 
 from saspy.config import connect_from_config
-from saspy.constants import SIMPLE_METER_WIDTH_BCD, ExceptionCode, LongPoll, MeterCode
+from saspy.constants import SIMPLE_METER_WIDTH_BCD, ExceptionCode, LongPoll, MeterCode, ValidationType
 from saspy.exceptions import SASError
 from saspy.models import EnhancedValidationInfo
 
@@ -294,6 +308,24 @@ LP4F_METER_COLUMNS = (  # LP 0x4F (Table 7.19a/7.19b) — gauges, not cumulative
     "lp4f_hopper_level",
 )
 
+LP48_METER_COLUMNS = (  # LP 0x48 (Table 7.11) — snapshot of the single most-recently-accepted bill, not cumulative
+    "lp48_last_bill_country_code",
+    "lp48_last_bill_denomination_code",
+    "lp48_last_bill_meter",
+)
+
+# 12 validation types (Table 15.13c) x 2 fields each, one LP 0x50 exchange per
+# type (no batching, unlike LP 6F/2F) — see _poll_all_meters(). Column name
+# derived from the ValidationType member's own name so it can't drift from
+# constants.py. Explicitly redundant with MeterCode 0x80+ (Table C-7) per the
+# spec's own note — deliberate, see this module's docstring on redundancy.
+VALIDATION_METER_TYPES: tuple[ValidationType, ...] = tuple(ValidationType)
+VALIDATION_METER_COLUMNS: dict[ValidationType, tuple[str, str]] = {
+    vt: (f"lp50_{vt.name.lower()}_total_validations", f"lp50_{vt.name.lower()}_cumulative_amount_cents")
+    for vt in VALIDATION_METER_TYPES
+}
+VALIDATION_METER_COLUMNS_FLAT: tuple[str, ...] = tuple(c for pair in VALIDATION_METER_COLUMNS.values() for c in pair)
+
 # Every other single-meter long poll this client implements (SASClient.send_meter()),
 # named "sm_" + a descriptive name so none can collide with a column above even
 # where the underlying counter is the same one LP 0x0F/0x19/0x1C already report
@@ -376,6 +408,9 @@ GAUGE_METER_FIELDS = frozenset(
         "c7_number_of_bills_currently_in_stacker",  # fills/empties with normal operation, not cumulative
         "c7_total_value_of_bills_currently_in_stacker_credits",
         "c7_weighted_average_theoretical_payback_percentage",  # a percentage, not a counter
+        "lp48_last_bill_country_code",  # identifies whichever bill was *last* accepted, not a running total
+        "lp48_last_bill_denomination_code",
+        "lp48_last_bill_meter",  # cumulative for that one denomination, but which denomination is "last" changes cycle to cycle
     }
 )
 
@@ -388,8 +423,10 @@ ALL_METER_FIELDS = (
     + LP1E_METER_COLUMNS
     + LP2D_METER_COLUMNS
     + LP4F_METER_COLUMNS
+    + LP48_METER_COLUMNS
     + tuple(SINGLE_METER_COLUMNS.values())
     + TABLE_C7_EXTENDED_COLUMNS
+    + VALIDATION_METER_COLUMNS_FLAT
 )
 DECREASE_CHECK_FIELDS = tuple(f for f in ALL_METER_FIELDS if f not in GAUGE_METER_FIELDS)
 
@@ -930,7 +967,14 @@ class _MeterPollFailure(Exception):
         self.original = original
 
 
-def _poll_all_meters(client, *, full_sweep: bool = True, table_c7_sweep: bool = True) -> dict:
+def _poll_all_meters(
+    client,
+    *,
+    full_sweep: bool = True,
+    table_c7_sweep: bool = True,
+    validation_meters_sweep: bool = True,
+    last_accepted_bill_poll: bool = True,
+) -> dict:
     """Poll every meter this tool knows how to read, in one pass, and
     return {column: value} covering every name in ALL_METER_FIELDS.
     Raises _MeterPollFailure on the first failure, naming exactly which
@@ -943,7 +987,22 @@ def _poll_all_meters(client, *, full_sweep: bool = True, table_c7_sweep: bool = 
     two sweeps are independent: LP 0x6F (this one) is far more
     wire-efficient per meter than the single-meter LP sweep (12 meters
     per exchange instead of 1), so it's worth keeping on even where the
-    single-meter sweep isn't.
+    single-meter sweep isn't. When ``validation_meters_sweep`` is False,
+    the 24 VALIDATION_METER_COLUMNS are likewise skipped and left None;
+    see --skip-validation-meters-sweep. LP 0x50 has no batching (unlike
+    LP 6F), so this sweep costs one exchange per validation type — 12
+    exchanges for meters this project already reads via Table C-7 (codes
+    0x80+, per the spec's own note); it's on by default anyway because
+    the redundancy is deliberate (see this module's docstring), but it's
+    the priciest of the three sweeps per meter actually obtained, so the
+    opt-out exists for constrained links. When ``last_accepted_bill_poll``
+    is False, LP48_METER_COLUMNS are likewise skipped and left None; see
+    --skip-last-accepted-bill-poll. This one's opt-out exists for a
+    different reason than the sweeps: §7.11 explicitly warns some older
+    machines don't support LP 0x48 at all, and unlike LP 0x6F's per-meter
+    size=0 signal, that failure mode is a genuine SASError on the whole
+    exchange — so on such a machine this poll, left on, would abort every
+    single cycle's row write, not just leave one field NULL.
     """
     values: dict = {}
 
@@ -992,6 +1051,20 @@ def _poll_all_meters(client, *, full_sweep: bool = True, table_c7_sweep: bool = 
     hopper = poll("send_current_hopper_status", client.send_current_hopper_status)
     values.update(zip(LP4F_METER_COLUMNS, (hopper.status, hopper.percent_full, hopper.level)))
 
+    if last_accepted_bill_poll:
+        # Its own flag, not folded into the always-on group above: unlike
+        # LP 0x6F's per-meter size=0 signal, a machine that doesn't support
+        # LP 0x48 at all (§7.11 explicitly warns some older ones don't)
+        # fails the *whole exchange* -- a genuine SASError/timeout, not a
+        # soft per-field skip. Folding it in unconditionally would abort
+        # every cycle's row write on such a machine; see --skip-last-
+        # accepted-bill-poll.
+        bill = poll("send_last_accepted_bill_information", client.send_last_accepted_bill_information)
+        values.update(zip(LP48_METER_COLUMNS, (bill.country_code, bill.denomination_code, bill.bill_meter)))
+    else:
+        for column in LP48_METER_COLUMNS:
+            values[column] = None
+
     if full_sweep:
         for lp, column in SINGLE_METER_COLUMNS.items():
             values[column] = poll(f"send_meter({lp.name})", client.send_meter, lp)
@@ -1009,9 +1082,30 @@ def _poll_all_meters(client, *, full_sweep: bool = True, table_c7_sweep: bool = 
                 client.send_extended_meters,
                 list(chunk_codes),
             )
-            values.update((column, result.meters[code]) for column, code in zip(chunk_columns, chunk_codes))
+            # .get(), not [] -- a code absent from result.meters means the
+            # machine answered normally but reported that specific meter as
+            # unsupported (size=0, §7.21b), not a failure. That's a known
+            # absence, correctly NULL, and must not raise: send_extended_meters()
+            # silently drops unsupported codes rather than erroring on them
+            # (see its own docstring), and almost no real EGM implements every
+            # one of Table C-7's ~154 codes, so treating an unsupported single
+            # meter as a whole-chunk failure would make this sweep unusable on
+            # real hardware -- only a genuine SASError (timeout, checksum
+            # failure, garbled response) aborts the cycle, same as everywhere
+            # else in this function.
+            values.update((column, result.meters.get(code)) for column, code in zip(chunk_columns, chunk_codes))
     else:
         for column in TABLE_C7_EXTENDED_COLUMNS:
+            values[column] = None
+
+    if validation_meters_sweep:
+        for vt in VALIDATION_METER_TYPES:
+            result = poll(f"send_validation_meters({vt.name})", client.send_validation_meters, vt)
+            total_col, amount_col = VALIDATION_METER_COLUMNS[vt]
+            values[total_col] = result.total_validations
+            values[amount_col] = result.cumulative_amount_cents
+    else:
+        for column in VALIDATION_METER_COLUMNS_FLAT:
             values[column] = None
 
     return values
@@ -1080,6 +1174,8 @@ def poll_and_log(
     db_size_fn=_db_file_size_bytes,
     full_meter_sweep: bool = True,
     table_c7_sweep: bool = True,
+    validation_meters_sweep: bool = True,
+    last_accepted_bill_poll: bool = True,
     interval: float | None = None,
     general_poll_retries: int = DEFAULT_GENERAL_POLL_RETRIES,
     pool_age_alert_hours: float = DEFAULT_POOL_AGE_ALERT_HOURS,
@@ -1112,9 +1208,9 @@ def poll_and_log(
     e.g. --interval) to also get a WARNING if the meter poll alone is at
     or above it — a sign this cycle's own meter sweep doesn't leave any
     slack for the general poll or the configured sleep, and
-    --skip-full-meter-sweep, --skip-table-c7-sweep, or a larger
-    --interval is worth considering. ``interval=None`` (the default)
-    skips that comparison.
+    --skip-full-meter-sweep, --skip-table-c7-sweep,
+    --skip-validation-meters-sweep, or a larger --interval is worth
+    considering. ``interval=None`` (the default) skips that comparison.
     """
     now = now_fn()
 
@@ -1153,7 +1249,13 @@ def poll_and_log(
     mono_now = monotonic_fn()
 
     try:
-        values = _poll_all_meters(client, full_sweep=full_meter_sweep, table_c7_sweep=table_c7_sweep)
+        values = _poll_all_meters(
+            client,
+            full_sweep=full_meter_sweep,
+            table_c7_sweep=table_c7_sweep,
+            validation_meters_sweep=validation_meters_sweep,
+            last_accepted_bill_poll=last_accepted_bill_poll,
+        )
     except _MeterPollFailure as failure:
         meter_poll_elapsed = monotonic_fn() - mono_now
         conn.execute(
@@ -1171,15 +1273,17 @@ def poll_and_log(
     meter_poll_elapsed = monotonic_fn() - mono_now
     meter_poll_count = (
         GROUPED_METER_POLL_COUNT
+        + (1 if last_accepted_bill_poll else 0)
         + (len(SINGLE_METER_COLUMNS) if full_meter_sweep else 0)
         + (TABLE_C7_CHUNK_COUNT if table_c7_sweep else 0)
+        + (len(VALIDATION_METER_TYPES) if validation_meters_sweep else 0)
     )
     if interval is not None and meter_poll_elapsed >= interval:
         print(
             f"[{now}] WARNING: meter poll took {meter_poll_elapsed:.3f}s across {meter_poll_count} long-poll "
             f"exchanges — at or above --interval {interval}s. This cycle's meter sweep alone doesn't leave "
             "room for the general poll or the configured sleep. Consider --skip-full-meter-sweep, "
-            "--skip-table-c7-sweep, or a larger --interval."
+            "--skip-table-c7-sweep, --skip-validation-meters-sweep, or a larger --interval."
         )
 
     columns = ", ".join(ALL_METER_FIELDS)
@@ -1339,6 +1443,24 @@ def main() -> int:
         "even where that one isn't affordable.",
     )
     parser.add_argument(
+        "--skip-validation-meters-sweep",
+        action="store_true",
+        help=f"skip the {len(VALIDATION_METER_TYPES)} LP 0x50 exchanges, one per validation type "
+        "(lp50_* columns are left NULL). These are explicitly redundant with the Table C-7 "
+        "validation meters (codes 0x80+) that --skip-table-c7-sweep already covers -- deliberate "
+        "cross-check, not waste, but LP 0x50 has no batching (unlike LP 6F), so it's the priciest "
+        "of the three sweeps per meter actually obtained.",
+    )
+    parser.add_argument(
+        "--skip-last-accepted-bill-poll",
+        action="store_true",
+        help="skip LP 0x48 (lp48_* columns are left NULL). Its own flag, not "
+        "--skip-full-meter-sweep's: unlike every other meter poll here, §7.11 explicitly warns "
+        "some older gaming machines don't support LP 0x48 at all, and that failure is a genuine "
+        "SASError on the whole exchange (not a soft per-field skip like LP 0x6F's), which would "
+        "otherwise abort every cycle's row write on such a machine.",
+    )
+    parser.add_argument(
         "--general-poll-retries",
         type=int,
         default=DEFAULT_GENERAL_POLL_RETRIES,
@@ -1385,7 +1507,9 @@ def main() -> int:
     print(
         f"  meters: {len(ALL_METER_FIELDS)} columns per row "
         f"(single-meter sweep {'enabled' if not args.skip_full_meter_sweep else 'skipped'}, "
-        f"Table C-7 sweep {'enabled' if not args.skip_table_c7_sweep else 'skipped'})."
+        f"Table C-7 sweep {'enabled' if not args.skip_table_c7_sweep else 'skipped'}, "
+        f"validation meters sweep {'enabled' if not args.skip_validation_meters_sweep else 'skipped'}, "
+        f"last-accepted-bill poll {'enabled' if not args.skip_last_accepted_bill_poll else 'skipped'})."
     )
 
     if not args.skip_ticket_out_backfill:
@@ -1412,6 +1536,8 @@ def main() -> int:
                 db_size_warning_mb=args.db_size_warning_mb,
                 full_meter_sweep=not args.skip_full_meter_sweep,
                 table_c7_sweep=not args.skip_table_c7_sweep,
+                validation_meters_sweep=not args.skip_validation_meters_sweep,
+                last_accepted_bill_poll=not args.skip_last_accepted_bill_poll,
                 interval=args.interval,
                 general_poll_retries=args.general_poll_retries,
                 pool_age_alert_hours=args.pool_age_alert_hours,

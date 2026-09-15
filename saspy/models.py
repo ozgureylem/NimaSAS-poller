@@ -325,6 +325,31 @@ class WagerCategoryInfo:
 
 
 @dataclass(frozen=True)
+class LastAcceptedBillInfo:
+    """Response to long poll 0x48 (Table 7.11). All fields are zero if the
+    machine has never accepted a bill (§7.11). Some older machines that
+    don't send exception 0x4F may not support this poll at all -- the
+    spec explicitly leaves that determination to the host.
+    """
+
+    country_code: int
+    denomination_code: int
+    bill_meter: int
+
+
+@dataclass(frozen=True)
+class ValidationMeters:
+    """Response to long poll 0x50 (Table 15.13b), for one validation type
+    at a time (see constants.ValidationType, Table 15.13c). Explicitly
+    redundant with MeterCode 0x80+ in Table C-7 per the spec's own note.
+    """
+
+    validation_type: int
+    total_validations: int
+    cumulative_amount_cents: int
+
+
+@dataclass(frozen=True)
 class ExtendedGameNInfo:
     """Response to long poll 0xB5 (Table 7.23b)."""
 

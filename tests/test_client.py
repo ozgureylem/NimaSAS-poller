@@ -660,6 +660,30 @@ def test_send_current_hopper_status_without_level():
     assert result.level is None
 
 
+def test_send_last_accepted_bill_information():
+    body = bytes([ADDRESS, 0x48, 0x01, 0x02]) + encode_bcd(37, 4)
+    result = make_client(body).send_last_accepted_bill_information()
+    assert result.country_code == 1
+    assert result.denomination_code == 2
+    assert result.bill_meter == 37
+
+
+def test_send_last_accepted_bill_information_never_accepted_a_bill():
+    body = bytes([ADDRESS, 0x48, 0x00, 0x00]) + encode_bcd(0, 4)
+    result = make_client(body).send_last_accepted_bill_information()
+    assert result.country_code == 0
+    assert result.denomination_code == 0
+    assert result.bill_meter == 0
+
+
+def test_send_validation_meters():
+    body = bytes([ADDRESS, 0x50, 0x80]) + encode_bcd(12, 4) + encode_bcd(4750, 5)
+    result = make_client(body).send_validation_meters(0x80)
+    assert result.validation_type == 0x80
+    assert result.total_validations == 12
+    assert result.cumulative_amount_cents == 4750
+
+
 def test_send_game_n_meters():
     body = bytes([ADDRESS, 0x52]) + encode_bcd(1, 2)
     for v in (10, 20, 30, 40):

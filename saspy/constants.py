@@ -109,10 +109,12 @@ class LongPoll(enum.IntEnum):
 
     SEND_CREDIT_AMOUNT_OF_ALL_BILLS_ACCEPTED = 0x46
     SEND_COIN_AMOUNT_FROM_EXTERNAL_ACCEPTOR = 0x47
+    SEND_LAST_ACCEPTED_BILL_INFORMATION = 0x48  # Table 7.11 -- most-recently-accepted bill only; some older machines don't support it at all (see its own docstring)
     SEND_BILLS_IN_STACKER_COUNT = 0x49
     SEND_BILLS_IN_STACKER_CREDIT_AMOUNT = 0x4A
 
     SEND_CURRENT_HOPPER_STATUS = 0x4F  # Table 7.19a/7.19b
+    SEND_VALIDATION_METERS = 0x50  # Table 15.13a/15.13b -- redundant with Table C-7 codes 0x80+ per the spec's own note
 
     SEND_TOTAL_GAMES_IMPLEMENTED = 0x51  # Table 7.6.3 (2-byte BCD)
     SEND_GAME_N_METERS = 0x52  # Table 7.6.4a/7.6.4b (type M)
@@ -636,6 +638,8 @@ LONG_POLL_TYPES: dict[LongPoll, PollType] = {
     LongPoll.SEND_TOTAL_HAND_PAID_CANCELLED_CREDITS: PollType.M,
     LongPoll.SEND_CASH_OUT_TICKET_INFORMATION: PollType.R,
     LongPoll.SEND_CURRENT_HOPPER_STATUS: PollType.R,
+    LongPoll.SEND_LAST_ACCEPTED_BILL_INFORMATION: PollType.R,  # "type R long poll with a 48 command code" per §7.11
+    LongPoll.SEND_VALIDATION_METERS: PollType.S,  # "type S long poll with command code 50" per §15.13
     LongPoll.SEND_GAME_N_METERS: PollType.M,
     LongPoll.SEND_GAME_N_CONFIGURATION: PollType.M,
     LongPoll.SEND_SELECTED_METERS: PollType.M,  # "type M command" per §7.3
@@ -660,3 +664,23 @@ LONG_POLL_TYPES: dict[LongPoll, PollType] = {
     LongPoll.AFT_GAME_LOCK_AND_STATUS: PollType.S,
     LongPoll.SEND_ENABLED_FEATURES: PollType.M,
 }
+
+
+class ValidationType(enum.IntEnum):
+    """Validation-type codes for LP 0x50 (Send Validation Meters), Table
+    15.13c. Not a bitmask -- these are the 12 discrete values the field can
+    take, each read with its own LP 0x50 call.
+    """
+
+    CASHABLE_TICKET_OR_HANDPAY_WIN_NO_LOCKUP = 0x00
+    RESTRICTED_PROMOTIONAL_TICKET_FROM_CASHOUT = 0x01
+    CASHABLE_TICKET_FROM_AFT_TRANSFER = 0x02
+    RESTRICTED_TICKET_FROM_AFT_TRANSFER = 0x03
+    DEBIT_TICKET_FROM_AFT_TRANSFER = 0x04
+    CANCELLED_CREDIT_HANDPAY_RECEIPT_PRINTED = 0x10
+    JACKPOT_HANDPAY_RECEIPT_PRINTED = 0x20
+    CANCELLED_CREDIT_HANDPAY_NO_RECEIPT = 0x40
+    JACKPOT_HANDPAY_NO_RECEIPT = 0x60
+    CASHABLE_TICKET_REDEEMED = 0x80
+    RESTRICTED_PROMOTIONAL_TICKET_REDEEMED = 0x81
+    NONRESTRICTED_PROMOTIONAL_TICKET_REDEEMED = 0x82

@@ -141,6 +141,43 @@ class SASClient:
         level = decode_bcd(payload[4:8]) if length == 6 else None
         return models.HopperStatus(status=payload[2], percent_full=payload[3], level=level)
 
+    def send_last_accepted_bill_information(self) -> models.LastAcceptedBillInfo:
+        """LP 0x48 (§7.11). Reports only the single most-recently-accepted
+        bill -- the machine keeps no history, so poll promptly after a bill
+        exception if you need every bill, not just the latest. All fields
+        are zero if the machine has never accepted a bill. Some older
+        machines that don't send exception 0x4F may not support this poll
+        at all; the spec leaves detecting that to the host (a SASError from
+        this call, e.g. a timeout, is the signal).
+        """
+        poll = LongPoll.SEND_LAST_ACCEPTED_BILL_INFORMATION
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=10, timeout=self.timeout)
+        payload = self._strip(raw)
+        return models.LastAcceptedBillInfo(
+            country_code=decode_bcd(payload[1:2]),
+            denomination_code=decode_bcd(payload[2:3]),
+            bill_meter=decode_bcd(payload[3:7]),
+        )
+
+    def send_validation_meters(self, validation_type: int) -> models.ValidationMeters:
+        """LP 0x50 (§15.13), for one validation type at a time -- see
+        constants.ValidationType for the 12 known codes (Table 15.13c).
+        Explicitly redundant with MeterCode 0x80+ in Table C-7 per the
+        spec's own note; polling both independently is a deliberate
+        cross-check, not waste (see sql_poll_logger.py's module docstring).
+        """
+        poll = LongPoll.SEND_VALIDATION_METERS
+        command_and_data = bytes([poll, validation_type])
+        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=14, timeout=self.timeout)
+        payload = self._strip(raw)
+        return models.ValidationMeters(
+            validation_type=payload[1],
+            total_validations=decode_bcd(payload[2:6]),
+            cumulative_amount_cents=decode_bcd(payload[6:11]),
+        )
+
     def send_game_n_meters(self, game_number: int = 0) -> models.GameNMeters:
         poll = LongPoll.SEND_GAME_N_METERS
         command_and_data = bytes([poll]) + encode_bcd(game_number, 2)
