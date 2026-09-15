@@ -198,6 +198,7 @@ class ScriptedClient:
         self._last_accepted_bill_info = last_accepted_bill_info
         self._validation_meters_values = dict(validation_meters_values) if validation_meters_values else {}
         self.validation_number_calls = []
+        self.extended_meter_commands = []
 
     def general_poll(self):
         if self._exception_script is None:
@@ -289,6 +290,15 @@ class ScriptedClient:
         return value
 
     def send_extended_meters(self, meter_codes, *, game_number=0):
+        return self._extended_meters(0x6F, meter_codes, game_number)
+
+    def send_extended_meters_alternate(self, meter_codes, *, game_number=0):
+        return self._extended_meters(0xAF, meter_codes, game_number)
+
+    def _extended_meters(self, command, meter_codes, game_number):
+        # Records the command byte per call so tests can assert the caller
+        # alternates 6F/AF across consecutive chunks (§7.21 / Table 3.1).
+        self.extended_meter_commands.append(command)
         meters = {}
         for code in meter_codes:
             value = self._table_c7_values.get(code, 0)
@@ -677,6 +687,34 @@ def test_table_c7_sweep_meter_unsupported_by_the_machine_is_null_not_a_crash():
     ).fetchone()
     assert row == (None, 42)
     assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
+
+
+def test_table_c7_sweep_alternates_6f_and_af_between_consecutive_chunks():
+    """SAS implicitly ACKs a long poll with "a general poll or a long poll
+    with a different command byte" (Table 3.1); a *repeated* identical poll
+    is an implied NACK meaning "re-send what you just sent" (3.2). Sending
+    0x6F for all 13 chunks would therefore invite a compliant machine to
+    answer chunks 2..13 with chunk 1's response -- wrong values in the
+    right columns, with no error raised anywhere.
+
+    0xAF exists for exactly this: 7.21 says the two codes reach identical
+    meter data and the second is provided "to allow a host to perform
+    consecutive meter polls and still provide a proper implied
+    acknowledgement", and the spec's own 6.00 revision note says the same.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()])
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+
+    sent = client.extended_meter_commands
+    assert len(sent) == TABLE_C7_CHUNK_COUNT
+    assert sent == [0x6F if n % 2 == 0 else 0xAF for n in range(TABLE_C7_CHUNK_COUNT)]
+    # The property that actually matters, stated independently of the
+    # ordering above: no two consecutive chunks share a command byte.
+    assert all(a != b for a, b in zip(sent, sent[1:]))
 
 
 def test_skip_table_c7_sweep_leaves_its_columns_null_but_other_groups_populate():

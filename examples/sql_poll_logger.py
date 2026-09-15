@@ -62,10 +62,34 @@ What each cycle does, in order:
    essentially the rest of Table C-7 (~154 more meter codes — every
    assigned code this client didn't already have a dedicated long poll
    for: per-denomination bill-acceptor counts, SAS-validation-specific
-   meters, AFT transfer meters, and more) via LP 0x6F in ~13 chunked
-   exchanges, 12 codes per exchange, self-describing size — far more
-   wire-efficient per meter than the single-meter sweep, which is why
-   it has its own opt-out rather than sharing --skip-full-meter-sweep's.
+   meters, AFT transfer meters, and more) via LP 0x6F/0xAF in ~13
+   chunked exchanges, 12 codes per exchange, self-describing size — far
+   more wire-efficient per meter than the single-meter sweep, which is
+   why it has its own opt-out rather than sharing
+   --skip-full-meter-sweep's. Those chunks alternate between command
+   codes 0x6F and 0xAF, which reach identical data: SAS implicitly ACKs
+   a long poll only with a general poll or "a long poll with a different
+   command byte" (Table 3.1), and a repeated identical poll is an
+   implied NACK meaning "re-send what you just sent" (§3.2). 0xAF exists
+   for precisely this (§7.21, and the spec's own 6.00 revision note
+   "Added long poll AF as alternate 6F meter poll, to allow consecutive
+   meter polls"); without alternating, a compliant machine could answer
+   chunks 2..13 with chunk 1's data — wrong values in the right columns,
+   with nothing raising an error.
+
+   UNRESOLVED, and worth knowing before trusting a long run: two other
+   places here still issue the same command byte back-to-back, and SAS
+   offers no alternate code for either. The validation-meters sweep
+   sends LP 0x50 once per validation type (12 in a row, differing only
+   in their data byte), and _drain_ticket_out_history() sends LP 0x4D
+   with function code 0x00 repeatedly until the buffer reports empty.
+   The 0x4D case is probably fine by construction — "next unread, mark
+   as read" is designed to be called repeatedly, so consecutive polls
+   must advance or draining could never work at all — but that is an
+   inference, not something the spec states. Whether real machines
+   discriminate on the full request or only the command byte is a
+   hardware question; the fact that IGT had to add 0xAF at all suggests
+   at least some key on the command byte alone.
    Several of these deliberately overlap: LP 0x19/0x1C, most of the
    single-meter sweep, and a good part of the Table C-7 sweep, report
    counters LP 0x0F already reports, through entirely independent
@@ -1202,9 +1226,27 @@ def _poll_all_meters(
             chunk_codes = TABLE_C7_EXTENDED_CODES[i:i + TABLE_C7_CHUNK_SIZE]
             chunk_columns = TABLE_C7_EXTENDED_COLUMNS[i:i + TABLE_C7_CHUNK_SIZE]
             chunk_num = i // TABLE_C7_CHUNK_SIZE + 1
+            # Alternate 0x6F / 0xAF between consecutive chunks. Both codes
+            # read the exact same meter data; the spec provides the second
+            # one for precisely this reason (§7.21: "to allow a host to
+            # perform consecutive meter polls and still provide a proper
+            # implied acknowledgement in accordance with Section 3.1", and
+            # the 6.00 revision note "Added long poll AF as alternate 6F
+            # meter poll, to allow consecutive meter polls").
+            #
+            # This is not cosmetic. Per Table 3.1 a long poll is implicitly
+            # ACKed only by a general poll or "a long poll with a different
+            # command byte"; §3.2 makes a repeated identical poll an implied
+            # NACK, meaning "re-send the information you just sent". Sending
+            # 0x6F 13 times in a row would invite a compliant machine to
+            # answer chunks 2..13 with chunk 1's response -- wrong meter
+            # values written to the right columns, with no error anywhere.
+            alternate = chunk_num % 2 == 0
+            fn = client.send_extended_meters_alternate if alternate else client.send_extended_meters
             result = poll(
-                f"send_extended_meters(chunk {chunk_num}/{TABLE_C7_CHUNK_COUNT})",
-                client.send_extended_meters,
+                f"send_extended_meters{'_alternate' if alternate else ''}"
+                f"(chunk {chunk_num}/{TABLE_C7_CHUNK_COUNT})",
+                fn,
                 list(chunk_codes),
             )
             # .get(), not [] -- a code absent from result.meters means the
