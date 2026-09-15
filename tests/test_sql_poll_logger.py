@@ -1330,6 +1330,213 @@ def test_ticket_in_completions_synced_at_defaults_to_null():
     assert row == (None,)
 
 
+# --- ticket_in_history view: correlating 0x67 inserts with 0x68 completions --
+
+
+TICKET_VD = b"\x00" + b"1" * 9  # the shared default in make_ticket_in/make_ticket_completion
+
+
+def run_ticket_in_cycle(conn, *, insert_at=None, complete_at=None, completion=None, ticket=None):
+    """Drive the real capture path (exception 0x67 then 0x68, one cycle
+    each) with controlled timestamps, so the view is exercised against
+    rows written by _capture_ticket_in()/_capture_ticket_in_completion()
+    rather than hand-inserted ones.
+    """
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    if insert_at is not None:
+        client = ScriptedClient(
+            [make_meters()],
+            exception_script=[ExceptionCode.TICKET_INSERTED],
+            ticket_script=[ticket if ticket is not None else make_ticket_in()],
+        )
+        poll_and_log(client, conn, state, history, monotonic_fn=FakeClock(), now_fn=lambda: insert_at)
+    if complete_at is not None:
+        client = ScriptedClient(
+            [make_meters()],
+            exception_script=[ExceptionCode.TICKET_TRANSFER_COMPLETE],
+            ticket_completion_script=[completion if completion is not None else make_ticket_completion()],
+        )
+        poll_and_log(client, conn, state, history, monotonic_fn=FakeClock(), now_fn=lambda: complete_at)
+
+
+def history_rows(conn):
+    return conn.execute(
+        "SELECT inserted_at, validation_number, amount_cents, completed_at, machine_status, outcome "
+        "FROM ticket_in_history ORDER BY COALESCE(inserted_at, completed_at)"
+    ).fetchall()
+
+
+def test_ticket_in_history_correlates_an_insert_with_its_completion():
+    conn = make_db()
+    run_ticket_in_cycle(
+        conn,
+        insert_at="2026-09-15T10:00:01+00:00",
+        complete_at="2026-09-15T10:00:03+00:00",
+        ticket=make_ticket_in(amount_cents=2500),
+        completion=make_ticket_completion(machine_status=0x00, amount_cents=2500),
+    )
+    assert history_rows(conn) == [
+        (
+            "2026-09-15T10:00:01+00:00",
+            TICKET_VD.hex(),
+            2500,
+            "2026-09-15T10:00:03+00:00",
+            0x00,
+            "redeemed",
+        )
+    ]
+
+
+def test_ticket_in_history_correlates_across_independent_autoincrement_ids():
+    """Regression test. ticket_in_events.id and ticket_in_completions.id are
+    SEPARATE AUTOINCREMENT sequences, so the first insert and the first
+    completion BOTH have id=1 -- ordering the two tables against each other
+    by id is meaningless and silently correlates nothing. An earlier version
+    of this view joined on `event.id < completion.id`, which made every
+    single ticket show up as two uncorrelated rows ("awaiting completion"
+    plus an orphan completion) instead of one. The view orders by
+    captured_at (ISO-8601 UTC, so string order is time order) instead.
+    """
+    conn = make_db()
+    run_ticket_in_cycle(conn, insert_at="2026-09-15T10:00:01+00:00", complete_at="2026-09-15T10:00:03+00:00")
+    event_id = conn.execute("SELECT id FROM ticket_in_events").fetchone()[0]
+    completion_id = conn.execute("SELECT id FROM ticket_in_completions").fetchone()[0]
+    assert event_id == completion_id == 1, "the id collision this test exists to defend against"
+    rows = history_rows(conn)
+    assert len(rows) == 1, "one ticket must be one row, not an insert and an orphan completion"
+    assert rows[0][0] is not None and rows[0][3] is not None
+
+
+def test_ticket_in_history_shows_an_insert_with_no_completion_as_awaiting():
+    conn = make_db()
+    run_ticket_in_cycle(conn, insert_at="2026-09-15T10:00:01+00:00")
+    assert history_rows(conn) == [
+        ("2026-09-15T10:00:01+00:00", TICKET_VD.hex(), 2500, None, None, "awaiting completion")
+    ]
+
+
+def test_ticket_in_history_shows_a_completion_whose_insert_was_never_seen():
+    """Started mid-cycle, or the 0x67 was lost to an exception-buffer
+    overflow. The completion is still real and must stay visible, with a
+    NULL inserted_at saying plainly that this half was never observed.
+    """
+    conn = make_db()
+    run_ticket_in_cycle(conn, complete_at="2026-09-15T10:00:03+00:00")
+    assert history_rows(conn) == [
+        (None, TICKET_VD.hex(), 2500, "2026-09-15T10:00:03+00:00", 0x00, "redeemed")
+    ]
+
+
+def test_ticket_in_history_classifies_a_rejection():
+    conn = make_db()
+    run_ticket_in_cycle(
+        conn,
+        insert_at="2026-09-15T10:00:01+00:00",
+        complete_at="2026-09-15T10:00:03+00:00",
+        completion=make_ticket_completion(machine_status=0x85),  # validation number does not match
+    )
+    row = history_rows(conn)[0]
+    assert row[4] == 0x85
+    assert row[5] == "rejected"
+
+
+@pytest.mark.parametrize(
+    "machine_status, expected",
+    [
+        (0x00, "redeemed"),  # 000xxxxx -- cashable ticket redeemed
+        (0x02, "redeemed"),  # 000xxxxx -- nonrestricted promotional redeemed
+        (0x20, "waiting for long poll 71"),  # 001xxxxx
+        (0x40, "redemption pending"),  # 010xxxxx
+        (0x80, "rejected"),  # 100xxxxx -- rejected by host or unknown
+        (0x8B, "rejected"),  # 100xxxxx -- validator failure
+        (0xC0, "incompatible with current cycle"),  # 110xxxxx
+        (0xFF, "no validation information"),  # 111xxxxx
+    ],
+)
+def test_ticket_in_history_classifies_status_by_the_specs_own_msbit_categories(machine_status, expected):
+    """Table 15.12d states outright that the 3 most significant bits
+    determine the category of the status code, so the view derives the
+    outcome with `machine_status >> 5` rather than carrying a 20-row
+    lookup table that could drift from the spec.
+    """
+    conn = make_db()
+    run_ticket_in_cycle(
+        conn,
+        complete_at="2026-09-15T10:00:03+00:00",
+        completion=make_ticket_completion(machine_status=machine_status),
+    )
+    assert history_rows(conn)[0][5] == expected
+
+
+def test_ticket_in_history_does_not_correlate_a_completion_with_no_validation_data():
+    """machine_status FF comes back with no validation data at all (the
+    response carries only the status byte), so there is nothing to join
+    on. It must not be silently attached to whatever ticket happened to
+    go in most recently -- that would invent a correlation the wire never
+    supported.
+    """
+    conn = make_db()
+    run_ticket_in_cycle(
+        conn,
+        insert_at="2026-09-15T10:00:01+00:00",
+        complete_at="2026-09-15T10:00:03+00:00",
+        completion=make_ticket_completion(machine_status=0xFF, amount_cents=0, validation_data=b""),
+    )
+    assert history_rows(conn) == [
+        ("2026-09-15T10:00:01+00:00", TICKET_VD.hex(), 2500, None, None, "awaiting completion"),
+        (None, None, 0, "2026-09-15T10:00:03+00:00", 0xFF, "no validation information"),
+    ]
+
+
+def test_ticket_in_history_keeps_both_inserts_when_the_same_ticket_is_reinserted():
+    """A rejected ticket re-inserted by the player produces two 0x67s with
+    the same validation number and one 0x68. The completion belongs to the
+    most recent preceding insert; the earlier insert must still appear
+    (never silently dropped) and must not also claim the same completion.
+    """
+    conn = make_db()
+    run_ticket_in_cycle(conn, insert_at="2026-09-15T10:00:01+00:00")
+    run_ticket_in_cycle(conn, insert_at="2026-09-15T10:00:05+00:00", complete_at="2026-09-15T10:00:07+00:00")
+    assert history_rows(conn) == [
+        ("2026-09-15T10:00:01+00:00", TICKET_VD.hex(), 2500, None, None, "awaiting completion"),
+        ("2026-09-15T10:00:05+00:00", TICKET_VD.hex(), 2500, "2026-09-15T10:00:07+00:00", 0x00, "redeemed"),
+    ]
+    assert conn.execute("SELECT COUNT(*) FROM ticket_in_completions").fetchone()[0] == 1
+
+
+def test_ticket_in_history_keeps_two_different_tickets_apart():
+    conn = make_db()
+    other = b"\x00" + b"7" * 9
+    run_ticket_in_cycle(conn, insert_at="2026-09-15T10:00:01+00:00", complete_at="2026-09-15T10:00:02+00:00")
+    run_ticket_in_cycle(
+        conn,
+        insert_at="2026-09-15T10:00:09+00:00",
+        complete_at="2026-09-15T10:00:10+00:00",
+        ticket=make_ticket_in(amount_cents=700, validation_data=other),
+        completion=make_ticket_completion(machine_status=0x85, amount_cents=700, validation_data=other),
+    )
+    assert history_rows(conn) == [
+        ("2026-09-15T10:00:01+00:00", TICKET_VD.hex(), 2500, "2026-09-15T10:00:02+00:00", 0x00, "redeemed"),
+        ("2026-09-15T10:00:09+00:00", other.hex(), 700, "2026-09-15T10:00:10+00:00", 0x85, "rejected"),
+    ]
+
+
+def test_ticket_in_history_is_empty_when_nothing_has_happened():
+    assert history_rows(make_db()) == []
+
+
+def test_ticket_in_history_view_is_rebuilt_not_preserved_on_reopen():
+    """The view is DROP+CREATEd rather than CREATE IF NOT EXISTS, so a
+    database made by an older version picks up the current definition.
+    Re-running SCHEMA must be safe and must not duplicate rows.
+    """
+    conn = make_db()
+    run_ticket_in_cycle(conn, insert_at="2026-09-15T10:00:01+00:00", complete_at="2026-09-15T10:00:03+00:00")
+    conn.executescript(SCHEMA)  # same thing startup does against an existing file
+    assert len(history_rows(conn)) == 1
+
+
 # --- ticket-out drain (exception 0x3D/0x3E) ---------------------------------
 
 

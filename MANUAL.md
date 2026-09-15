@@ -341,6 +341,36 @@ or rejected, via exception `0x68` and a safe, read-only status query
 table only observes an outcome that already happened, it never decides
 one.
 
+**Ticket-in history** (`ticket_in_history`) is those two tables joined
+into the thing you actually want to look at — one row per ticket-in
+cycle: when it went in, its validation number, what it was worth, when
+the cycle ended, and an `outcome` (`redeemed`, `rejected`, `redemption
+pending`, `awaiting completion`, …). Query it like any table:
+
+```
+sqlite3 gateway.sqlite3 "SELECT * FROM ticket_in_history ORDER BY inserted_at DESC LIMIT 5;"
+```
+
+Three things to know about it, because they're the difference between
+reading it correctly and over-trusting it:
+
+- **It's a view, not a table.** Nothing extra is polled or stored to
+  produce it; it's derived from the two tables above every time you
+  query it. That's deliberate — see §6.3.
+- **`outcome` comes from the spec's own rule**, not a hand-maintained
+  list: Table 15.12d states that the three most significant bits of
+  `machine_status` give its category, so the view derives the outcome
+  with `machine_status >> 5`.
+- **Correlation is best-effort, and the view says so rather than
+  hiding it.** A completion that comes back `FF` carries no validation
+  data at all, so there's nothing to match it against — it appears
+  with a `NULL` `inserted_at` instead of being silently glued to
+  whatever ticket went in most recently. Likewise a ticket inserted
+  but never seen to complete (still in escrow, or this tool started
+  after the fact) shows as `awaiting completion` rather than
+  disappearing. `NULL`s here mean "never observed," and that's
+  information, not a defect.
+
 **Gateway-local cashout validation** (`validation_pool`) is the other
 direction: when a machine is ready to print a cashout ticket, it waits
 for the host to hand it a validation number. This tool answers that
@@ -1029,6 +1059,16 @@ CREATE TABLE IF NOT EXISTS validation_pool (
     assigned_at TEXT,
     assigned_amount_cents INTEGER
 );
+
+-- One row per ticket-in cycle, correlating the two tables above.
+-- DROP+CREATE, not IF NOT EXISTS: a view holds no data, so recreating it
+-- costs nothing and an older database picks up the current definition --
+-- exactly the migration problem a *table* would have.
+DROP VIEW IF EXISTS ticket_in_history;
+CREATE VIEW ticket_in_history AS ...
+    -- inserted_at, validation_number, amount_cents,
+    -- completed_at, machine_status, outcome, event_id, completion_id
+    -- (full definition in sql_poll_logger.py's SCHEMA, with comments)
 ```
 
 `issued_at` is set by `seed_validation_pool()` to when a row entered the
@@ -1124,16 +1164,21 @@ brand-new or infinitely old.
   rows" look like the only available option. Add the column for what a
   table *is* — here, an audit-style event log — not only once
   something exists to populate it.
-- **Two related events don't need a shared table if nothing correlates
-  them.** `ticket_in_events` (exception `0x67`, an insertion) and
-  `ticket_in_completions` (exception `0x68`, how that cycle ended) are
-  about the same underlying ticket, but SAS gives no ID that ties one
-  to the other — no sequence number, no shared key, nothing. Bolting
-  them into one table would invite treating adjacent rows as related
-  when they might not be (two tickets inserted in quick succession).
-  Two independent append-only logs, correlated later by whoever
-  consumes them (timestamp proximity, `validation_data_hex`) if they
-  need to be, is the honest shape for data SAS itself doesn't link.
+- **Two related events don't need a shared table — correlate them in a
+  view instead.** `ticket_in_events` (exception `0x67`, an insertion)
+  and `ticket_in_completions` (exception `0x68`, how that cycle ended)
+  are about the same underlying ticket, but SAS issues no transaction
+  ID tying one to the other — no sequence number, nothing but the
+  validation number itself, and even that is absent when a completion
+  comes back `FF`. Bolting them into one table would invite treating
+  adjacent rows as related when they might not be (two tickets
+  inserted in quick succession), and would freeze a best-effort guess
+  into stored data. The shape that keeps both properties is two
+  independent append-only logs *plus* the `ticket_in_history` view over
+  them (§4.1): the tables stay the literal record of what each
+  exception reported, and the correlation lives somewhere it can be
+  redefined without a migration. Rule of thumb: derive what you
+  inferred, store only what you observed.
 - **A table you spend from needs a status column; a table you only
   observe doesn't.** Every other table here is written by the poller
   and read by someone else. `validation_pool` is the opposite: this
@@ -1156,6 +1201,7 @@ sqlite3 gateway.sqlite3 "SELECT * FROM meters_history;"
 sqlite3 gateway.sqlite3 "SELECT * FROM poll_errors;"
 sqlite3 gateway.sqlite3 "SELECT * FROM ticket_out_history;"
 sqlite3 gateway.sqlite3 "SELECT * FROM ticket_in_events;"
+sqlite3 gateway.sqlite3 "SELECT * FROM ticket_in_history;"
 sqlite3 gateway.sqlite3 "SELECT * FROM validation_pool;"
 ```
 

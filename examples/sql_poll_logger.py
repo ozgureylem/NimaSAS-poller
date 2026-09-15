@@ -36,7 +36,9 @@ What each cycle does, in order:
    the redemption cycle finished, stacked or rejected, not which),
    read the completion status (the safe, read-only LP 71/FF status
    query) and log it to ticket_in_completions — see "What this does
-   NOT do" below for how this stays read-only too. If it returns 0x3D
+   NOT do" below for how this stays read-only too. (The two are
+   correlated into one row per ticket by the ticket_in_history view;
+   see "Ticket-in history" below.) If it returns 0x3D
    or 0x3E (a ticket-out record is ready), drain every currently-unread
    ticket-out record (LP 4D,
    function code 0x00) into ticket_out_history. If it returns 0x57
@@ -153,6 +155,21 @@ query (redeem_ticket_status(), LP 71/FF) redeem_ticket() itself is
 never used for — but "safe to observe" and "safe to decide" stay
 different things throughout: this tool still never authorizes, rejects,
 or influences a ticket-in outcome, only reads what already happened.
+
+Ticket-in history. Those two tables are the raw, append-only record of
+what each exception actually reported; the ticket_in_history VIEW joins
+them into one row per ticket-in cycle (what went in, what it was worth,
+how it ended). It is a view and not a table on purpose: SAS gives the
+host no retroactive ticket-in buffer to re-read — unlike ticket-OUT,
+where LP 4D genuinely can walk the machine's own buffer by index — so
+this history exists only because both halves were caught live, and
+correlating them is best-effort by nature. A 0x68 can arrive with
+machine_status FF and no validation data at all (nothing to join on),
+and a 0x67 can be missed outright if this tool started mid-cycle or the
+machine's exception buffer overflowed. A view can be redefined when
+that correlation logic improves; a guess written into a column at
+capture time cannot be taken back out. See the view's own comments in
+SCHEMA for the matching rule and MANUAL.md §6.3.
 This is a different direction from cashout validation above, not a
 contradiction of it — see §5.4 vs. §5.8 in the docstring paragraph above.
 
@@ -540,6 +557,80 @@ CREATE TABLE IF NOT EXISTS validation_pool (
     assigned_at TEXT,
     assigned_amount_cents INTEGER
 );
+
+-- Ticket-in history: the two raw capture tables above, correlated into one
+-- row per ticket-in cycle. DROP+CREATE rather than IF NOT EXISTS because a
+-- view holds no data -- recreating it costs nothing and guarantees an older
+-- database gets the current definition, which is exactly the migration
+-- problem a *table* would have (see MANUAL.md 6.3 on column order).
+--
+-- Deliberately a view, not a table: correlation here is best-effort by
+-- nature (a 0x68 can arrive with machine_status FF and empty validation
+-- data, leaving nothing to join on; a 0x67 can be missed entirely if this
+-- tool started mid-cycle or the machine's exception buffer overflowed).
+-- The raw tables stay the append-only record of what the wire actually
+-- said; a wrong guess here can be redefined, a wrong guess written into a
+-- column cannot.
+DROP VIEW IF EXISTS ticket_in_history;
+CREATE VIEW ticket_in_history AS
+    -- Every completion, joined to the most recent *preceding* insert
+    -- carrying the same validation number. Driving from completions keeps
+    -- this one-to-one: a ticket rejected and re-inserted (same validation
+    -- number twice) would otherwise be claimed by both inserts.
+    SELECT
+        e.captured_at AS inserted_at,
+        COALESCE(NULLIF(c.validation_data_hex, ''), e.validation_data_hex) AS validation_number,
+        COALESCE(e.amount_cents, c.amount_cents) AS amount_cents,
+        c.captured_at AS completed_at,
+        c.machine_status AS machine_status,
+        CASE c.machine_status >> 5
+            WHEN 0 THEN 'redeemed'
+            WHEN 1 THEN 'waiting for long poll 71'
+            WHEN 2 THEN 'redemption pending'
+            WHEN 4 THEN 'rejected'
+            WHEN 6 THEN 'incompatible with current cycle'
+            WHEN 7 THEN 'no validation information'
+            ELSE 'unknown'
+        END AS outcome,
+        e.id AS event_id,
+        c.id AS completion_id
+    FROM ticket_in_completions c
+    LEFT JOIN ticket_in_events e
+        ON e.id = (
+            -- Ordered by captured_at, NOT by id: the two tables have
+            -- independent AUTOINCREMENT sequences, so event id 1 and
+            -- completion id 1 say nothing about which happened first.
+            -- captured_at is ISO-8601 UTC, so string order is time order.
+            SELECT e2.id FROM ticket_in_events e2
+            WHERE e2.validation_data_hex = c.validation_data_hex
+              AND c.validation_data_hex <> ''
+              AND e2.captured_at <= c.captured_at
+            ORDER BY e2.captured_at DESC, e2.id DESC
+            LIMIT 1
+        )
+    UNION ALL
+    -- Inserts that no completion claimed: still in escrow, rejected before
+    -- a redemption cycle started, or superseded by a later insert of the
+    -- same ticket. Kept visible rather than dropped -- a history that
+    -- silently omits a ticket that went in is worse than one that says
+    -- "went in, never saw it finish".
+    SELECT
+        e.captured_at, e.validation_data_hex, e.amount_cents,
+        NULL, NULL, 'awaiting completion', e.id, NULL
+    FROM ticket_in_events e
+    WHERE NOT EXISTS (
+        SELECT 1 FROM ticket_in_completions c2
+        WHERE c2.validation_data_hex = e.validation_data_hex
+          AND c2.validation_data_hex <> ''
+          AND c2.captured_at >= e.captured_at
+          AND e.id = (
+              SELECT e3.id FROM ticket_in_events e3
+              WHERE e3.validation_data_hex = c2.validation_data_hex
+                AND e3.captured_at <= c2.captured_at
+              ORDER BY e3.captured_at DESC, e3.id DESC
+              LIMIT 1
+          )
+    );
 """
 # meters_current always holds exactly one row (id=1, INSERT OR REPLACE) —
 # most consumers only ever want the latest value, and a one-row table
