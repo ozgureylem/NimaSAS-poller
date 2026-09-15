@@ -10,6 +10,7 @@ import pytest
 from examples.sql_poll_logger import (
     ALL_METER_FIELDS,
     GROUPED_METER_POLL_COUNT,
+    PRIORITY_METER_COLUMNS,
     SAS_MIN_POLL_INTERVAL_S,
     SCHEMA,
     SINGLE_METER_COLUMNS,
@@ -359,6 +360,25 @@ def history_row_count(conn: sqlite3.Connection) -> int:
 def current_coin_in(conn: sqlite3.Connection):
     row = conn.execute("SELECT total_coin_in FROM meters_current").fetchone()
     return row[0] if row else None
+
+
+# --- column order ------------------------------------------------------
+
+
+def test_priority_meter_columns_lead_all_meter_fields_in_order():
+    """Business-facing meters (coin in/out, cancelled credits, jackpot,
+    dollar value of bills, games played, ticket in/out cashable and
+    restricted) come first, in the exact order PRIORITY_METER_COLUMNS
+    specifies -- everything else follows, in whatever order it already
+    had. This is a column-position guarantee, not just a set membership
+    one: meters_current/meters_history are meant to be eyeballed and
+    queried with SELECT *, so where a field lands in the row matters.
+    """
+    assert ALL_METER_FIELDS[: len(PRIORITY_METER_COLUMNS)] == PRIORITY_METER_COLUMNS
+
+
+def test_priority_meter_columns_are_not_duplicated_in_all_meter_fields():
+    assert len(ALL_METER_FIELDS) == len(set(ALL_METER_FIELDS))
 
 
 # --- meters_current: always exactly one row, always the latest value ---

@@ -414,7 +414,35 @@ GAUGE_METER_FIELDS = frozenset(
     }
 )
 
-ALL_METER_FIELDS = (
+# Column *order* only -- every one of these already exists in one of the
+# group tuples above; this doesn't add a new poll or change what's read,
+# just where it lands in the row. Front-loads the meters the business
+# actually watches day to day, ahead of the long tail of redundant/
+# secondary reads (LP 19/1C re-reads, the single-meter sweep, Table C-7,
+# per-validation-type meters, etc.), which keep their existing relative
+# order after it. "Ticket in"/"ticket out"/"promo ticket in"/"promo
+# ticket out" are the cashable/restricted LP 2F pairs -- SAS calls
+# restricted tickets "promotional" throughout (see ValidationType) --
+# each kept as its natural (cents, count) pair, cents first, matching
+# how TICKET_METER_COLUMNS itself already orders them.
+PRIORITY_METER_COLUMNS = (
+    "total_coin_in",
+    "total_coin_out",
+    "total_cancelled_credits",
+    "total_jackpot",
+    "sm_total_dollar_value_of_bills",
+    "games_played",
+    "ticket_in_cashable_cents",
+    "ticket_in_cashable_count",
+    "ticket_out_cashable_cents",
+    "ticket_out_cashable_count",
+    "ticket_in_restricted_cents",
+    "ticket_in_restricted_count",
+    "ticket_out_restricted_cents",
+    "ticket_out_restricted_count",
+)
+
+_ALL_GROUPED_METER_COLUMNS = (
     METER_FIELDS
     + TICKET_METER_COLUMNS
     + LP19_METER_COLUMNS
@@ -427,6 +455,12 @@ ALL_METER_FIELDS = (
     + tuple(SINGLE_METER_COLUMNS.values())
     + TABLE_C7_EXTENDED_COLUMNS
     + VALIDATION_METER_COLUMNS_FLAT
+)
+assert set(PRIORITY_METER_COLUMNS) <= set(_ALL_GROUPED_METER_COLUMNS), (
+    "PRIORITY_METER_COLUMNS can only reorder columns that already exist above"
+)
+ALL_METER_FIELDS = PRIORITY_METER_COLUMNS + tuple(
+    f for f in _ALL_GROUPED_METER_COLUMNS if f not in PRIORITY_METER_COLUMNS
 )
 DECREASE_CHECK_FIELDS = tuple(f for f in ALL_METER_FIELDS if f not in GAUGE_METER_FIELDS)
 

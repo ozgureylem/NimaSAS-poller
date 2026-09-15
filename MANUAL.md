@@ -926,19 +926,32 @@ A few decisions worth making deliberately, illustrated by
 CREATE TABLE IF NOT EXISTS meters_current (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     polled_at TEXT NOT NULL,
-    total_cancelled_credits INTEGER,
+    -- PRIORITY_METER_COLUMNS lead every other meter column, in this
+    -- exact order -- the meters actually watched day to day, ahead of
+    -- the long tail of redundant/secondary reads. Column *position*
+    -- only: none of these are new polls, they're the same LP 0x0F/0x20/
+    -- 0x2F fields TICKET_METER_COLUMNS etc. already read, just moved to
+    -- the front of the row.
     total_coin_in INTEGER,
     total_coin_out INTEGER,
-    total_drop INTEGER,
+    total_cancelled_credits INTEGER,
     total_jackpot INTEGER,
+    sm_total_dollar_value_of_bills INTEGER,
     games_played INTEGER,
     ticket_in_cashable_cents INTEGER,
     ticket_in_cashable_count INTEGER,
-    -- ... and north of 250 more meter columns, generated (not
+    ticket_out_cashable_cents INTEGER,
+    ticket_out_cashable_count INTEGER,
+    ticket_in_restricted_cents INTEGER,   -- "promo ticket in": SAS calls restricted tickets "promotional" (see ValidationType)
+    ticket_in_restricted_count INTEGER,
+    ticket_out_restricted_cents INTEGER,  -- "promo ticket out"
+    ticket_out_restricted_count INTEGER,
+    -- ... and north of 245 more meter columns, generated (not
     -- hand-typed) from ALL_METER_FIELDS in sql_poll_logger.py -- see
     -- that name for the full, current, authoritative list; this manual
     -- won't try to keep a duplicate of a list that size in sync by
-    -- hand. Covers every ticket meter (LP 0x2F), LP
+    -- hand. In their original relative order (unaffected by the
+    -- reordering above): the rest of LP 0x2F, LP
     -- 0x18/0x19/0x1C/0x1E/0x2D/0x4F, (unless --skip-last-accepted-bill-poll)
     -- LP 0x48, (unless --skip-full-meter-sweep) every other single-meter
     -- long poll this client implements, (unless --skip-table-c7-sweep)
@@ -949,7 +962,21 @@ CREATE TABLE IF NOT EXISTS meters_current (
     -- above through an entirely independent long poll.
     -- meters_history has the identical column set (same generation).
 );
+```
 
+**A word on column order and existing databases**: `CREATE TABLE IF NOT
+EXISTS` is exactly that — a no-op against a `gateway.sqlite3` file that
+already has a `meters_current`/`meters_history` table from before this
+reordering. SQLite doesn't reorder columns in place. If you have a
+database from an older version of this tool and want the new column
+order, that's a one-time manual migration (recreate the table, copy
+rows across by column name, not position) — nothing here does that for
+you automatically, deliberately, for the same reason this tool never
+deletes rows on its own (§6.3, `synced_at` discussion): schema
+migrations on a database something else may depend on are a decision
+for whoever owns that database, not this tool's to make silently.
+
+```sql
 CREATE TABLE IF NOT EXISTS poll_errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     occurred_at TEXT NOT NULL,
