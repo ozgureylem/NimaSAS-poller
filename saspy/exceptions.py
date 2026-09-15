@@ -48,6 +48,20 @@ class SASEncodingError(SASError):
     """
 
 
+class SASCommandNackedError(SASError):
+    """The gaming machine explicitly rejected a type S/M/G command (Table
+    7.4b's NACK: the address byte it returns is the polled address ORed
+    with 0x80) rather than failing to respond at all. The spec doesn't
+    say why beyond "the message CRC and data" being invalid -- an ACK
+    here only means the command was accepted, not that whatever it asked
+    for (e.g. a shutdown) has actually finished happening yet.
+    """
+
+    def __init__(self, address: int):
+        super().__init__(f"gaming machine at address 0x{address:02X} NACKed the command")
+        self.address = address
+
+
 class SASPortCapabilityError(SASError):
     """The underlying serial port/driver rejected something the wakeup-bit
     scheme needs (typically setting mark/space parity).

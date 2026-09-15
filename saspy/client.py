@@ -19,7 +19,7 @@ from . import models
 from .bcd import decode_bcd, encode_bcd
 from .binary import decode_binary_le, encode_binary_le
 from .constants import LONG_POLL_TYPES, METER_CODE_SIZES_BCD, SIMPLE_METER_WIDTH_BCD, LongPoll, PollType
-from .exceptions import SASEncodingError, SASError
+from .exceptions import SASAddressMismatchError, SASCommandNackedError, SASEncodingError, SASError
 from .framing import build_command, parse_response
 from .transport import SASTransport
 
@@ -40,6 +40,53 @@ class SASClient:
         """Send a general poll and return the raw exception code (0x00 = none)."""
         response = self.transport.general_poll(self.address, timeout=self.timeout)
         return response[0]
+
+    # -- Enable/disable (Table 7.4a/7.4b) -----------------------------------
+    # Only the two commands this project actually wants to send remotely
+    # (see MANUAL.md) -- every other §7.4 enable/disable long poll (sound,
+    # bill acceptor, maintenance mode, ...) is deliberately not implemented,
+    # not an oversight; _check_enable_disable_ack() below is written to be
+    # reusable if that scope ever changes, but nothing else calls it yet.
+
+    def send_shutdown(self) -> None:
+        """LP 0x01 (§7.4.1) -- makes the gaming machine unplayable ("lock
+        out play"). Not necessarily immediate on an active machine: per
+        §7.4.1 it first finishes the current game cycle (including any
+        double-up and pending bonus/handpay), then disables itself; an
+        idle machine disables immediately except for cash-out and
+        change/attendant. Returning normally only means the machine
+        *accepted* the command (Table 7.4b's ACK) -- not that it has
+        finished disabling itself yet. Raises SASCommandNackedError if
+        the machine rejects the command outright (bad CRC/data).
+        """
+        poll = LongPoll.SHUTDOWN
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=1, timeout=self.timeout)
+        self._check_enable_disable_ack(raw)
+
+    def send_startup(self) -> None:
+        """LP 0x02 (Table 7.4a/7.4b) -- re-enables a machine previously
+        disabled (by send_shutdown() or any other means). See
+        send_shutdown()'s docstring for the ACK/NACK semantics.
+        """
+        poll = LongPoll.STARTUP
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=1, timeout=self.timeout)
+        self._check_enable_disable_ack(raw)
+
+    def _check_enable_disable_ack(self, raw: bytes) -> None:
+        """Table 7.4b's response shape, shared by every §7.4 enable/disable
+        long poll: a bare single address byte, no command echo and no CRC
+        -- the polled address itself for ACK, or that same address ORed
+        with 0x80 for NACK. Distinct from a plain address mismatch (an
+        entirely different address responding, e.g. a bus/wiring fault),
+        which still raises SASAddressMismatchError.
+        """
+        responder = raw[0] & 0x7F
+        if responder != self.address:
+            raise SASAddressMismatchError(expected=self.address, actual=raw[0])
+        if raw[0] & 0x80:
+            raise SASCommandNackedError(self.address)
 
     # -- Single-meter reads (Table 7.1 / Appendix B) -------------------------
 

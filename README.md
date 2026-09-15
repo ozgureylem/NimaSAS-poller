@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 190 tests, all against fake serial ports; run them with
+- **`tests/`** — 197 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -81,6 +81,14 @@ cites the spec table it was built from, and `constants.py`'s module
 docstring explains the scope boundary below.
 
 - **General poll** (0x80/addr).
+- **Enable/disable** (0x01/0x02): remote shutdown ("lock out play") and
+  startup, the only command/control long polls this project wants to
+  send remotely — see "Deliberately not implemented" below for why
+  every other one (sound, bill acceptor, maintenance mode, ...) isn't
+  here. `send_shutdown()`/`send_startup()` raise `SASCommandNackedError`
+  if the machine rejects the command (Table 7.4b's NACK) rather than
+  returning silently — an ACK means only that the command was accepted,
+  not that a shutdown has actually finished happening on the machine yet.
 - **Meters**: core (0x0F, 0x19, 0x1C — see `constants.py` for why 0x1C
   isn't literally "11 through 15" despite an earlier misleading name),
   single-meter reads (0x10-0x18, 0x1A, 0x20, 0x2A-0x2C, bill/stacker
@@ -104,12 +112,13 @@ docstring explains the scope boundary below.
   (0x58), pending cashout info (0x57), cash-out ticket info (0x3D),
   handpay information (0x1B).
 
-**Deliberately not implemented**, and why: pure command/control polls
-with no data to pull (shutdown, sound on/off, bill acceptor enable/
-disable, maintenance mode, delay game, enable/disable game, remote
-handpay reset, jackpot-reset-method/auto-rebet enable, receive-progressive/
-date-time/ticket-data setters) — a distinct, lower-priority piece of work
-from "can't pull some data" if you need it later. Progressive jackpots,
+**Deliberately not implemented**, and why: every other command/control
+poll (sound on/off, bill acceptor enable/disable, maintenance mode,
+delay game, enable/disable game, remote handpay reset, jackpot-reset-
+method/auto-rebet enable, receive-progressive/date-time/ticket-data
+setters) — a scope decision, not an oversight: this project explicitly
+does not want to override machine setup remotely beyond the enable/
+disable pair above. Progressive jackpots,
 tournament mode, legacy bonusing, and card/reel-stop data — out of this
 project's stated TITO/AFT/meters scope; long poll 0x8B (multiplied
 jackpots) specifically because the spec itself recommends against

@@ -7,15 +7,20 @@ review.
 
 Coverage scope, as of the pass that closed out Appendix B (Table B-1 —
 the spec's own complete long-poll list) against this module: every
-data-returning long poll relevant to a TITO/AFT/meters gateway is here.
-Deliberately not implemented: pure command/control polls with no data to
-pull (shutdown, sound on/off, bill acceptor enable/disable, maintenance
-mode, and similar — see the public repo's README for the full list) as a
-distinct, lower-priority piece of work; progressive/tournament/legacy-
-bonus/card-reel-stop data as out of this project's stated scope; long
-poll 0x8B specifically because the spec itself recommends against
-implementing it (multiplied jackpots). Component authentication (0x6E)
-and the multi-denom preamble (0xB0) are real gaps, not scoped out.
+data-returning long poll relevant to a TITO/AFT/meters gateway is here,
+plus the two command/control long polls this project actually wants to
+send remotely — SHUTDOWN (0x01) and STARTUP (0x02), i.e. remote
+enable/disable of the machine, server-to-gateway-to-machine. Every
+other pure command/control poll with no data to pull (sound on/off,
+bill acceptor enable/disable, maintenance mode, and similar — see the
+public repo's README for the full list) is deliberately not
+implemented — a scope decision, not an oversight: this project
+explicitly does not want to override machine setup remotely beyond
+enable/disable. progressive/tournament/legacy-bonus/card-reel-stop
+data is out of this project's stated scope; long poll 0x8B
+specifically because the spec itself recommends against implementing
+it (multiplied jackpots). Component authentication (0x6E) and the
+multi-denom preamble (0xB0) are real gaps, not scoped out.
 """
 
 from __future__ import annotations

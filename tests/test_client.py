@@ -19,7 +19,7 @@ from saspy.binary import encode_binary_le
 from saspy.client import SASClient
 from saspy.constants import LongPoll, MeterCode
 from saspy.crc import crc16_bytes
-from saspy.exceptions import SASEncodingError, SASError
+from saspy.exceptions import SASAddressMismatchError, SASCommandNackedError, SASEncodingError, SASError
 from saspy.transport import SASTransport
 
 ADDRESS = 0x01
@@ -56,6 +56,41 @@ def test_general_poll_returns_exception_code():
     transport = SASTransport(FakeSerial(bytes([0x00])))
     client = SASClient(transport, ADDRESS)
     assert client.general_poll() == 0x00
+
+
+# -- Enable/disable (0x01/0x02, Table 7.4a/7.4b) -----------------------------
+
+
+def test_send_shutdown_acked_returns_none():
+    # make_client() appends a CRC that exchange_fixed(response_length=1)
+    # never reads -- Table 7.4b's response is a bare address byte, no CRC.
+    assert make_client(bytes([ADDRESS])).send_shutdown() is None
+
+
+def test_send_startup_acked_returns_none():
+    assert make_client(bytes([ADDRESS])).send_startup() is None
+
+
+def test_send_shutdown_nacked_raises():
+    with pytest.raises(SASCommandNackedError) as exc_info:
+        make_client(bytes([ADDRESS | 0x80])).send_shutdown()
+    assert exc_info.value.address == ADDRESS
+
+
+def test_send_startup_nacked_raises():
+    with pytest.raises(SASCommandNackedError) as exc_info:
+        make_client(bytes([ADDRESS | 0x80])).send_startup()
+    assert exc_info.value.address == ADDRESS
+
+
+def test_send_shutdown_wrong_address_raises_address_mismatch_not_nack():
+    """A different address entirely responding (bus contention, wiring
+    fault) is a distinct failure from a NACK from *this* machine -- it
+    must not be misread as either an ACK or a NACK for our own address.
+    """
+    other_address = 0x02
+    with pytest.raises(SASAddressMismatchError):
+        make_client(bytes([other_address])).send_shutdown()
 
 
 def test_send_meters_10_through_15():
