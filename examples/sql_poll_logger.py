@@ -77,19 +77,19 @@ What each cycle does, in order:
    chunks 2..13 with chunk 1's data — wrong values in the right columns,
    with nothing raising an error.
 
-   UNRESOLVED, and worth knowing before trusting a long run: two other
-   places here still issue the same command byte back-to-back, and SAS
-   offers no alternate code for either. The validation-meters sweep
-   sends LP 0x50 once per validation type (12 in a row, differing only
-   in their data byte), and _drain_ticket_out_history() sends LP 0x4D
-   with function code 0x00 repeatedly until the buffer reports empty.
-   The 0x4D case is probably fine by construction — "next unread, mark
-   as read" is designed to be called repeatedly, so consecutive polls
-   must advance or draining could never work at all — but that is an
-   inference, not something the spec states. Whether real machines
-   discriminate on the full request or only the command byte is a
-   hardware question; the fact that IGT had to add 0xAF at all suggests
-   at least some key on the command byte alone.
+   Two other places here issue the same command byte back-to-back, and
+   SAS offers no alternate code for either: the validation-meters sweep
+   (LP 0x50, 12 in a row, differing only in their data byte) and
+   _drain_ticket_out_history() (LP 0x4D, function code 0x00, repeated
+   until the buffer reports empty). Both are very probably fine. IGT's
+   own tooling ships a meter script firing 41 consecutive LP 0x52 polls
+   (sastest.ini [Meter Test]), which would be useless if machines
+   re-sent the first response to every one of them; and LP 0x4D's
+   "next unread, mark as read" is *designed* for repeated calls, so
+   consecutive polls must advance or draining could never work at all.
+   Neither is a spec guarantee, so both are worth an eye on real
+   hardware — but neither is a known defect, and neither warrants
+   restructuring the poll loop on inference.
    Several of these deliberately overlap: LP 0x19/0x1C, most of the
    single-meter sweep, and a good part of the Table C-7 sweep, report
    counters LP 0x0F already reports, through entirely independent
@@ -1234,13 +1234,24 @@ def _poll_all_meters(
             # the 6.00 revision note "Added long poll AF as alternate 6F
             # meter poll, to allow consecutive meter polls").
             #
-            # This is not cosmetic. Per Table 3.1 a long poll is implicitly
-            # ACKed only by a general poll or "a long poll with a different
-            # command byte"; §3.2 makes a repeated identical poll an implied
-            # NACK, meaning "re-send the information you just sent". Sending
-            # 0x6F 13 times in a row would invite a compliant machine to
-            # answer chunks 2..13 with chunk 1's response -- wrong meter
-            # values written to the right columns, with no error anywhere.
+            # Why bother: per Table 3.1 a long poll is implicitly ACKed only
+            # by a general poll or "a long poll with a different command
+            # byte", and §3.2 makes a repeated identical poll an implied
+            # NACK meaning "re-send the information you just sent".
+            #
+            # Calibrate that risk honestly, though. IGT's own test tool ships
+            # a canned meter script (sastest.ini [Meter Test]) that fires 41
+            # consecutive LP 0x52 polls differing only in their game-number
+            # data -- so real machines evidently tolerate same-command-byte
+            # runs, or that script would return game 0's meters 41 times and
+            # be useless. The honest reading is that 0xAF exists because 0x6F
+            # is the one poll *designed* for automated back-to-back use (12
+            # meters per poll, ~13 polls to cover Table C-7), not because
+            # consecutive polls are broadly unsafe.
+            #
+            # Alternating costs nothing and is exactly what the spec provides
+            # 0xAF for, so it stays -- but treat it as cheap insurance, not
+            # as a bug being patched.
             alternate = chunk_num % 2 == 0
             fn = client.send_extended_meters_alternate if alternate else client.send_extended_meters
             result = poll(

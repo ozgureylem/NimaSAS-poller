@@ -692,15 +692,17 @@ def test_table_c7_sweep_meter_unsupported_by_the_machine_is_null_not_a_crash():
 def test_table_c7_sweep_alternates_6f_and_af_between_consecutive_chunks():
     """SAS implicitly ACKs a long poll with "a general poll or a long poll
     with a different command byte" (Table 3.1); a *repeated* identical poll
-    is an implied NACK meaning "re-send what you just sent" (3.2). Sending
-    0x6F for all 13 chunks would therefore invite a compliant machine to
-    answer chunks 2..13 with chunk 1's response -- wrong values in the
-    right columns, with no error raised anywhere.
+    is an implied NACK meaning "re-send what you just sent" (3.2). 0xAF
+    reaches identical meter data to 0x6F and exists precisely so a host can
+    alternate: 7.21 provides it "to allow a host to perform consecutive
+    meter polls and still provide a proper implied acknowledgement", and
+    the spec's 6.00 revision note says the same in one line.
 
-    0xAF exists for exactly this: 7.21 says the two codes reach identical
-    meter data and the second is provided "to allow a host to perform
-    consecutive meter polls and still provide a proper implied
-    acknowledgement", and the spec's own 6.00 revision note says the same.
+    Calibration, so this test isn't read as guarding against a known
+    failure: IGT's own tooling fires 41 consecutive LP 0x52 polls in its
+    canned meter script, so machines clearly tolerate same-command runs in
+    practice. Alternating is cheap insurance on the one poll the spec
+    singled out for automated back-to-back use, not a patched bug.
     """
     conn = make_db()
     clock = FakeClock()
