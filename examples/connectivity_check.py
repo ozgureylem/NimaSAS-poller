@@ -32,8 +32,14 @@ from __future__ import annotations
 import argparse
 import sys
 
+from pathlib import Path
+
+# Run from a clone without installing: examples are the first thing anyone
+# tries at a machine, and "pip install -e ." is an easy step to skip.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from saspy.client import SASClient
-from saspy.exceptions import SASError
+from saspy.exceptions import SASError, SASPortCapabilityError
 from saspy.serial_port import open_serial_port
 from saspy.transport import SASTransport
 
@@ -105,21 +111,58 @@ def main() -> int:
     args = parser.parse_args()
 
     print(f"Opening {args.port} at {args.baud} baud...")
-    serial_port = open_serial_port(args.port, baudrate=args.baud)
+    try:
+        serial_port = open_serial_port(args.port, baudrate=args.baud)
+    except SASPortCapabilityError as e:
+        # The adapter cannot carry SAS's wakeup bit. Say so plainly: this
+        # is the one failure that otherwise looks exactly like a machine
+        # that isn't answering, and this script is where people start.
+        print(f"\n{e}", file=sys.stderr)
+        return 2
+    except Exception as e:  # noqa: BLE001 - a bad port name must not print a traceback
+        print(f"\nCould not open {args.port}: {e}", file=sys.stderr)
+        print(
+            "\nCheck the device path and that the adapter is plugged in. On Linux, "
+            "a permission error usually means your user is not in the 'dialout' group. "
+            "'python3 examples/poll_test_tool.py --list-ports' lists what this machine can see.",
+            file=sys.stderr,
+        )
+        return 2
     transport = SASTransport(serial_port, byte_timeout=args.timeout)
     client = SASClient(transport, args.address, timeout=args.timeout)
 
     got_response = False
+    parity_failed = False
     for attempt in range(1, args.cycles + 1):
         print(f"General poll #{attempt} to address {args.address}...", end=" ")
         try:
             exception_code = client.general_poll()
+        except SASPortCapabilityError as e:
+            # Some drivers accept the parity setting at open and only fail
+            # when it is actually toggled, so this can still turn up here.
+            parity_failed = True
+            print(f"no response ({e})")
+            continue
         except SASError as e:
             print(f"no response ({e})")
             continue
         print(f"got exception code 0x{exception_code:02X}")
         got_response = True
         break
+
+    if not got_response and parity_failed:
+        # Do not send someone to check wiring and addresses when the port
+        # itself refused to carry the wakeup bit: nothing downstream of
+        # this can work, and both of those are red herrings.
+        print(
+            f"\nNo response from address {args.address}, and the port failed to set "
+            "mark/space parity during the attempt. That is the fault to fix first: "
+            "SAS marks the first byte of every message with the wakeup bit, and this "
+            "adapter or driver cannot produce it. Wiring, baud rate and the SAS "
+            "address are not the problem here. Try a different adapter.",
+            file=sys.stderr,
+        )
+        return 2
 
     if not got_response:
         print(

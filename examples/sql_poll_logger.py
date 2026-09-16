@@ -262,7 +262,14 @@ import sys
 import time
 from dataclasses import dataclass
 
+from pathlib import Path
+
+# Run from a clone without installing: examples are the first thing anyone
+# tries at a machine, and "pip install -e ." is an easy step to skip.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from saspy.config import connect_from_config
+from saspy.exceptions import SASPortCapabilityError
 from saspy.constants import SIMPLE_METER_WIDTH_BCD, ExceptionCode, LongPoll, MeterCode, ValidationType
 from saspy.exceptions import SASError
 from saspy.models import EnhancedValidationInfo
@@ -1669,7 +1676,23 @@ def main() -> int:
     )
     state = PollState()
 
-    client = connect_from_config(args.config)
+    try:
+        client = connect_from_config(args.config)
+    except SASPortCapabilityError as e:
+        # Worth failing loudly at startup rather than logging endless
+        # timeouts into the database: the adapter cannot carry SAS's
+        # wakeup bit, so no poll will ever succeed on this port.
+        print(f"\n{e}", file=sys.stderr)
+        return 2
+    except Exception as e:  # noqa: BLE001 - a bad port/config must not print a traceback
+        print(f"\nCould not open the serial port from {args.config}: {e}", file=sys.stderr)
+        print(
+            "\nCheck the port name in the config file, that the adapter is plugged in, "
+            "and that nothing else already holds the port (this client opens it "
+            "exclusively, so a second poller or poll_test_tool.py will block it).",
+            file=sys.stderr,
+        )
+        return 2
     conn = sqlite3.connect(args.db)
     conn.executescript(SCHEMA)
     conn.commit()
@@ -1723,6 +1746,28 @@ def main() -> int:
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nStopped.")
+    except Exception as e:  # noqa: BLE001 - see below; must not end as a traceback
+        # A USB-serial adapter that re-enumerates mid-run (unplugged,
+        # power-saved, or a flaky cable) raises out of pyserial, not as a
+        # SASError, so it lands here rather than being absorbed as a
+        # failed poll. There is deliberately no reconnect loop: silently
+        # reopening a port hides a physical fault that someone should be
+        # told about, and reopening the WRONG device after a re-enumeration
+        # (ttyUSB0 coming back as ttyUSB1, with another machine's adapter
+        # now on ttyUSB0) would log one machine's meters under another's
+        # name. Exiting non-zero hands recovery to a process supervisor,
+        # which restarts from the config and so re-resolves the port by
+        # name. Everything already committed to SQLite is safe; the
+        # finally-block close below still runs.
+        print(f"\nPolling stopped: {type(e).__name__}: {e}", file=sys.stderr)
+        print(
+            "\nThe serial port failed mid-run. The usual cause is the adapter "
+            "disconnecting or re-enumerating. Data already written to the database "
+            "is intact. Run this under a supervisor (systemd 'Restart=always') so a "
+            "gateway recovers on its own — see MANUAL.md §4.6.",
+            file=sys.stderr,
+        )
+        return 3
     finally:
         conn.close()
     return 0

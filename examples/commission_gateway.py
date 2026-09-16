@@ -22,6 +22,12 @@ from __future__ import annotations
 import argparse
 import sys
 
+from pathlib import Path
+
+# Run from a clone without installing: examples are the first thing anyone
+# tries at a machine, and "pip install -e ." is an easy step to skip.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from saspy.client import SASClient
 from saspy.config import DEFAULT_BAUDRATE, GatewayConfig, save_config
 from saspy.exceptions import SASError

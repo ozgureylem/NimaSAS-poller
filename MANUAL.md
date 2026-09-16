@@ -820,6 +820,60 @@ columns refreshed every cycle or can live with them stale/`NULL`.
 
 ---
 
+### 4.6 Running it on a gateway (exit codes and restarts)
+
+This script is a foreground program, not a daemon. On a real gateway,
+run it under a process supervisor and let the supervisor own restarts.
+
+| Exit code | Meaning | What a supervisor should do |
+|---|---|---|
+| 0 | Finished the requested cycles, or Ctrl-C | Nothing |
+| 2 | The serial port could not be opened at startup | Restart with backoff; alert if it keeps failing — this is usually a wrong port name, a missing adapter, or a permissions problem, none of which fix themselves |
+| 3 | The serial port failed **mid-run** | Restart |
+
+Exit 3 is the one worth understanding, because it is the normal
+consequence of a USB-serial adapter re-enumerating — unplugged, cable
+flexed, or the host power-saving the port. pyserial raises out of the
+read, which is not a `SASError`, so the poller treats it as fatal rather
+than as a failed poll and stops.
+
+**Why there is no built-in reconnect loop**, given that one would be a
+few lines: reopening the port automatically would paper over a physical
+fault that somebody should be told about, and — the part that actually
+decides it — a re-enumeration can change the device name. If
+`/dev/ttyUSB0` disappears and comes back as `/dev/ttyUSB1`, a blind
+reopen of `ttyUSB0` may attach to a *different machine's* adapter, and
+this program would then write one EGM's meters under another's identity.
+That is a data-integrity failure, and a quiet one. Exiting and letting a
+supervisor restart from the config file re-resolves the port by name
+every time, which is the behaviour you want.
+
+Anything already committed to SQLite is safe across all of this; the
+database is closed cleanly on every exit path above.
+
+For a stable device name that survives re-enumeration, bind the adapter
+by its serial number with a udev rule and point the config at that:
+
+```
+# /etc/udev/rules.d/99-nimasas.rules
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{serial}=="AB0KXYZW", SYMLINK+="ttySAS0"
+```
+
+A minimal unit:
+
+```ini
+# /etc/systemd/system/nimasas-poller.service
+[Service]
+ExecStart=/opt/nimasas/.venv/bin/python /opt/nimasas/examples/sql_poll_logger.py /etc/nimasas/gateway.ini
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+```
+
+`Restart=always` rather than `on-failure` so a clean stop is also
+restarted; use `on-failure` if you want Ctrl-C/exit-0 to stay stopped.
+
 ## 5. `saspy` — the library itself
 
 ### 5.1 What it's for, in plain terms
@@ -901,7 +955,9 @@ a data byte. `SASTransport.write_with_wakeup()` handles this for you;
 you never need to touch parity settings directly through the normal
 `SASClient` API. The one thing worth knowing: this requires a serial
 port/driver that actually supports mark/space parity. Most real
-USB-to-RS232 and RS485 adapters do; some virtual or exotic ports don't.
+USB-to-RS232 and RS485 adapters do; some virtual or exotic ports don't,
+and a port that can't is checked for at open rather than at first write
+— see §5.5, including the case that check cannot detect.
 
 ### 5.5 `SASPortCapabilityError`
 
@@ -913,6 +969,29 @@ mark/space parity — this is a hardware/driver limitation, not a bug to
 patch around in your polling code. Try a different adapter, or confirm
 with your adapter's documentation that RS485/RS232 parity control is
 actually supported.
+
+`open_serial_port()` probes this **at open time** rather than waiting
+for the first write, so the error names the adapter instead of arriving
+mid-poll disguised as silence. That distinction is worth the paragraph:
+an adapter that cannot carry the wakeup bit produces timeouts, and
+timeouts read as "wrong address" or "bad wiring" — the two things
+everyone checks first, and neither of which is wrong. Every tool in
+`examples/` inherits the earlier, accurate failure for free.
+
+**What the probe cannot tell you.** It catches a driver that *refuses*
+mark/space parity. It cannot catch one that accepts the setting and then
+ignores it — Linux ptys do exactly this, and some USB bridges do too.
+No software on the host side can distinguish that from a working port;
+confirming the 9th bit is physically on the wire takes a second listener
+or a scope. So read a clean open as "the driver did not refuse", not as
+"the wakeup bit is reaching the machine". If polls still time out with
+the address and wiring confirmed, the adapter is still a suspect, and
+the fastest way to settle it is a known-good adapter.
+
+A loopback or simulator rig (a pty pair, for instance) can opt out with
+`open_serial_port(..., require_wakeup_capability=False)`. That is for
+bench harnesses only — against a real machine the probe is the thing
+standing between you and an afternoon of chasing the wrong fault.
 
 ### 5.6 What's implemented vs. not, and multi-version SAS
 

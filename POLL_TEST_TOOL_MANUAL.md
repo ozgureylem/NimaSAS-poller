@@ -233,7 +233,8 @@ What makes a finding useful: the machine make/model, its SAS version
 | Symptom | Cause |
 |---|---|
 | `Could not exclusively lock port` | Something else holds the port — usually `sql_poll_logger.py` or another copy of this tool. Stop it first. |
-| `The driver rejected the port settings` | The adapter cannot do mark/space parity, which SAS needs for the wakeup bit. Some USB adapters cannot; a virtual tty never can. Try a different adapter, or `--simulate`. |
+| `cannot set mark/space parity` at open | The adapter's driver refuses the mark/space parity SAS needs for the wakeup bit. Some USB bridges cannot do it; a virtual tty never can. Not wiring, baud or address. Try a different adapter, or `--simulate`. |
+| Everything times out, but the port opened cleanly | A clean open only means the driver did not *refuse* mark/space parity. Some drivers accept it and silently ignore it, and nothing on this side of the wire can tell that apart from a working port. So the adapter is not cleared — if address and wiring check out, suspect it next, and confirm with a known-good adapter. |
 | Everything times out | Wrong address is by far the most common cause. Then baud, then wiring. `connectivity_check.py` isolates this faster. |
 | One poll times out, others answer | That machine probably does not implement it (§4.4). A real finding, not a fault. |
 | UI unreachable from the laptop | Started without `--bind 0.0.0.0`, or a firewall on the gateway. |
