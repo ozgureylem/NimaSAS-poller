@@ -114,6 +114,15 @@ class SASTransport:
         keep working perfectly. Draining first makes the ordering explicit
         instead of leaving it to the scheduler.
 
+        Deliberately scoped to multi-byte frames only. A single-byte
+        general poll leaves parity at MARK, so the next one issues no
+        tcsetattr before its write at all -- and that exact path is what
+        real machines have already answered. Restoring SPACE after every
+        frame is tidier and was tried; it puts a port reconfiguration
+        immediately before every general poll, on the one path that was
+        known good. See examples/wakeup_probe.py, which measures whether
+        a tcsetattr before a write costs this machine the byte.
+
         Note this cannot be caught by a fake serial port (an attribute
         assignment has no timing) nor by a pty (which accepts parity and
         ignores it). It needs either a drain or real hardware with a
@@ -124,15 +133,17 @@ class SASTransport:
         try:
             self._serial.parity = PARITY_MARK
             self._serial.write(frame[:1])
-            self._drain()  # the wakeup byte must be on the wire before parity moves
-            # Safe to lower now, and it restores the documented invariant
-            # that the port sits at SPACE between frames -- pyserial skips
-            # the tcsetattr entirely when the value is unchanged.
-            self._serial.parity = PARITY_SPACE
             if len(frame) > 1:
+                # The ONLY place the race lives. Draining here keeps the
+                # single-byte path (every general poll) byte-for-byte
+                # identical to what real machines have already answered
+                # 60/60 -- in steady state parity is already MARK, so
+                # pyserial issues no tcsetattr at all before the write.
+                self._drain()
+                self._serial.parity = PARITY_SPACE
                 self._serial.write(frame[1:])
-                # Drain the tail too, so the NEXT frame raising parity to
-                # MARK cannot catch these bytes still queued and stamp a
+                # Drain the tail so the NEXT frame raising parity to MARK
+                # cannot catch these bytes still queued and stamp a
                 # spurious message start on them.
                 self._drain()
         except Exception as e:

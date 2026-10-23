@@ -53,6 +53,17 @@ step-by-step guide to structuring a local SQL layer around a poller.
   ```
   python3 examples/wire_diagnostics.py /dev/ttyS0 --address 1
   ```
+- **`examples/wakeup_probe.py`** — read-only follow-up for when a bare
+  general poll gets no answer but one preceded by a `0x80` does. Changing
+  parity calls `tcsetattr` with `TCSANOW`, which reconfigures the port
+  immediately, so a byte written straight afterwards may be the one that
+  gets damaged — meaning a leading `0x80` can work by absorbing that
+  damage rather than by being a sync. The two explanations lead to
+  opposite fixes, so this measures which one holds: it polls with parity
+  set once and never touched again, which only succeeds under the second.
+  ```
+  python3 examples/wakeup_probe.py /dev/ttyS0 --address 1
+  ```
 - **`examples/poll_test_tool.py`** — a bench tool for trying long polls
   against a real EGM and watching what comes back. Serves a small local
   web UI: one panel lists every long poll this client implements, tagged

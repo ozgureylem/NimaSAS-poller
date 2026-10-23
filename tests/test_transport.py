@@ -155,6 +155,7 @@ class RacyFakeSerial:
         self._pending = []
         self.on_wire = []  # (byte, parity it was actually transmitted with)
         self.to_read = b""
+        self.reconfigs = 0  # tcsetattr calls that actually changed the line
 
     @property
     def parity(self):
@@ -162,6 +163,9 @@ class RacyFakeSerial:
 
     @parity.setter
     def parity(self, value):
+        if value == self._parity:
+            return  # pyserial issues no tcsetattr when nothing changed
+        self.reconfigs += 1
         # TCSANOW: the new setting catches anything not yet shifted out.
         self._pending = [(b, value) for b, _ in self._pending]
         self._parity = value
@@ -171,6 +175,11 @@ class RacyFakeSerial:
         return len(data)
 
     def flush(self) -> None:
+        self.settle()
+
+    def settle(self) -> None:
+        """Bytes reach the wire, stamped with the parity in force now --
+        by a drain, or just by time passing between polls."""
         self.on_wire.extend(self._pending)
         self._pending.clear()
 
@@ -211,18 +220,31 @@ def test_frame_tail_cannot_be_restamped_by_the_next_frame():
     transport = SASTransport(fake)
     transport.write_with_wakeup(bytes([0x01, 0x3D]))
     transport.write_with_wakeup(bytes([0x81]))
+    fake.settle()
 
     assert fake.on_wire == [(0x01, "M"), (0x3D, "S"), (0x81, "M")]
 
 
-def test_port_is_left_at_space_between_frames():
-    """serial_port.open_serial_port documents that the port sits at SPACE
-    between frames. A single-byte frame used to leave it at MARK, so two
-    consecutive general polls put the wakeup bit on both bytes with no
-    SPACE transition between them.
+def test_single_byte_frames_leave_parity_at_mark_on_purpose():
+    """Deliberate, and the opposite of tidy.
+
+    A general poll is one byte, so nothing has to lower parity afterwards.
+    Leaving it at MARK means the next general poll's ``parity = MARK`` is
+    a no-op and pyserial issues no tcsetattr at all -- the write goes out
+    with no port reconfiguration anywhere near it. That is the exact path
+    real machines have already answered 60/60, so it is pinned here.
+
+    Restoring SPACE after every frame reads better and was tried. It puts
+    a reconfiguration immediately before every general poll, which is a
+    change to the one path known to work; examples/wakeup_probe.py exists
+    to measure whether a machine can tell the difference.
     """
     fake = RacyFakeSerial()
-    SASTransport(fake).write_with_wakeup(bytes([0x81]))
+    transport = SASTransport(fake)
+    transport.write_with_wakeup(bytes([0x81]))
+    transport.write_with_wakeup(bytes([0x81]))
+    fake.settle()
 
-    assert fake.on_wire == [(0x81, "M")]
-    assert fake.parity == "S"
+    assert fake.parity == "M"
+    assert fake.reconfigs == 1, "only the first poll may reconfigure the port"
+    assert fake.on_wire == [(0x81, "M"), (0x81, "M")]

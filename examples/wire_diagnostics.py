@@ -92,9 +92,14 @@ def main() -> int:
     print(f"   {baseline}/{n} replies\n")
 
     if baseline == 0:
-        print("Nothing answered a plain general poll. Fix that before "
-              "interpreting anything else: wrong address is the usual cause.")
-        return 1
+        # Deliberately NOT a bail-out. A zero here is a finding, and the
+        # conditions below are what explain it -- stopping would throw away
+        # the comparison that makes the zero mean something. The only case
+        # worth aborting on is a bus where nothing works at all, and B
+        # will show that just as clearly.
+        print("   Nothing answered a bare general poll. That is a result, not")
+        print("   a dead end -- continuing, because B and C are what explain it.")
+        print("   (If B is also 0/30, suspect the address before anything else.)\n")
 
     # --- B: does the sync byte earn its place? -------------------------
     print("B. 0x80 sync before each poll, by gap")
