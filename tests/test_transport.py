@@ -59,14 +59,14 @@ class ParityRejectingSerial(FakeSerial):
 
 def test_write_with_wakeup_wraps_parity_failure():
     fake = ParityRejectingSerial()
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     with pytest.raises(SASPortCapabilityError):
         transport.write_with_wakeup(bytes([0x81]))
 
 
 def test_write_with_wakeup_sets_mark_parity_on_first_byte_only():
     fake = FakeSerial()
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     transport.write_with_wakeup(bytes([0x81, 0x02, 0x03]))
     assert fake.written[0] == (bytes([0x81]), PARITY_MARK)
     assert fake.written[1] == (bytes([0x02, 0x03]), PARITY_SPACE)
@@ -74,21 +74,21 @@ def test_write_with_wakeup_sets_mark_parity_on_first_byte_only():
 
 def test_write_with_wakeup_single_byte():
     fake = FakeSerial()
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     transport.write_with_wakeup(bytes([0x81]))
     assert fake.written == [(bytes([0x81]), PARITY_MARK)]
 
 
 def test_exchange_fixed_reads_exact_length():
     fake = FakeSerial(response=bytes(range(5)))
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     result = transport.exchange_fixed(bytes([0x01, 0x1F]), response_length=5, timeout=1.0)
     assert result == bytes(range(5))
 
 
 def test_exchange_fixed_times_out_on_silence():
     fake = FakeSerial(response=b"")
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     with pytest.raises(SASTimeoutError):
         transport.exchange_fixed(bytes([0x01, 0x1F]), response_length=5, timeout=0.05)
 
@@ -97,14 +97,14 @@ def test_exchange_length_prefixed_reads_header_then_body():
     # address, command, length=3, three data bytes, two CRC bytes
     response = bytes([0x01, 0x73, 0x03, 0xAA, 0xBB, 0xCC, 0x00, 0x00])
     fake = FakeSerial(response=response)
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     result = transport.exchange_length_prefixed(bytes([0x01, 0x73]), timeout=1.0)
     assert result == response
 
 
 def test_general_poll_reads_single_byte():
     fake = FakeSerial(response=bytes([0x00]))
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     result = transport.general_poll(0x01, timeout=1.0)
     assert result == bytes([0x00])
     # general poll writes address ORed with 0x80, wakeup bit set
@@ -117,7 +117,7 @@ def test_concurrent_exchanges_do_not_interleave():
     scheduler rule (an in-flight poll is never interrupted).
     """
     fake = FakeSerial(response=bytes([0xAA]) * 100, response_delay=0.02)
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     results = []
 
     def worker(tag: bytes):
@@ -203,7 +203,7 @@ def test_wakeup_bit_survives_a_multi_byte_frame():
     after them.
     """
     fake = RacyFakeSerial()
-    SASTransport(fake).write_with_wakeup(bytes([0x01, 0x3D]))
+    SASTransport(fake, wake_byte=None).write_with_wakeup(bytes([0x01, 0x3D]))
 
     assert fake.on_wire[0] == (0x01, "M"), (
         "first byte must reach the wire with MARK parity -- the wakeup bit"
@@ -217,7 +217,7 @@ def test_frame_tail_cannot_be_restamped_by_the_next_frame():
     starts. Draining the tail is what prevents it.
     """
     fake = RacyFakeSerial()
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     transport.write_with_wakeup(bytes([0x01, 0x3D]))
     transport.write_with_wakeup(bytes([0x81]))
     fake.settle()
@@ -240,7 +240,7 @@ def test_single_byte_frames_leave_parity_at_mark_on_purpose():
     to measure whether a machine can tell the difference.
     """
     fake = RacyFakeSerial()
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     transport.write_with_wakeup(bytes([0x81]))
     transport.write_with_wakeup(bytes([0x81]))
     fake.settle()
@@ -248,3 +248,60 @@ def test_single_byte_frames_leave_parity_at_mark_on_purpose():
     assert fake.parity == "M"
     assert fake.reconfigs == 1, "only the first poll may reconfigure the port"
     assert fake.on_wire == [(0x81, "M"), (0x81, "M")]
+
+
+class WakeFake(RacyFakeSerial):
+    """RacyFakeSerial plus a record of input flushes, so a test can check
+    that a reply drawn by the wake byte is discarded before the real
+    message goes out."""
+
+    def __init__(self):
+        super().__init__()
+        self.flushes_at = []
+
+    def reset_input_buffer(self) -> None:
+        self.flushes_at.append(len(self._pending) + len(self.on_wire))
+
+
+def test_wake_byte_precedes_a_message_and_its_reply_is_discarded():
+    """Measured on an EGT machine: a poll after ~500ms idle was answered
+    0/20; the identical poll preceded by 0x80 and 5ms was answered 20/20.
+    The flush matters as much as the byte -- callers flush input before
+    writing, so a reply the wake byte draws would otherwise be read back
+    as the answer to the real message.
+    """
+    fake = WakeFake()
+    SASTransport(fake, wake_gap=0).write_with_wakeup(bytes([0x81]))
+    fake.settle()
+
+    assert [b for b, _p in fake.on_wire] == [0x80, 0x81]
+    assert fake.flushes_at, "the wake byte's reply must be flushed away"
+
+
+def test_wake_byte_is_optional():
+    """A link that does not need it must be able to send pure SAS, and the
+    protocol tests themselves rely on this.
+    """
+    fake = WakeFake()
+    SASTransport(fake, wake_byte=None).write_with_wakeup(bytes([0x81]))
+    fake.settle()
+
+    assert [b for b, _p in fake.on_wire] == [0x81]
+
+
+def test_wake_byte_can_be_skipped_while_the_line_is_still_warm():
+    """If the loss really is "first byte after idle", back-to-back
+    exchanges need no wake byte, and a meter sweep is dozens of exchanges
+    in a row. The threshold is per-machine, so the default stays 0.0 --
+    send it every time, the configuration actually measured at 20/20 --
+    until examples/preamble_probe.py has established one.
+    """
+    fake = WakeFake()
+    transport = SASTransport(fake, wake_gap=0, wake_after_idle=60.0)
+    transport.write_with_wakeup(bytes([0x81]))
+    transport.write_with_wakeup(bytes([0x81]))
+    fake.settle()
+
+    assert [b for b, _p in fake.on_wire] == [0x80, 0x81, 0x81], (
+        "only the first message should carry a wake byte"
+    )

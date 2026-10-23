@@ -48,12 +48,12 @@ class FakeSerial:
 def make_client(response_body: bytes) -> SASClient:
     """``response_body`` is address..data (no CRC) — the CRC is appended here."""
     full_response = response_body + crc16_bytes(response_body)
-    transport = SASTransport(FakeSerial(full_response))
+    transport = SASTransport(FakeSerial(full_response), wake_byte=None)
     return SASClient(transport, ADDRESS, timeout=1.0)
 
 
 def test_general_poll_returns_exception_code():
-    transport = SASTransport(FakeSerial(bytes([0x00])))
+    transport = SASTransport(FakeSerial(bytes([0x00])), wake_byte=None)
     client = SASClient(transport, ADDRESS)
     assert client.general_poll() == 0x00
 
@@ -256,7 +256,7 @@ def test_aft_transfer_funds_round_trip_has_no_phantom_field():
     body_with_length = bytes([ADDRESS, 0x72, len(data)]) + data
 
     fake = FakeSerial(body_with_length + crc16_bytes(body_with_length))
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     client = SASClient(transport, ADDRESS)
 
     result = client.aft_transfer_funds(
@@ -315,7 +315,7 @@ def test_redeem_ticket_encodes_nine_byte_validation_number():
     """
     ack_body = bytes([ADDRESS, 0x71, 0x01, 0x00])
     fake = FakeSerial(ack_body + crc16_bytes(ack_body))
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     client = SASClient(transport, ADDRESS)
 
     validation_number = int("00" + "1234567890123456")  # system id 00 + 16-digit number
@@ -377,7 +377,7 @@ def test_send_selected_meters_request_uses_bcd_game_number_and_binary_codes():
     data = encode_bcd(0, 2) + bytes([MeterCode.CASHABLE_TICKET_IN_CENTS]) + encode_bcd(0, 5)
     body = bytes([ADDRESS, 0x2F, len(data)]) + data
     fake = FakeSerial(body + crc16_bytes(body))
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     client = SASClient(transport, ADDRESS)
     client.send_selected_meters([MeterCode.CASHABLE_TICKET_IN_CENTS], game_number=12)
 
@@ -389,14 +389,14 @@ def test_send_selected_meters_request_uses_bcd_game_number_and_binary_codes():
 
 
 def test_send_selected_meters_rejects_unknown_meter_code():
-    transport = SASTransport(FakeSerial(b""))
+    transport = SASTransport(FakeSerial(b""), wake_byte=None)
     client = SASClient(transport, ADDRESS)
     with pytest.raises(SASEncodingError):
         client.send_selected_meters([0x7E])  # not in METER_CODE_SIZES_BCD
 
 
 def test_send_selected_meters_rejects_too_many_codes():
-    transport = SASTransport(FakeSerial(b""))
+    transport = SASTransport(FakeSerial(b""), wake_byte=None)
     client = SASClient(transport, ADDRESS)
     with pytest.raises(SASError):
         client.send_selected_meters([MeterCode.CASHABLE_TICKET_IN_CENTS] * 11)
@@ -486,7 +486,7 @@ def test_set_secure_enhanced_validation_id_round_trip():
 def test_set_secure_enhanced_validation_id_query_form_uses_zero():
     body = bytes([ADDRESS, 0x4C]) + encode_binary_le(0, 3) + encode_binary_le(0, 3)
     fake = FakeSerial(body + crc16_bytes(body))
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     client = SASClient(transport, ADDRESS)
     client.set_secure_enhanced_validation_id()  # defaults: query, don't set
     written = bytes(fake.written)
@@ -523,7 +523,7 @@ def test_send_enhanced_validation_information_default_function_code_is_peek():
     """
     body = bytes([ADDRESS, 0x4D]) + bytes(31)  # all-zero record (no data)
     fake = FakeSerial(body + crc16_bytes(body))
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     client = SASClient(transport, ADDRESS)
     client.send_enhanced_validation_information()
     written = bytes(fake.written)
@@ -550,7 +550,7 @@ def test_extended_validation_status_default_call_does_not_change_anything():
     data = bytes(12)
     body = bytes([ADDRESS, 0x7B, len(data)]) + data
     fake = FakeSerial(body + crc16_bytes(body))
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     client = SASClient(transport, ADDRESS)
     client.extended_validation_status()
     written = bytes(fake.written)
@@ -571,7 +571,7 @@ def test_redeem_ticket_status_sends_the_short_form_request():
     """
     ack_body = bytes([ADDRESS, 0x71, 0x01, 0x00])
     fake = FakeSerial(ack_body + crc16_bytes(ack_body))
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     client = SASClient(transport, ADDRESS)
     client.redeem_ticket_status()
     written = bytes(fake.written)
@@ -611,7 +611,7 @@ def test_send_meter_reads_a_two_byte_bcd_meter():
 
 
 def test_send_meter_rejects_a_non_meter_poll():
-    transport = SASTransport(FakeSerial(b""))
+    transport = SASTransport(FakeSerial(b""), wake_byte=None)
     client = SASClient(transport, ADDRESS)
     with pytest.raises(SASError):
         client.send_meter(LongPoll.REDEEM_TICKET)
@@ -629,7 +629,7 @@ def test_send_meters_11_through_15_is_the_real_0x19_poll():
     for v in (100, 200, 300, 400, 500):
         body += encode_bcd(v, 4)
     fake = FakeSerial(body + crc16_bytes(body))
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     client = SASClient(transport, ADDRESS)
     meters = client.send_meters_11_through_15()
     assert meters.total_coin_in == 100
@@ -772,7 +772,7 @@ def test_send_extended_meters_alternate_uses_0xaf_not_0x6f():
     data = encode_bcd(0, 2) + encode_binary_le(0x1234, 2) + bytes([2]) + encode_bcd(99, 2)
     body = bytes([ADDRESS, 0xAF, len(data)]) + data
     fake = FakeSerial(body + crc16_bytes(body))
-    transport = SASTransport(fake)
+    transport = SASTransport(fake, wake_byte=None)
     client = SASClient(transport, ADDRESS)
     result = client.send_extended_meters_alternate([0x1234])
     assert result.meters[0x1234] == 99

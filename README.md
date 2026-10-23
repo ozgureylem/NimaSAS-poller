@@ -63,6 +63,16 @@ step-by-step guide to structuring a local SQL layer around a poller.
   set once and never touched again, which only succeeds under the second.
   ```
   python3 examples/wakeup_probe.py /dev/ttyS0 --address 1
+  python3 examples/wakeup_probe.py /dev/ttyS0 --address 1 --watch   # swing the slot door
+  ```
+- **`examples/preamble_probe.py`** — read-only. Once a preamble is known
+  to be needed, this says *what it is*: whether any throwaway byte works
+  (a link-layer fault — the far end needs the line driven before it reads)
+  or only `0x80` does (protocol), and how long the line may be quiet
+  before a bare poll stops being answered. Both answers feed straight into
+  `SASTransport(wake_byte=..., wake_after_idle=...)`.
+  ```
+  python3 examples/preamble_probe.py /dev/ttyS0 --address 1
   ```
 - **`examples/poll_test_tool.py`** — a bench tool for trying long polls
   against a real EGM and watching what comes back. Serves a small local
@@ -152,6 +162,19 @@ cites the spec table it was built from, and `constants.py`'s module
 docstring explains the scope boundary below.
 
 - **General poll** (0x80/addr).
+
+**Link note — the wake byte.** `SASTransport` sends a throwaway `0x80`
+before each message by default (`wake_byte`, `wake_gap`,
+`wake_after_idle`). On the first EGT machine tested, a general poll sent
+after ~0.5s of silence was answered **0/20**, and the identical poll
+preceded by `0x80` and 5ms was answered **20/20** — with the preamble's
+own reply discarded, so the reply provably belonged to the real poll. The
+machine does not answer the `0x80` itself, which is what makes it a safe
+byte to throw away. This is an empirical workaround, not SAS: the spec
+asks for nothing of the kind, and the likely cause is the far end needing
+the line driven before it reads reliably. `wake_byte=None` switches it
+off; `examples/preamble_probe.py` establishes whether a given link needs
+it at all.
 - **Enable/disable** (0x01/0x02): remote shutdown ("lock out play") and
   startup, the only command/control long polls this project wants to
   send remotely — see "Deliberately not implemented" below for why

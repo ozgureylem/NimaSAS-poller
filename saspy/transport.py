@@ -76,10 +76,64 @@ class SASTransport:
     and single-flight (ACK-atomic) send/receive exchanges.
     """
 
-    def __init__(self, serial_port: SerialLike, *, byte_timeout: float = 1.0):
+    def __init__(
+        self,
+        serial_port: SerialLike,
+        *,
+        byte_timeout: float = 1.0,
+        wake_byte: int | None = 0x80,
+        wake_gap: float = 0.005,
+        wake_after_idle: float = 0.0,
+    ):
+        """``wake_byte`` is a throwaway byte sent before a message when the
+        line has been idle, to absorb the loss of the first byte after idle.
+
+        Measured on an EGT machine: a general poll sent after ~500ms of
+        idle was answered 0/20, and the identical poll preceded by 0x80 and
+        5ms was answered 20/20 -- with the preamble's own reply discarded,
+        so the reply provably belonged to the real poll. 0x80 is a general
+        poll to the broadcast address, which that machine does not answer
+        (0/20 sent alone), making it a safe byte to throw away.
+
+        This is an empirical workaround, not a SAS requirement -- the spec
+        asks for nothing of the kind, and the real cause is more likely the
+        receiving end of the link needing the line driven before it reads
+        reliably. Set ``wake_byte=None`` to switch it off on a link that
+        does not need it.
+
+        ``wake_after_idle`` is how long the line must have been quiet
+        before the wake byte is sent again. The default of 0.0 sends it
+        before every message, which is the configuration actually measured
+        at 20/20; raise it to skip the byte on back-to-back exchanges once
+        examples/preamble_probe.py has established the real threshold for
+        a given machine.
+        """
         self._serial = serial_port
         self._byte_timeout = byte_timeout
+        self._wake_byte = wake_byte
+        self._wake_gap = wake_gap
+        self._wake_after_idle = wake_after_idle
+        self._last_tx: float | None = None
         self._lock = threading.Lock()
+
+    def _wake_line(self) -> None:
+        """Send the throwaway byte if the line has been idle long enough.
+
+        Any reply it draws is discarded: the callers above flush input
+        before calling in, so a reply arriving after that flush would
+        otherwise be read back as the answer to the real message.
+        """
+        if self._wake_byte is None:
+            return
+        now = time.monotonic()
+        if self._last_tx is not None and (now - self._last_tx) < self._wake_after_idle:
+            return
+        self._serial.parity = PARITY_MARK
+        self._serial.write(bytes([self._wake_byte]))
+        self._drain()
+        if self._wake_gap:
+            time.sleep(self._wake_gap)
+        self._serial.reset_input_buffer()
 
     def _drain(self) -> None:
         """Block until bytes already written are physically on the wire.
@@ -131,6 +185,7 @@ class SASTransport:
         if not frame:
             return
         try:
+            self._wake_line()
             self._serial.parity = PARITY_MARK
             self._serial.write(frame[:1])
             if len(frame) > 1:
@@ -146,6 +201,7 @@ class SASTransport:
                 # cannot catch these bytes still queued and stamp a
                 # spurious message start on them.
                 self._drain()
+            self._last_tx = time.monotonic()
         except Exception as e:
             # Not every USB-serial adapter honors mark/space parity, and a
             # virtual pty never does (see the module docstring) — surface
