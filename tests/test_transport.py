@@ -134,3 +134,95 @@ def test_concurrent_exchanges_do_not_interleave():
     write_bytes = [w for w, _parity in fake.written]
     assert all(len(w) == 1 for w in write_bytes)
     assert len(results) == 5
+
+
+class RacyFakeSerial:
+    """A fake that models the thing the other fakes cannot: transmission
+    takes time, and a parity change applies to bytes still queued.
+
+    ``FakeSerial`` records the parity in effect at the moment ``write()``
+    is called, which silently assumes a byte is on the wire the instant it
+    is handed over. Real UARTs do not work that way, and pyserial changes
+    parity with ``TCSANOW`` -- immediately, without draining -- so a byte
+    still sitting in the transmit buffer goes out under the NEW setting.
+    Here, bytes stay pending until ``flush()``, and a parity change
+    restamps everything still pending. That is what turns the race into a
+    visible assertion instead of a heisenbug on real hardware.
+    """
+
+    def __init__(self):
+        self._parity = "S"
+        self._pending = []
+        self.on_wire = []  # (byte, parity it was actually transmitted with)
+        self.to_read = b""
+
+    @property
+    def parity(self):
+        return self._parity
+
+    @parity.setter
+    def parity(self, value):
+        # TCSANOW: the new setting catches anything not yet shifted out.
+        self._pending = [(b, value) for b, _ in self._pending]
+        self._parity = value
+
+    def write(self, data: bytes) -> int:
+        self._pending.extend((b, self._parity) for b in bytes(data))
+        return len(data)
+
+    def flush(self) -> None:
+        self.on_wire.extend(self._pending)
+        self._pending.clear()
+
+    def read(self, size: int = 1) -> bytes:
+        chunk, self.to_read = self.to_read[:size], self.to_read[size:]
+        return chunk
+
+    def reset_input_buffer(self) -> None:
+        pass
+
+
+def test_wakeup_bit_survives_a_multi_byte_frame():
+    """The regression that matters on real hardware.
+
+    Every long poll is a multi-byte frame, so every long poll used to hand
+    the first byte to the kernel and lower parity to SPACE before the UART
+    had shifted it. The machine then sees the command byte as a mid-message
+    continuation, never registers a message start, and ignores the poll --
+    a timeout indistinguishable from an unimplemented command (4.4), while
+    single-byte general polls keep working because nothing lowers parity
+    after them.
+    """
+    fake = RacyFakeSerial()
+    SASTransport(fake).write_with_wakeup(bytes([0x01, 0x3D]))
+
+    assert fake.on_wire[0] == (0x01, "M"), (
+        "first byte must reach the wire with MARK parity -- the wakeup bit"
+    )
+    assert [p for _b, p in fake.on_wire[1:]] == ["S"], "data bytes must be SPACE"
+
+
+def test_frame_tail_cannot_be_restamped_by_the_next_frame():
+    """Back-to-back frames: if the tail of one is still queued when the
+    next raises parity to MARK, those bytes go out flagged as message
+    starts. Draining the tail is what prevents it.
+    """
+    fake = RacyFakeSerial()
+    transport = SASTransport(fake)
+    transport.write_with_wakeup(bytes([0x01, 0x3D]))
+    transport.write_with_wakeup(bytes([0x81]))
+
+    assert fake.on_wire == [(0x01, "M"), (0x3D, "S"), (0x81, "M")]
+
+
+def test_port_is_left_at_space_between_frames():
+    """serial_port.open_serial_port documents that the port sits at SPACE
+    between frames. A single-byte frame used to leave it at MARK, so two
+    consecutive general polls put the wakeup bit on both bytes with no
+    SPACE transition between them.
+    """
+    fake = RacyFakeSerial()
+    SASTransport(fake).write_with_wakeup(bytes([0x81]))
+
+    assert fake.on_wire == [(0x81, "M")]
+    assert fake.parity == "S"

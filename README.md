@@ -39,6 +39,20 @@ step-by-step guide to structuring a local SQL layer around a poller.
   ```
   python3 examples/connectivity_check.py /dev/ttyUSB0 --address 1 --test-shutdown
   ```
+- **`examples/wire_diagnostics.py`** — run this first on a machine you
+  have never polled before. Read-only: it answers three questions in the
+  order they block you — does a plain general poll work, does a `0x80`
+  sync byte before each poll help/hurt/do nothing (and does the gap after
+  it matter), and do **long polls** work. That last one is separate on
+  purpose: every long poll is a multi-byte frame, which exercises a
+  parity transition a single-byte general poll never touches, so a bus
+  that general-polls perfectly can still fail every long poll. Every
+  condition runs the same counted harness, because a loop that stops at
+  its first failure and one that counts failures are not comparable
+  evidence.
+  ```
+  python3 examples/wire_diagnostics.py /dev/ttyS0 --address 1
+  ```
 - **`examples/poll_test_tool.py`** — a bench tool for trying long polls
   against a real EGM and watching what comes back. Serves a small local
   web UI: one panel lists every long poll this client implements, tagged

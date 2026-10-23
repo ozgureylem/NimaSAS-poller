@@ -60,6 +60,12 @@ class SerialLike(Protocol):
     def read(self, size: int = 1) -> bytes: ...
     def reset_input_buffer(self) -> None: ...
 
+    # Optional: block until everything written is physically out of the
+    # UART (POSIX tcdrain). write_with_wakeup() needs it to change parity
+    # safely; a fake that omits it still works, it just cannot exhibit the
+    # race the drain exists to prevent.
+    def flush(self) -> None: ...
+
 
 PARITY_MARK = "M"
 PARITY_SPACE = "S"
@@ -75,16 +81,60 @@ class SASTransport:
         self._byte_timeout = byte_timeout
         self._lock = threading.Lock()
 
+    def _drain(self) -> None:
+        """Block until bytes already written are physically on the wire.
+
+        This is what makes the parity changes around it safe; see
+        write_with_wakeup(). A fake serial object need not provide
+        flush(), so its absence is not an error.
+        """
+        flush = getattr(self._serial, "flush", None)
+        if flush is not None:
+            flush()
+
     def write_with_wakeup(self, frame: bytes) -> None:
-        """Write ``frame``, setting the wakeup bit only on the first byte."""
+        """Write ``frame``, setting the wakeup bit only on the first byte.
+
+        The drains are load-bearing, not hygiene. ``write()`` returns once
+        the kernel has accepted the bytes, not once the UART has shifted
+        them out, and pyserial applies a parity change with ``TCSANOW`` --
+        immediately, without waiting for the transmit buffer to empty. So
+        setting parity straight after writing the first byte races that
+        byte: at 19200 baud it occupies the wire for ~573us, while the
+        write and the parity change together return in microseconds. Lose
+        that race and the first byte of the frame goes out with SPACE
+        parity -- the wakeup bit silently cleared.
+
+        That breaks every multi-byte frame, which means every long poll:
+        the machine sees the command byte as a mid-message continuation,
+        never registers a message start, and ignores the poll. The symptom
+        is a timeout indistinguishable from a machine that does not
+        implement the command (section 4.4), while single-byte general
+        polls -- which change parity only before the byte, never after --
+        keep working perfectly. Draining first makes the ordering explicit
+        instead of leaving it to the scheduler.
+
+        Note this cannot be caught by a fake serial port (an attribute
+        assignment has no timing) nor by a pty (which accepts parity and
+        ignores it). It needs either a drain or real hardware with a
+        second listener.
+        """
         if not frame:
             return
         try:
             self._serial.parity = PARITY_MARK
             self._serial.write(frame[:1])
+            self._drain()  # the wakeup byte must be on the wire before parity moves
+            # Safe to lower now, and it restores the documented invariant
+            # that the port sits at SPACE between frames -- pyserial skips
+            # the tcsetattr entirely when the value is unchanged.
+            self._serial.parity = PARITY_SPACE
             if len(frame) > 1:
-                self._serial.parity = PARITY_SPACE
                 self._serial.write(frame[1:])
+                # Drain the tail too, so the NEXT frame raising parity to
+                # MARK cannot catch these bytes still queued and stamp a
+                # spurious message start on them.
+                self._drain()
         except Exception as e:
             # Not every USB-serial adapter honors mark/space parity, and a
             # virtual pty never does (see the module docstring) — surface
