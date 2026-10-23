@@ -79,15 +79,20 @@ def main() -> int:
         print(f"\nCould not open {args.port}: {e}", file=sys.stderr)
         return 2
 
-    transport = SASTransport(port, byte_timeout=args.timeout)
-    client = SASClient(transport, args.address, timeout=args.timeout)
+    # wake_byte=None so section A is a genuine control. SASTransport sends a
+    # throwaway 0x80 before each message by default, so a "no sync byte"
+    # condition built on a default transport is not one -- it is the default
+    # preamble plus nothing, and reporting it as bare makes the sync byte look
+    # unnecessary when it was present the whole time. This script controls the
+    # preamble itself, below.
+    transport = SASTransport(port, byte_timeout=args.timeout, wake_byte=None)
     n = args.n
 
     print(f"{args.port} @ {args.baud}, address {args.address}, {n} attempts per condition")
     print(f"(~{n * CADENCE:.0f}s per condition; read-only throughout)\n")
 
     # --- A: is the bus healthy with nothing clever at all? -------------
-    print("A. Plain general poll, no sync byte")
+    print("A. Plain general poll, genuinely no sync byte")
     baseline = run_condition(transport, args.address, sync=False, gap=0, n=n, timeout=args.timeout)
     print(f"   {baseline}/{n} replies\n")
 
@@ -112,6 +117,12 @@ def main() -> int:
     print()
 
     # --- C: long polls, the part none of the above proves --------------
+    # Long polls go through a transport configured the way a poll loop would
+    # actually run, wake byte included -- C answers "does the library work on
+    # this machine", not "does it work stripped down".
+    client = SASClient(
+        SASTransport(port, byte_timeout=args.timeout), args.address, timeout=args.timeout
+    )
     print("C. Long polls (multi-byte frames -- the parity transition)")
     long_polls = [
         ("0x54 SAS version/serial", client.send_sas_version_and_serial),
@@ -142,8 +153,11 @@ def main() -> int:
 
     print(f"A. plain general poll ....... {baseline}/{n}")
     if baseline == n and best_sync <= baseline:
-        print("   The sync byte buys nothing here. Don't send it: it is not")
-        print("   in the spec, and an unnecessary byte per cycle is a cost.")
+        print("   A bare poll was answered every time, so on THIS run the sync")
+        print("   byte bought nothing. Before turning it off, note that earlier")
+        print("   runs on this same machine measured a bare poll at 0/20 and")
+        print("   13/20 -- the link is intermittent, and a single clean sweep")
+        print("   is not evidence that it is not. Settle it on a soak.")
     elif best_sync > baseline:
         best_gap = max(results, key=lambda g: results[g])
         print(f"   The sync byte DOES help (best {best_sync}/{n} at {best_gap * 1000:.0f} ms).")

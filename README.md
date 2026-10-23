@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 219 tests, all against fake serial ports; run them with
+- **`tests/`** — 233 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -248,6 +248,32 @@ also independently readable one at a time via LP 0x50
 sweep per the spec's own note, and read that way too by default
 (`--skip-validation-meters-sweep` to opt out); no batching on 0x50, so
 it's the most expensive of the sweeps per meter actually obtained.
+
+## Verified against real hardware
+
+`tests/test_hardware_vectors.py` is built from one EGT Premier (SAS version
+602, serial 000106719, paytable MGDJE3), and each value in it was read over
+SAS and then found on that machine's own Machine Accounting display, to the
+cent:
+
+| SAS field (LP `0x0F`) | read | machine's own screen |
+|---|---|---|
+| `total_coin_in` | 21387723 | Total Bet (Coin In) 213,877.23 USD |
+| `total_coin_out` | 20718334 | Total Won 207,183.34 USD |
+| `total_drop` | 6408958 | Total In 64,089.58 USD |
+| `total_cancelled_credits` | 5739569 | Total Cancelled Credits 57,395.69 USD |
+| `games_played` | 665524 | Total Games Played 665,524 |
+
+Every other test here is derived from the spec tables, so it proves the code
+matches somebody's reading of the document. These prove it matches a gaming
+machine — which is a different claim, and the only one that catches a field
+**order** slip: swapping two meters still decodes to plausible numbers and
+still passes every spec-derived test.
+
+One value is recorded as observed rather than verified. LP `0x1F` reported
+`max_bet=255`, which is a legitimate figure and also `0xFF`, the saturation
+value a too-narrow or unsupported field produces. Check it against the
+machine's own max-bet setting before relying on it.
 
 ## Multi-version SAS (6.0 / 6.01 / 6.02)
 
