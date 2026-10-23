@@ -1,35 +1,26 @@
-"""Is it the 0x80, or is it just that the line was quiet? And for how long?
+"""Does the wake byte matter, and does its value matter -- measured so the
+answer cannot be an artefact of when each condition happened to run.
 
 Read-only: general polls only. Nothing changes machine state.
 
-Established on an EGT machine: a general poll sent on its own after about
-half a second of silence is answered 0/20, and the same poll preceded by
-0x80 and a 5ms gap is answered 20/20 -- with the preamble's own reply
-discarded, so the reply provably belongs to the real poll. The machine
-does not answer the 0x80 itself (0/20 when sent alone), and opening the
-slot door moves the exception byte to 0x11/0x12, so the link is real.
+This script replaces one that ran each condition as a block: twenty
+attempts of 0x80, then twenty of 0x00, and so on. That design cannot tell
+a condition effect from anything drifting over the minute it takes to run
+-- machine state after a door or attendant-menu visit, link supervision,
+warm-up. And on this machine something IS drifting: a bare poll measured
+0/20 in one script and 13/20 in another, for the same operation.
 
-What that does NOT establish is why. Two readings remain, and they lead
-to different code:
+So every condition here is sampled once per round, with the order rotated
+each round, interleaved across the whole run. A condition that only works
+early, or only once the line has been busy a while, can no longer hide as
+a property of the byte.
 
-  1. SAS on this machine wants a 0x80 before a poll. Then the byte is
-     protocol, and only 0x80 will do.
-  2. The first byte sent after the line goes quiet is lost, whatever it
-     is -- the far end needs the line driven before it reads reliably.
-     Then the byte is a throwaway, any value works, and what actually
-     matters is how long "quiet" has to be.
-
-Reading 2 is favoured by something already in hand: during the address
-sweep in wakeup_probe.py, address 1 answered 2 of 3 bare polls with no
-0x80 anywhere near them -- the only difference being that those polls
-followed the previous byte by ~50ms instead of ~500ms.
-
-Section 1 sends a different throwaway byte each time. If 0x00 and 0xFF
-work as well as 0x80, the byte is not protocol.
-Section 2 drops the preamble entirely and varies the silence before the
-poll, to find where it stops being answered.
-
-Both answers go straight into SASTransport(wake_byte=..., wake_after_idle=...).
+Section 1 varies the throwaway byte, including a genuine no-preamble
+control. Section 2 sends NO preamble at all and varies the silence before
+the poll -- the previous version wrote a 0x80 every iteration while
+titled "no preamble", and then advised raising wake_after_idle on the
+strength of it. It was measuring the gap a preamble still works across,
+which is a different question and not the one the setting answers.
 
     python3 examples/preamble_probe.py /dev/ttyS0 --address 1
 """
@@ -39,6 +30,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -56,13 +48,34 @@ def read_reply(port, timeout):
     return b""
 
 
+def interleave(port, poll_byte, timeout, conditions, rounds, attempt):
+    """Sample every condition once per round, rotating the order.
+
+    ``conditions`` is a list of (label, payload); ``attempt`` performs one
+    and returns True if the poll was answered. Returns {label: (ok, half)}
+    where ``half`` is how many of those successes fell in the first half
+    of the run -- a condition that is genuinely about the byte should sit
+    near half, and drift shows up as a lopsided split.
+    """
+    ok = Counter()
+    first_half = Counter()
+    for r in range(rounds):
+        order = conditions[r % len(conditions):] + conditions[: r % len(conditions)]
+        for label, payload in order:
+            if attempt(port, poll_byte, timeout, payload):
+                ok[label] += 1
+                if r < rounds / 2:
+                    first_half[label] += 1
+    return {label: (ok[label], first_half[label]) for label, _ in conditions}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("port")
     ap.add_argument("--address", type=int, default=1)
     ap.add_argument("--baud", type=int, default=19200)
     ap.add_argument("--timeout", type=float, default=0.3)
-    ap.add_argument("-n", type=int, default=20)
+    ap.add_argument("-n", type=int, default=20, help="rounds per condition")
     args = ap.parse_args()
 
     try:
@@ -74,74 +87,87 @@ def main() -> int:
     pb = args.address | 0x80
     n = args.n
     port.parity = PARITY_MARK
-    print(f"{args.port} @ {args.baud}, address {args.address} (poll 0x{pb:02X}), {n} attempts each\n")
+    print(f"{args.port} @ {args.baud}, address {args.address} (poll 0x{pb:02X})")
+    print(f"{n} rounds, conditions interleaved and rotated\n")
 
     # --- 1. does the identity of the throwaway byte matter? ------------
-    print("1. Preamble byte (0.5s of silence before each attempt, 5ms gap after)")
-    by_byte = {}
-    for name, value in (("0x80 broadcast poll", 0x80), ("0x00 null", 0x00),
-                        ("0xFF all ones", 0xFF), ("none (control)", None)):
-        ok = 0
-        for _ in range(n):
-            time.sleep(0.5)  # force the line quiet
-            port.reset_input_buffer()
-            if value is not None:
-                port.write(bytes([value]))
-                if hasattr(port, "flush"):
-                    port.flush()
-                time.sleep(0.005)
-                port.reset_input_buffer()
-            port.write(bytes([pb]))
-            if read_reply(port, args.timeout):
-                ok += 1
-        by_byte[name] = ok
-        print(f"   {name:22} {ok}/{n}")
+    def attempt_byte(p, poll, timeout, value):
+        time.sleep(0.3)  # let the line go quiet before each attempt
+        p.reset_input_buffer()
+        if value is not None:
+            p.write(bytes([value]))
+            if hasattr(p, "flush"):
+                p.flush()
+            time.sleep(0.005)
+            p.reset_input_buffer()
+        p.write(bytes([poll]))
+        return bool(read_reply(p, timeout))
 
-    # --- 2. how long does the line have to be quiet to break it? -------
-    print("\n2. No preamble; silence before the poll")
-    by_idle = {}
-    for idle in (0.005, 0.02, 0.05, 0.1, 0.2, 0.5):
-        ok = 0
-        for _ in range(n):
-            # A byte to warm the line, then the chosen silence, then poll.
-            port.reset_input_buffer()
-            port.write(bytes([0x80]))
-            if hasattr(port, "flush"):
-                port.flush()
-            time.sleep(idle)
-            port.reset_input_buffer()
-            port.write(bytes([pb]))
-            if read_reply(port, args.timeout):
-                ok += 1
-            time.sleep(0.05)
-        by_idle[idle] = ok
-        print(f"   {idle * 1000:6.0f} ms quiet      {ok}/{n}")
+    byte_conditions = [("0x80 broadcast poll", 0x80), ("0x00 null", 0x00),
+                       ("0xFF all ones", 0xFF), ("none (control)", None)]
+    print("1. Preamble byte, 0.3s quiet before each attempt")
+    by_byte = interleave(port, pb, args.timeout, byte_conditions, n, attempt_byte)
+    for label, _ in byte_conditions:
+        got, half = by_byte[label]
+        print(f"   {label:22} {got:2}/{n}   (first half {half}, second {got - half})")
+
+    # --- 2. silence before a GENUINELY bare poll ------------------------
+    def attempt_idle(p, poll, timeout, idle):
+        time.sleep(idle)  # nothing is written during this -- that is the point
+        p.reset_input_buffer()
+        p.write(bytes([poll]))
+        return bool(read_reply(p, timeout))
+
+    idle_conditions = [(f"{int(ms * 1000)} ms", ms) for ms in (0.005, 0.05, 0.2, 0.5, 1.0)]
+    print("\n2. NO preamble; silence before the poll (nothing written during it)")
+    by_idle = interleave(port, pb, args.timeout, idle_conditions, n, attempt_idle)
+    for label, _ in idle_conditions:
+        got, half = by_idle[label]
+        print(f"   {label:>8} quiet        {got:2}/{n}   (first half {half}, second {got - half})")
 
     # --- verdict --------------------------------------------------------
-    any_byte = min(by_byte["0x80 broadcast poll"], by_byte["0x00 null"], by_byte["0xFF all ones"])
-    control = by_byte["none (control)"]
-    print("\n" + "=" * 66)
-    if any_byte >= n * 0.9 and control < n * 0.5:
+    hi = n * 0.9
+    lo = n * 0.5
+    c80 = by_byte["0x80 broadcast poll"][0]
+    c00 = by_byte["0x00 null"][0]
+    cff = by_byte["0xFF all ones"][0]
+    ctl = by_byte["none (control)"][0]
+    print("\n" + "=" * 68)
+    if min(c80, c00, cff) >= hi and ctl < lo:
         print("Any byte works, none does not: the preamble is a throwaway, not")
         print("protocol. The far end needs the line driven before it reads --")
-        print("a link-layer fault, so worth raising with whoever built the")
-        print("interface rather than living with forever.")
-    elif by_byte["0x80 broadcast poll"] >= n * 0.9 and any_byte < n * 0.5:
-        print("Only 0x80 works. That is protocol, not a line effect, and the")
-        print("vendor should be asked why -- SAS 6.02 does not call for it.")
+        print("a link fault, worth raising with whoever built the interface.")
+    elif c80 >= hi and max(c00, cff) < lo:
+        print("Only 0x80 works. That is protocol, and the vendor should be")
+        print("asked why -- SAS 6.02 does not call for it.")
+    elif ctl >= hi:
+        print("The control answers too: on this run a bare poll needs no")
+        print("preamble at all. Earlier 0/20 runs were measuring something")
+        print("else. Do NOT conclude the wake byte is required from this.")
     else:
-        print("Section 1 is mixed; report it as-is.")
+        lopsided = [l for l, _ in byte_conditions
+                    if by_byte[l][0] >= 4 and (by_byte[l][1] == by_byte[l][0] or by_byte[l][1] == 0)]
+        print("Mixed. Report the table as-is rather than acting on it.")
+        if lopsided:
+            print(f"  All successes for {', '.join(lopsided)} fell in one half of")
+            print("  the run, so something is drifting and the byte is not the")
+            print("  variable. Re-run before drawing any conclusion.")
 
-    good = [ms for ms, got in by_idle.items() if got >= n * 0.9]
-    if good:
-        print(f"\nLongest silence still answered: {max(good) * 1000:.0f} ms.")
-        print(f"  => SASTransport(wake_after_idle={max(good):.3f}) skips the wake byte")
-        print("     on back-to-back exchanges, which a meter sweep is dozens of.")
-        print("     Leave it at 0.0 if you would rather spend the byte than the risk.")
+    bare_ok = [ms for (label, ms) in idle_conditions if by_idle[label][0] >= hi]
+    print()
+    if not bare_ok:
+        print("No bare poll was reliable at any silence: keep wake_byte=0x80")
+        print("and wake_after_idle=0.0 (a wake byte before every message).")
+    elif len(bare_ok) == len(idle_conditions):
+        print("A bare poll was reliable at EVERY silence tested, up to")
+        print(f"{max(bare_ok) * 1000:.0f} ms. On this evidence the wake byte is not needed")
+        print("here at all -- but it also never hurt, so leaving it on costs")
+        print("~5.6ms per exchange and nothing else. Decide on a soak, not this.")
     else:
-        print("\nNo silence was reliably answered without a preamble: keep")
-        print("wake_after_idle at 0.0, so every message carries the wake byte.")
-    print("=" * 66)
+        print(f"Bare polls reliable up to {max(bare_ok) * 1000:.0f} ms of silence.")
+        print(f"  => SASTransport(wake_after_idle={max(bare_ok):.3f}) is supported by this")
+        print("     run: below that gap the line is warm enough without a byte.")
+    print("=" * 68)
     return 0
 
 

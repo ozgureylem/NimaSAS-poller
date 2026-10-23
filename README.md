@@ -165,16 +165,27 @@ docstring explains the scope boundary below.
 
 **Link note — the wake byte.** `SASTransport` sends a throwaway `0x80`
 before each message by default (`wake_byte`, `wake_gap`,
-`wake_after_idle`). On the first EGT machine tested, a general poll sent
-after ~0.5s of silence was answered **0/20**, and the identical poll
-preceded by `0x80` and 5ms was answered **20/20** — with the preamble's
-own reply discarded, so the reply provably belonged to the real poll. The
-machine does not answer the `0x80` itself, which is what makes it a safe
-byte to throw away. This is an empirical workaround, not SAS: the spec
-asks for nothing of the kind, and the likely cause is the far end needing
-the line driven before it reads reliably. `wake_byte=None` switches it
-off; `examples/preamble_probe.py` establishes whether a given link needs
-it at all.
+`wake_after_idle`), and `wake_byte=None` switches it off.
+
+It is there because on the first EGT machine tested, a general poll after
+~0.5s of silence was answered **0/20** while the identical poll preceded
+by `0x80` and 5 ms was answered **20/20** — the preamble's own reply
+discarded, so the reply provably belonged to the real poll.
+
+**But that is not a settled result.** A later run measured the same bare
+poll at **13/20**, and bare polls at **20/20** across every silence from
+5 ms to 1 s. Something on this link is intermittent, and until it is
+characterised the wake byte stays on because it has never made anything
+worse — not because it is known to be required. It is an empirical
+workaround in any case, not SAS: the spec asks for nothing of the kind.
+
+Two things follow. Do **not** raise `wake_after_idle` off a run that had
+a preamble present throughout — that measures the gap a preamble works
+across, not whether the line stays warm without one. And treat any
+condition measured as a *block* of attempts with suspicion on this link:
+`examples/preamble_probe.py` interleaves and rotates its conditions, and
+reports how each one's successes split across the first and second half
+of the run, precisely so drift cannot pose as a property of the byte.
 - **Enable/disable** (0x01/0x02): remote shutdown ("lock out play") and
   startup, the only command/control long polls this project wants to
   send remotely — see "Deliberately not implemented" below for why
