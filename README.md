@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 275 tests, all against fake serial ports; run them with
+- **`tests/`** — 278 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -261,6 +261,19 @@ step-by-step guide to structuring a local SQL layer around a poller.
   (deliberately one program — see the module docstring for why). A
   runnable starting point for stress-testing over time or prototyping a
   persistence layer — see MANUAL.md §4/§6 for the schema and reasoning.
+
+  **Every exception is recorded, not just the actionable ones.** An
+  18-hour soak produced 81 core-meter timeouts and a 116-second stall with
+  nothing in the database to explain either; the explanation turned out to be
+  in the machine's own event log, read off its screen afterwards — a
+  technician had the slot door open for most of the run and entered the
+  attendant menu twice. The poller had been told all of that over the wire,
+  as exceptions `0x11`, `0x12`, `0x82` and `0x83`, and discarded it because
+  it only acted on tickets and cashouts. A failure log without the machine's
+  own state beside it cannot be read. Everything now lands in
+  `machine_events`, and `soak_report.py` flags door/menu/operator events
+  explicitly — turning "the loop stalled, investigate" into "the door was
+  open".
 
   **The meter sweep interleaves general polls.** A cycle used to issue one
   general poll and then 73 long-poll exchanges, leaving the machine's

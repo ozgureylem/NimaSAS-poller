@@ -190,6 +190,54 @@ def main() -> int:
                 else:
                     print("  => Spread fairly evenly; a rate, not an outage.")
 
+    # --- what was the machine doing? -------------------------------------
+    # The point of this section: an 18-hour soak showed 81 core-meter timeouts
+    # and a 116-second stall with nothing in the database to explain either.
+    # The explanation was a technician with the slot door open for most of the
+    # run -- which the machine had reported over the wire as exceptions 0x11,
+    # 0x12, 0x82 and 0x83, and which the poller used to discard. A failure log
+    # without the machine's own state beside it cannot be read.
+    ATTENDED = {0x11: "door opened", 0x12: "door closed",
+                0x82: "attendant/meter menu entered", 0x83: "attendant/meter menu exited",
+                0x84: "operator menu entered", 0x85: "operator menu exited",
+                0x3C: "operator changed options", 0x7A: "soft meters reset",
+                0x86: "out of service (by attendant)"}
+    print()
+    if not table_exists(conn, "machine_events"):
+        print("no machine_events table -- this database predates exception recording,")
+        print("so a failure cluster here cannot be correlated with what the machine")
+        print("was doing. Re-soak to get that.")
+    else:
+        total_events = conn.execute("SELECT COUNT(*) FROM machine_events").fetchone()[0]
+        print(f"machine events   {total_events}")
+        if total_events:
+            print("\n  most frequent:")
+            for code, desc, n in conn.execute(
+                "SELECT exception_code, description, COUNT(*) FROM machine_events "
+                "GROUP BY exception_code ORDER BY COUNT(*) DESC LIMIT 10"):
+                print(f"    0x{code:02X}  x{n:<6} {desc}")
+
+            attended = list(conn.execute(
+                "SELECT occurred_at, exception_code, description FROM machine_events "
+                f"WHERE exception_code IN ({','.join(str(c) for c in ATTENDED)}) "
+                "ORDER BY occurred_at"))
+            if attended:
+                print(f"\n  SOMEONE WAS AT THE MACHINE ({len(attended)} event(s)):")
+                for occurred, code, desc in attended[:20]:
+                    print(f"    {occurred}  0x{code:02X}  {desc}")
+                if len(attended) > 20:
+                    print(f"    ... {len(attended) - 20} more")
+                print("\n  => Failures overlapping these are not link failures. A machine")
+                print("     with its door open or sitting in an attendant menu is being")
+                print("     serviced, and section 8.3 lists exactly those states as ones")
+                print("     where it cannot act normally. Treat this run as a robustness")
+                print("     test, not a stability measurement -- and re-soak untouched if")
+                print("     stability is what you were measuring.")
+            else:
+                print("\n  No door, menu or operator events: nobody was at the machine.")
+                print("  Failures here are the link's own, which is what a stability")
+                print("  measurement needs.")
+
     # --- did any meter go backwards? -------------------------------------
     # Meters are cumulative, so a decrease means a RAM clear, a decode fault,
     # or a meter read from the wrong machine. All three matter; none would

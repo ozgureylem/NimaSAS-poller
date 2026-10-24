@@ -166,3 +166,76 @@ def test_backfill_keeps_going_past_a_single_timeout():
         pass
 
     assert client.calls >= 2, "a single timeout must not end the scan"
+
+
+def test_every_exception_is_recorded_not_just_the_actionable_ones():
+    """The lesson from an 18-hour soak.
+
+    It showed 81 core-meter timeouts and a 116-second stall, and nothing in
+    the database explained either. The explanation was in the machine's own
+    event log, read off its screen afterwards: a technician had the slot door
+    open for most of the run and entered the attendant menu twice. The poller
+    had been told all of it over the wire -- exceptions 0x11, 0x12, 0x82,
+    0x83 -- and discarded it because it only acted on tickets and cashouts.
+
+    A failure log without the machine's own state beside it cannot be read.
+    """
+    import sqlite3
+
+    from sql_poll_logger import SCHEMA, _dispatch_exception
+
+    class Nop:
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+
+    for code in (0x11, 0x82, 0x83, 0x12):
+        _dispatch_exception(Nop(), conn, "2026-10-24T10:52:00+00:00", code)
+
+    rows = conn.execute(
+        "SELECT exception_code, description FROM machine_events ORDER BY id"
+    ).fetchall()
+    assert [r[0] for r in rows] == [0x11, 0x82, 0x83, 0x12]
+    assert rows[0][1] == "slot door was opened"
+    assert rows[1][1] == "display meters or attendant menu has been entered"
+
+
+def test_no_activity_is_not_recorded_as_an_event():
+    """0x00 is the absence of an event. Recording it would put a row on every
+    poll and bury the ones that mean something."""
+    import sqlite3
+
+    from saspy.constants import ExceptionCode
+    from sql_poll_logger import SCHEMA, _dispatch_exception
+
+    class Nop:
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    _dispatch_exception(Nop(), conn, "2026-10-24T10:52:00+00:00", ExceptionCode.NONE)
+
+    assert conn.execute("SELECT COUNT(*) FROM machine_events").fetchone()[0] == 0
+
+
+def test_heartbeat_sourced_events_are_distinguishable():
+    """Knowing an exception was drained mid-sweep rather than at the top of a
+    cycle is how the interleaving can be shown to be doing anything."""
+    import sqlite3
+
+    from sql_poll_logger import SCHEMA, _dispatch_exception
+
+    class Nop:
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    _dispatch_exception(Nop(), conn, "t", 0x11, source="heartbeat")
+    _dispatch_exception(Nop(), conn, "t", 0x12, source="cycle")
+
+    sources = [r[0] for r in conn.execute("SELECT source FROM machine_events ORDER BY id")]
+    assert sources == ["heartbeat", "cycle"]

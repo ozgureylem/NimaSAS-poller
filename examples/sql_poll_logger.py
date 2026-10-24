@@ -542,6 +542,17 @@ CREATE TABLE IF NOT EXISTS meters_history (
     {_METER_COLUMN_DDL}
 );
 
+CREATE TABLE IF NOT EXISTS machine_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL,
+    exception_code INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    source TEXT NOT NULL,          -- 'cycle' or 'heartbeat'
+    synced_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_machine_events_at ON machine_events (occurred_at);
+
 CREATE TABLE IF NOT EXISTS poll_errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     occurred_at TEXT NOT NULL,
@@ -1421,14 +1432,36 @@ def _poll_all_meters(
     return values
 
 
-def _dispatch_exception(client, conn: sqlite3.Connection, now: str, exception_code: int) -> None:
-    """Act on one general-poll exception code.
+def _dispatch_exception(
+    client, conn: sqlite3.Connection, now: str, exception_code: int, *, source: str = "cycle"
+) -> None:
+    """Record one general-poll exception, then act on it if it is actionable.
 
     Extracted so that a heartbeat poll taken mid-sweep is handled exactly
     like the cycle's own poll -- an exception found while draining the queue
     is not a lesser exception, and a second copy of this dispatch would be a
     place for the two to drift apart.
+
+    EVERY exception is recorded, not only the five this tool acts on. The
+    reason is concrete: an 18-hour soak produced a cluster of 81 core-meter
+    timeouts and a 116-second stall, and nothing in the database explained
+    either. The explanation was in the machine's own event log, read off its
+    screen afterwards -- a technician had the slot door open for most of the
+    run and entered the attendant menu twice. The poller had been told all of
+    that over the wire, as exceptions 0x11, 0x12, 0x82 and 0x83, and had
+    thrown it away because it only cared about tickets and cashouts.
+
+    A failure log without the machine's own state beside it cannot be read.
+    Recording the rest costs one row per event and turns "the loop stalled,
+    investigate" into "the door was open".
     """
+    if exception_code != ExceptionCode.NONE:
+        conn.execute(
+            "INSERT INTO machine_events (occurred_at, exception_code, description, source) "
+            "VALUES (?, ?, ?, ?)",
+            (now, int(exception_code), describe_exception(int(exception_code)), source),
+        )
+        _safe_commit(conn, now)
     if exception_code == ExceptionCode.TICKET_INSERTED:
         _capture_ticket_in(client, conn, now)
     elif exception_code == ExceptionCode.TICKET_TRANSFER_COMPLETE:
@@ -1631,7 +1664,7 @@ def poll_and_log(
     for code in heartbeat_codes:
         print(f"[{now}] exception 0x{code:02X} drained during the meter sweep: "
               f"{describe_exception(code)}")
-        _dispatch_exception(client, conn, now, code)
+        _dispatch_exception(client, conn, now, code, source="heartbeat")
 
     meter_poll_elapsed = monotonic_fn() - mono_now
     meter_poll_count = (
