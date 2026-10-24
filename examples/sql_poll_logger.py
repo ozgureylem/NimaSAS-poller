@@ -867,16 +867,46 @@ def backfill_ticket_out_history(client, conn: sqlite3.Connection, *, now_fn=utc_
     """
     now = now_fn()
     found = 0
+    consecutive_timeouts = 0
     for index in range(1, 32):
         try:
             record = client.send_enhanced_validation_information(function_code=index)
+        except SASTimeoutError as e:
+            # A machine with no printer has no ticket-out buffer to read, so
+            # it ignores every index (section 4.4). On the first EGT Premier
+            # tested that was 31 timeouts at every startup -- about 31
+            # seconds of it, and 31 poll_errors rows that then dominated the
+            # soak report's failure count and hid a real cluster elsewhere.
+            #
+            # If index 1 and 2 are silent, 3 through 31 will be too: this is
+            # a feature the machine does not have, not a buffer that happens
+            # to start empty. Record it once and stop.
+            consecutive_timeouts += 1
+            if consecutive_timeouts == 1:
+                conn.execute(
+                    "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) "
+                    "VALUES (?, ?, ?, ?)",
+                    (now, "send_enhanced_validation_information(backfill)", type(e).__name__,
+                     f"{e} -- no response at buffer index {index}"),
+                )
+                _safe_commit(conn, now)
+            if consecutive_timeouts >= 2:
+                print(f"[{now}] ticket-out backfill: no response at indices 1-{index}; this "
+                      f"machine has no readable ticket-out buffer (no printer configured). "
+                      f"Skipping the remaining {31 - index} indices.")
+                break
+            continue
         except SASError as e:
+            # Not a timeout: a checksum or framing fault is a real problem
+            # whatever the machine supports, and worth a row of its own.
+            consecutive_timeouts = 0
             conn.execute(
                 "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
                 (now, "send_enhanced_validation_information(backfill)", type(e).__name__, str(e)),
             )
             _safe_commit(conn, now)
             continue
+        consecutive_timeouts = 0
         if _is_empty_ticket_out_record(record):
             continue
         before = conn.total_changes

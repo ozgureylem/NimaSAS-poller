@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 273 tests, all against fake serial ports; run them with
+- **`tests/`** — 275 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -215,8 +215,18 @@ step-by-step guide to structuring a local SQL layer around a poller.
   — a "99.97% success rate" — and is an outage if 37 of them land in the
   same minute. A single percentage describes neither case. Also checks that
   no cumulative meter ever decreased, flags any stall in the snapshot
-  cadence, and prints the current meters as dollars for comparison against
+  cadence (with the timestamp, so it can be cross-referenced against the
+  errors), and prints the current meters as dollars for comparison against
   the machine's own accounting screen.
+
+  The monotonicity check excludes columns that are **not** cumulative. On
+  its first real soak it flagged five decreases and all five were correct
+  behaviour: current credits is a *balance* that falls on every wager, the
+  "games since" counters reset to zero by definition when a door closes or
+  power cycles, stacker levels drop when the cashbox is emptied, and the
+  selected game number is an identifier rather than a meter. A check wrong
+  five times out of five is worse than none — it teaches the reader to skim
+  past the one that matters.
   ```
   python3 examples/soak_report.py soak.db
   ```

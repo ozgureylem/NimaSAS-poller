@@ -25,6 +25,34 @@ from pathlib import Path
 from collections import Counter
 from datetime import datetime
 
+# Columns that are NOT cumulative, and so may legitimately fall.
+#
+# The monotonicity check below assumed every meter column only ever rises.
+# On its first real soak it flagged five decreases and all five were correct
+# behaviour: current credits is a BALANCE that falls on every wager, the
+# "games since" counters reset to zero by definition when the door closes or
+# power cycles, the stacker levels drop when the cashbox is emptied, and the
+# selected game number is an identifier rather than a meter at all. A check
+# wrong five times out of five is worse than no check -- it teaches the
+# reader to skim past the one that matters.
+#
+# Matched as substrings so both the single-meter (sm_) and Table C-7 (c7_)
+# copies of the same quantity are covered, since this tool reads several
+# meters by two routes deliberately.
+NOT_CUMULATIVE = (
+    "current_credits",
+    "current_restricted_credits",
+    "games_since",
+    "selected_game_number",
+    "currently_in_stacker",
+    "hopper_level",
+)
+
+
+def is_cumulative(column: str) -> bool:
+    return not any(fragment in column for fragment in NOT_CUMULATIVE)
+
+
 # The meters worth eyeballing against the machine's own accounting screen,
 # which is the only check here that does not come from inside the database.
 SCREEN_METERS = (
@@ -108,8 +136,15 @@ def main() -> int:
     if gaps:
         median = sorted(gaps)[len(gaps) // 2]
         worst = max(gaps)
+        worst_at = stamps[gaps.index(worst) + 1]
         print(f"snapshot gap     median {median:.1f}s, worst {worst:.1f}s", end="")
-        print("  <- investigate: the loop stalled" if worst > max(median * 10, 60) else "")
+        if worst > max(median * 10, 60):
+            print(f"  <- the loop stalled, ending {worst_at:%Y-%m-%d %H:%M:%S}")
+            print(f"                 cross-reference that minute against the errors below; "
+                  f"a stall\n                 of {worst / median:.0f} cycles is a run of "
+                  f"aborted cycles, not one slow one")
+        else:
+            print()
 
     # --- failures, and crucially how they are distributed ----------------
     print()
@@ -160,8 +195,9 @@ def main() -> int:
     # or a meter read from the wrong machine. All three matter; none would
     # show up as a poll error.
     print()
-    meter_cols = [c for c in columns(conn, "meters_history")
-                  if c not in ("id", "polled_at")]
+    all_cols = [c for c in columns(conn, "meters_history") if c not in ("id", "polled_at")]
+    meter_cols = [c for c in all_cols if is_cumulative(c)]
+    skipped = [c for c in all_cols if not is_cumulative(c)]
     regressions = []
     for col in meter_cols:
         rows = [r[0] for r in conn.execute(
@@ -177,7 +213,11 @@ def main() -> int:
         print("  => A cumulative meter must never fall. RAM clear, decode fault,")
         print("     or the wrong machine. Resolve before trusting this data.")
     else:
-        print(f"meter monotonicity  OK across {len(meter_cols)} columns")
+        print(f"meter monotonicity  OK across {len(meter_cols)} cumulative columns")
+    if skipped:
+        print(f"  ({len(skipped)} columns excluded as not cumulative -- balances, "
+              f"\"since\" counters,")
+        print("   stacker levels and the selected game number all fall legitimately)")
 
     # --- the one check from outside the database -------------------------
     if table_exists(conn, "meters_current"):

@@ -102,3 +102,67 @@ def test_heartbeat_frequency_follows_heartbeat_every():
         counts[every] = len(beats)
 
     assert counts[4] > counts[16], counts
+
+
+def test_backfill_stops_once_the_buffer_is_clearly_absent():
+    """A machine with no printer has no ticket-out buffer, so it ignores
+    every index (4.4). That was 31 timeouts at every startup on the first EGT
+    Premier -- about 31 seconds of it, and 31 poll_errors rows that then
+    dominated an 18-hour soak report's failure count and hid a real cluster
+    elsewhere. If indices 1 and 2 are silent, 3 through 31 will be too.
+    """
+    import sqlite3
+
+    from sql_poll_logger import SCHEMA, backfill_ticket_out_history
+
+    class NoBuffer:
+        def __init__(self):
+            self.calls = 0
+
+        def send_enhanced_validation_information(self, function_code):
+            self.calls += 1
+            raise SASTimeoutError("no response")
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    client = NoBuffer()
+
+    found = backfill_ticket_out_history(client, conn, now_fn=lambda: "2026-10-24T01:33:00+00:00")
+
+    assert found == 0
+    assert client.calls == 2, f"stopped after {client.calls} indices, not 31"
+    rows = conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0]
+    assert rows == 1, "one row recording the absence, not one per index"
+
+
+def test_backfill_keeps_going_past_a_single_timeout():
+    """Only a RUN of silence means the feature is absent. One timeout among
+    answering indices is a transient and must not truncate the scan, or a
+    blip would silently skip real records further up the buffer.
+    """
+    import sqlite3
+
+    from sql_poll_logger import SCHEMA, backfill_ticket_out_history
+
+    class Flaky:
+        def __init__(self):
+            self.calls = 0
+
+        def send_enhanced_validation_information(self, function_code):
+            self.calls += 1
+            if function_code == 1:
+                raise SASTimeoutError("transient")
+            raise _Empty()
+
+    class _Empty(Exception):
+        pass
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    client = Flaky()
+    try:
+        backfill_ticket_out_history(client, conn, now_fn=lambda: "2026-10-24T01:33:00+00:00")
+    except Exception:
+        pass
+
+    assert client.calls >= 2, "a single timeout must not end the scan"
