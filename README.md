@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 251 tests, all against fake serial ports; run them with
+- **`tests/`** — 262 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -235,6 +235,21 @@ step-by-step guide to structuring a local SQL layer around a poller.
   (deliberately one program — see the module docstring for why). A
   runnable starting point for stress-testing over time or prototyping a
   persistence layer — see MANUAL.md §4/§6 for the schema and reasoning.
+
+  **An unsupported meter does not abort a cycle.** §4.4 requires a machine
+  that doesn't support a long poll to ignore it silently, so a single-meter
+  poll returns a timeout for "unsupported" and a timeout for "no answer" —
+  the same bytes for two different facts. Treating both as fatal meant a
+  cashless machine (no hopper, so LP `0x2C` never answers) abandoned **every**
+  cycle's meter write, which is what the first EGT Premier did: zero meter
+  rows and one `poll_errors` row per cycle, indefinitely. The distinction is
+  now made over time — a poll that has *never* answered is taken as
+  unsupported and its column left NULL, while one that answered before and
+  then goes silent is still a real failure and still aborts. A
+  permanently-NULL column doesn't misrepresent "as of `polled_at`" (the
+  machine has no such meter); one populated yesterday and missing today
+  does. Only a timeout qualifies — a checksum error is a link fault whatever
+  the machine supports.
 - **`legacy/`** — an earlier Python 2 implementation, kept for reference.
   **It has known, confirmed bugs** (wrong byte offsets, a fabricated
   field on a fund-transfer command, crashes on certain inputs) — don't
