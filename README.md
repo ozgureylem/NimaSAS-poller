@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 265 tests, all against fake serial ports; run them with
+- **`tests/`** — 269 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -129,8 +129,11 @@ step-by-step guide to structuring a local SQL layer around a poller.
   as a NACK and re-queue. So enabling RTE breaks this client everywhere at
   once — `general_poll()` reads exactly one byte, and any long poll may come
   back as an event. `poll_test_tool.py` will happily send `0x0E 01`; if
-  someone does, the machine looks dead and the fix is `0x0E 00` or a power
-  cycle (the spec requires machines to default to non-RTE on power up).
+  someone does, the machine looks dead and the fix is
+  `exception_monitor.py --disable-rte`, or a power cycle (the spec requires
+  machines to default to non-RTE on power up). That recovery exists as its
+  own flag because a machine stuck in RTE cannot be recovered by the tools
+  that assume it is not.
   Game start/end need none of this.
 
   **§12.4 is handled.** Every long poll goes through one place in the client,
