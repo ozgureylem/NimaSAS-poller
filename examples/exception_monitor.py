@@ -94,6 +94,10 @@ def main() -> int:
                     help="after each GAME HAS ENDED, read current credits and total coin out "
                          "and show them on the line. One extra exchange per game: both are "
                          "Table C-7 codes, so LP 0x6F fetches them together.")
+    ap.add_argument("--disable-rte", action="store_true",
+                    help="send LP 0x0E 00 and exit. Recovery for a machine left in real "
+                         "time event mode -- in that state an ordinary poll loop mis-frames "
+                         "every reply, so nothing else works until it is cleared.")
     ap.add_argument("--rte", action="store_true",
                     help="enable real time event reporting (LP 0x0E) for this run and "
                          "turn it back off on exit -- adds reel stops, cards held, and "
@@ -110,6 +114,24 @@ def main() -> int:
     client = SASClient(
         SASTransport(port, byte_timeout=args.timeout), args.address, timeout=args.timeout
     )
+
+    if args.disable_rte:
+        # Assume it IS on: that is the only reason to run this, and the
+        # RTE-aware read path is the one that copes either way.
+        client._rte_active = True
+        print("Sending LP 0x0E 00 to leave real time event mode...")
+        try:
+            client.enable_real_time_events(False)
+        except SASError as e:
+            print(f"Failed: {type(e).__name__}: {e}", file=sys.stderr)
+            print("If this keeps failing, power cycle the machine -- section 12 "
+                  "requires machines to default to the ordinary polling mode on "
+                  "power up.", file=sys.stderr)
+            return 1
+        print("RTE disabled. Exceptions are single-byte codes again.")
+        for event in client.drain_rte_events():
+            print(f"  (collected on the way out: 0x{event.code:02X} {event.description})")
+        return 0
 
     print(f"{args.port} @ {args.baud}, address {args.address}, polling every {args.interval}s")
     print("Play the machine. Ctrl-C to stop.\n")

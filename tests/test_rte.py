@@ -194,10 +194,12 @@ def test_rte_is_only_marked_active_after_the_machine_acks():
 
 def test_repeated_preemption_eventually_gives_up_rather_than_looping():
     """A machine with more queued events than the poll has retries must not
-    hang the caller forever."""
+    hang the caller forever. The limit is deliberately generous -- every
+    retry collects a real event, so a backlog being drained is progress, not
+    a spin -- but it is bounded."""
     from saspy.bcd import encode_bcd
 
-    many = _event(0x7F, encode_bcd(0, 4)) * 10
+    many = _event(0x7F, encode_bcd(0, 4)) * 30
     client = SASClient(SASTransport(FakeSerial(many), wake_byte=None), ADDRESS, timeout=1.0)
     client._rte_active = True
 
@@ -208,3 +210,38 @@ def test_repeated_preemption_eventually_gives_up_rather_than_looping():
 
     # The events seen along the way are still kept, not thrown away.
     assert len(client.drain_rte_events()) >= 1
+
+
+def test_a_one_byte_ack_is_not_mistaken_for_the_start_of_an_event():
+    """The bug that stranded a machine in RTE mode.
+
+    A Table 7.4b ACK is a single byte with no CRC, and an RTE event also
+    begins with the address byte, so the two are indistinguishable until the
+    next byte arrives -- or fails to. Reading two bytes unconditionally hangs
+    on a genuine ACK, which is how disabling RTE failed with "got 1/2 bytes
+    before timeout": the machine had acked correctly and the read was waiting
+    for a byte that was never coming. The machine could then not be taken out
+    of RTE mode at all, which is precisely when it matters.
+    """
+    fake = FakeSerial(bytes([ADDRESS]))  # one byte, nothing after it
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=1.0)
+    client._rte_active = True
+
+    client.enable_real_time_events(False)  # must not raise
+
+    assert client._rte_active is False, "RTE must actually be cleared"
+
+
+def test_an_event_arriving_in_place_of_an_ack_is_still_caught():
+    """The other half: if an event really does pre-empt the ACK, the poll is
+    reissued and the event kept, exactly as for a longer response."""
+    from saspy.bcd import encode_bcd
+
+    fake = FakeSerial(_event(0x7F, encode_bcd(0, 4)) + bytes([ADDRESS]))
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=1.0)
+    client._rte_active = True
+
+    client.enable_real_time_events(False)
+
+    assert client._rte_active is False
+    assert [e.code for e in client.drain_rte_events()] == [0x7F]

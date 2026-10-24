@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+from pathlib import Path
 from collections import Counter
 from datetime import datetime
 
@@ -59,6 +60,18 @@ def main() -> int:
                     help="the poller's --interval, used to estimate expected cycles (default 1.0)")
     args = ap.parse_args()
 
+    # "unable to open database file" is sqlite's message for a path that does
+    # not exist AND for one it cannot read, which sends people looking for a
+    # permissions problem when the poller simply never ran.
+    if not Path(args.db).exists():
+        print(f"{args.db} does not exist.", file=sys.stderr)
+        print("\nNothing has written it yet. Run the poller first, e.g.:", file=sys.stderr)
+        print(f"  python3 examples/sql_poll_logger.py gateway.ini --db {args.db} "
+              f"--cycles 3 --interval 1.0", file=sys.stderr)
+        print("\nand if gateway.ini does not exist either:", file=sys.stderr)
+        print("  printf '[connection]\\nport = /dev/ttyS0\\naddress = 1\\n' > gateway.ini",
+              file=sys.stderr)
+        return 2
     try:
         conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     except sqlite3.Error as e:

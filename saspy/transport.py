@@ -262,7 +262,7 @@ class SASTransport:
         response_length: int | None = None,
         header_length: int = 3,
         crc_length: int = 2,
-        max_requeue: int = 4,
+        max_requeue: int = 24,
     ) -> bytes:
         """A long poll that survives being pre-empted by a real time event.
 
@@ -295,6 +295,30 @@ class SASTransport:
             for _ in range(max_requeue):
                 self._serial.reset_input_buffer()
                 self.write_with_wakeup(frame)
+
+                if response_length == 1:
+                    # A Table 7.4b ACK is a single byte with no CRC, and an RTE
+                    # event also begins with the address byte -- so the two are
+                    # indistinguishable until the NEXT byte arrives, or fails
+                    # to. Reading two bytes unconditionally hangs on a genuine
+                    # ACK, which is how disabling RTE came to fail with
+                    # "got 1/2 bytes": the machine had acked correctly and the
+                    # read was waiting for a byte that was never coming, so the
+                    # machine could not be taken out of RTE mode at all.
+                    first = self._read_exact(1, deadline)
+                    try:
+                        # At 19200 baud a following byte is under a millisecond
+                        # behind, so a short wait settles it either way.
+                        second = self._read_exact(1, time.monotonic() + 0.03)
+                    except SASTimeoutError:
+                        return first  # nothing followed: it was the ACK
+                    if second[0] == RTE_EVENT_IDENTIFIER:
+                        code = self._read_exact(1, deadline)[0]
+                        body = self._read_exact(data_len_for(code) + crc_length, deadline)
+                        on_event(first + second + bytes([code]) + body)
+                        continue
+                    return first + second
+
                 head = self._read_exact(2, deadline)
                 if head[1] == RTE_EVENT_IDENTIFIER:
                     code = self._read_exact(1, deadline)[0]
@@ -307,8 +331,10 @@ class SASTransport:
                 return header + self._read_exact(header[-1] + crc_length, deadline)
             raise SASTimeoutError(
                 f"long poll pre-empted by a real time event {max_requeue} times "
-                f"(section 12.3); the machine has more events queued than this "
-                f"poll has retries"
+                f"in a row (section 12.3). Each retry collected a real event, so "
+                f"this is a backlog being drained rather than a fault -- the "
+                f"machine simply had more queued than one poll's retries. The "
+                f"events are not lost; collect them with drain_rte_events()."
             )
 
     def general_poll_rte(
