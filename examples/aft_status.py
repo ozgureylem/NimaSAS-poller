@@ -39,6 +39,37 @@ from saspy.serial_port import open_serial_port
 from saspy.transport import SASTransport
 
 
+# Table 8.2b, transcribed from the spec. Bit 3 of AFT status and bit 0 of
+# available transfers are the two that decide whether a transfer is even
+# worth attempting, and neither is legible as a hex byte.
+AFT_STATUS_BITS = (
+    "printer available for transaction receipts",
+    "transfer to host of less than full available amount allowed",
+    "custom ticket data supported",
+    "AFT REGISTERED",
+    "in-house transfers enabled",
+    "bonus transfers enabled",
+    "debit transfers enabled",
+    "ANY AFT ENABLED",
+)
+AVAILABLE_TRANSFER_BITS = {
+    0: "transfer TO gaming machine OK",
+    1: "transfer FROM gaming machine OK",
+    2: "transfer to printer OK",
+    3: "win amount pending cashout to host",
+    4: "bonus award to gaming machine OK",
+    7: "Lock After Transfer supported",
+}
+GAME_LOCK = {0x00: "LOCKED", 0x40: "lock pending", 0xFF: "not locked"}
+
+
+def show_bits(value, names):
+    for bit in sorted(names):
+        label = names[bit] if isinstance(names, dict) else names[bit]
+        on = value >> bit & 1
+        print(f"      bit {bit}  {'1' if on else '0'}  {'YES' if on else 'no':3}  {label}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("port")
@@ -88,17 +119,26 @@ def main() -> int:
         print("  code for this status before deciding anything.\n")
     except SASError as e:
         print(f"0x73 failed: {type(e).__name__}: {e}")
-        print("  A machine with AFT off may simply ignore this (section 4.4).\n")
+        print("  Per section 8.1 the machine SHOULD answer a read-current-registration")
+        print("  poll -- 'must still respond with the most recently received")
+        print("  registration key, even if it is not currently registered'. Silence")
+        print("  means it does not implement 0x73 at all, which section 4.4 permits")
+        print("  by ignoring unsupported long polls. That is consistent with debit")
+        print("  transfers being off, since registration exists for debit. Check")
+        print("  0x74's AFT status bit 3 below for the registration state instead.\n")
 
     # --- 0x74 with 0xFF: status without touching the lock ----------------
     try:
         lock = client.aft_game_lock_and_status_request(lock_code=0xFF)
         print("0x74 lock and status (query only, lock untouched)")
         print(f"    asset_number            {lock.asset_number}")
-        print(f"    game_lock_status        0x{lock.game_lock_status:02X}")
-        print(f"    available_transfers     0x{lock.available_transfers:02X}")
-        print(f"    host_cashout_status     0x{lock.host_cashout_status:02X}")
+        print(f"    game_lock_status        0x{lock.game_lock_status:02X}"
+              f"  ({GAME_LOCK.get(lock.game_lock_status, 'unknown code')})")
         print(f"    aft_status              0x{lock.aft_status:02X}")
+        show_bits(lock.aft_status, dict(enumerate(AFT_STATUS_BITS)))
+        print(f"    available_transfers     0x{lock.available_transfers:02X}")
+        show_bits(lock.available_transfers, AVAILABLE_TRANSFER_BITS)
+        print(f"    host_cashout_status     0x{lock.host_cashout_status:02X}")
         print(f"    transfer limit          {lock.gaming_machine_transfer_limit / 100:,.2f}")
         print(f"    credits on machine      cashable {lock.current_cashable_amount / 100:,.2f}"
               f"  restricted {lock.current_restricted_amount / 100:,.2f}"
@@ -108,9 +148,39 @@ def main() -> int:
         if lock.gaming_machine_transfer_limit == 0:
             print("  transfer limit is 0: this machine will not accept a host")
             print("  transfer of any size as currently configured.")
-        if lock.game_lock_status not in (0xFF, 0x00):
-            print(f"  game_lock_status 0x{lock.game_lock_status:02X} is not idle -- resolve that")
-            print("  before attempting a transfer.")
+
+        aft_on = bool(lock.aft_status & 0x80)
+        in_house = bool(lock.aft_status & 0x10)
+        debit = bool(lock.aft_status & 0x40)
+        registered = bool(lock.aft_status & 0x08)
+        to_machine = bool(lock.available_transfers & 0x01)
+
+        if not aft_on:
+            print("  AFT is disabled on this machine (status bit 7 clear). The spec")
+            print("  has both these fields read zero in that case, so nothing else")
+            print("  here is meaningful until it is enabled.")
+        elif not to_machine:
+            # The distinction that matters: configuration vs current state.
+            print("  AFT is ENABLED, but available_transfers says no transfer type is")
+            print("  accepted RIGHT NOW -- including transfer to the gaming machine.")
+            print("  Those bits are current state, not configuration: the spec sets")
+            print("  them from 'a state where it might be able to accept' the type.")
+            print("  Section 8.3 names the conditions that rule it out, among them")
+            print("  door open, OPERATOR MENU, tilt, disabled, waiting for handpay.")
+            print("  If the machine is sitting in its accounting or attendant menu,")
+            print("  that alone explains this. Return it to normal idle play and")
+            print("  re-run before reading anything further into it.")
+            if not registered and not debit:
+                print()
+                print("  Registration is NOT the cause. Per section 8.1 it is required")
+                print("  for DEBIT transfers only, and debit is disabled here, so an")
+                print("  unregistered machine can still do in-house transfers.")
+        else:
+            print(f"  Transfer to gaming machine is currently available, in-house"
+                  f" {'on' if in_house else 'OFF'}, up to"
+                  f" {lock.gaming_machine_transfer_limit / 100:,.2f}.")
+            if lock.game_lock_status != 0xFF:
+                print(f"  But game_lock_status is 0x{lock.game_lock_status:02X} -- resolve that first.")
     except SASError as e:
         print(f"0x74 failed: {type(e).__name__}: {e}")
         print("  If 0x73 answered and this did not, report both -- that pairing")
