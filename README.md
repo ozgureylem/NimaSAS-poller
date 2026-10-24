@@ -163,6 +163,20 @@ step-by-step guide to structuring a local SQL layer around a poller.
   ```
   python3 examples/aft_push_credits.py /dev/ttyS0 --address 1 --acknowledge-only
   ```
+- **`examples/poll_gap_probe.py`** — read-only. Finds what causes exception
+  `0x70`, buffer overflow. Measured on an EGT Premier at turbo play: ~2.4
+  exceptions/sec against a monitor polling 4.5/sec, with **zero** overflow —
+  so a fast player does not outrun a loop that is actually polling, and
+  raising the poll rate is not the fix. What matters is the **budget**: at
+  2.4/sec a ~35-deep queue is about **15 seconds** of not polling. The usual
+  culprit on a gateway is its own long polls — one general poll per cycle,
+  then a meter sweep of dozens of exchanges during which nothing drains the
+  queue. This times the real sweep (it imports `sql_poll_logger`'s own
+  `_poll_all_meters` rather than imitating it) in each `--skip-*`
+  configuration and converts each duration into exceptions accumulated.
+  ```
+  python3 examples/poll_gap_probe.py /dev/ttyS0 --address 1
+  ```
 - **`examples/exception_buffer_probe.py`** — read-only. Measures how many
   exceptions a machine really buffers. §2.2.1 requires "a first in/first out
   (FIFO) exception queue of **at least 20 elements** in non-volatile
