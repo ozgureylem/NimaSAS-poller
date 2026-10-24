@@ -1759,6 +1759,17 @@ def _sas_poll_interval(value: str) -> float:
 
 
 def main() -> int:
+    # Line-buffer stdout. Python block-buffers it when it is not a terminal,
+    # so under `nohup ... > soak.log` nothing appears until ~8KB has built up
+    # -- about four minutes of cycles at ~250 bytes each. A long-running
+    # process whose log stays empty for minutes after it starts is
+    # indistinguishable from one that failed to start, and the first thing
+    # anyone does is tail the log. Costs nothing: one flush per cycle.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass  # not a reconfigurable stream; the log is merely less prompt
+
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("config", help="gateway .ini file (see saspy/config.py or MANUAL.md)")
     parser.add_argument("--db", default="gateway.sqlite3", help="SQLite file to write to")

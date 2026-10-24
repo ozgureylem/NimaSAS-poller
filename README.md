@@ -230,6 +230,11 @@ step-by-step guide to structuring a local SQL layer around a poller.
   ```
   python3 examples/soak_report.py soak.db
   ```
+  Safe to run while a soak is in progress — it opens the database read-only,
+  and is the reliable way to check a backgrounded run is working. (The
+  poller line-buffers its own stdout for the same reason: block-buffered,
+  a `nohup … > soak.log` log stays empty for minutes after a perfectly
+  healthy start, which is indistinguishable from a failure to start.)
 - **`examples/aft_status.py`** — read-only AFT interrogation: long polls
   `0x73` and `0x74` with their query-only codes (`0xFF`, "report state,
   change nothing"). Answers whether a host is registered, what the machine's
