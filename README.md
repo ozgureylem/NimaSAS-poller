@@ -109,6 +109,27 @@ step-by-step guide to structuring a local SQL layer around a poller.
   **backend** enforces, not just the UI. `--lab-mode` drops that
   confirmation for a bench where a locked machine is a non-event — a
   deliberate startup flag, never the default.
+- **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
+  and says whether the link held. It buckets failures by hour and minute
+  and reports the worst minute alongside the mean, because the failure mode
+  that matters is a **bursty** one: 43 failures over four hours is 0.18/min
+  — a "99.97% success rate" — and is an outage if 37 of them land in the
+  same minute. A single percentage describes neither case. Also checks that
+  no cumulative meter ever decreased, flags any stall in the snapshot
+  cadence, and prints the current meters as dollars for comparison against
+  the machine's own accounting screen.
+  ```
+  python3 examples/soak_report.py soak.db
+  ```
+- **`examples/aft_status.py`** — read-only AFT interrogation: long polls
+  `0x73` and `0x74` with their query-only codes (`0xFF`, "report state,
+  change nothing"). Answers whether a host is registered, what the machine's
+  transfer limit is, and what credits are on it — before anyone sends
+  `0x72`, which is the one command in this library that moves money and has
+  never run against hardware.
+  ```
+  python3 examples/aft_status.py /dev/ttyS0 --address 1
+  ```
 - **`examples/commission_gateway.py`** — run this once when a gateway is
   attached to a new EGM: scans ports/addresses, confirms a find by
   querying the machine's SAS version and serial number, and writes a
