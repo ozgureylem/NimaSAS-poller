@@ -269,9 +269,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from saspy.config import connect_from_config
-from saspy.exceptions import SASPortCapabilityError
 from saspy.constants import SIMPLE_METER_WIDTH_BCD, ExceptionCode, LongPoll, MeterCode, ValidationType
-from saspy.exceptions import SASError
+from saspy.exceptions import SASError, SASPortCapabilityError, SASTimeoutError
 from saspy.models import EnhancedValidationInfo
 
 DEFAULT_VALIDATION_SYSTEM_ID = 1  # 0 means "deny" per Table 15.8a — never use it for a real pool entry
@@ -1108,6 +1107,67 @@ def _capture_ticket_in_completion(client, conn: sqlite3.Connection, now: str) ->
     print(f"[{now}] ticket-in completion captured: machine_status=0x{result.machine_status:02X} amount_cents={result.amount_cents}")
 
 
+class _MeterSupport:
+    """Which optional meter polls this machine has ever answered.
+
+    Section 4.4 requires a machine that does not support a long poll to
+    ignore it silently, so for a single-meter poll there is no way to tell
+    "unsupported" from "no answer" in one exchange: both are a timeout.
+    Treating either as a cycle-aborting failure means a machine missing any
+    one optional meter can never write a meter row at all -- and that is not
+    hypothetical. A cashless machine has no hopper, so LP 0x2C
+    (SEND_CURRENT_HOPPER_LEVEL) never answers, and on the first EGT Premier
+    tested it aborted every cycle before a single row was written.
+
+    The distinction is therefore made over time rather than per exchange: a
+    poll that has NEVER answered is taken as unsupported and its column left
+    NULL, while a poll that HAS answered before and now times out is a real
+    failure and still aborts the cycle. A column that is permanently NULL
+    does not misrepresent "as of polled_at" -- the machine has no such meter.
+    One that was populated yesterday and is missing today does, which is why
+    the two are not treated alike.
+    """
+
+    def __init__(self):
+        self.answered: set[str] = set()
+        self.unsupported: set[str] = set()
+
+    def record_success(self, name: str) -> None:
+        self.answered.add(name)
+        self.unsupported.discard(name)
+
+    def is_known_good(self, name: str) -> bool:
+        return name in self.answered
+
+    def record_unsupported(self, name: str) -> None:
+        self.unsupported.add(name)
+
+
+METER_SUPPORT = _MeterSupport()
+
+
+def _poll_optional(support: _MeterSupport, name: str, fn, *args):
+    """A meter poll whose absence is a per-column NULL rather than a fault.
+
+    Only a timeout is taken as "unsupported", because silence is the one
+    thing section 4.4 specifies for an unsupported long poll. A checksum or
+    address error is a real fault whatever the machine supports, and still
+    aborts the cycle. And a timeout from a poll that has answered before is
+    a real failure too -- that is the whole point of keeping the ledger.
+    """
+    try:
+        result = fn(*args)
+    except SASTimeoutError as e:
+        if support.is_known_good(name):
+            raise _MeterPollFailure(name, e) from e
+        support.record_unsupported(name)
+        return None
+    except SASError as e:
+        raise _MeterPollFailure(name, e) from e
+    support.record_success(name)
+    return result
+
+
 class _MeterPollFailure(Exception):
     """Internal signal: one meter poll failed. Carries which poll and the
     original SASError so the caller can log a precise poll_errors row.
@@ -1164,9 +1224,14 @@ def _poll_all_meters(
 
     def poll(name, fn, *args):
         try:
-            return fn(*args)
+            result = fn(*args)
         except SASError as e:
             raise _MeterPollFailure(name, e) from e
+        METER_SUPPORT.record_success(name)
+        return result
+
+    def poll_optional(name, fn, *args):
+        return _poll_optional(METER_SUPPORT, name, fn, *args)
 
     meters = poll("send_meters_10_through_15", client.send_meters_10_through_15)
     values.update({f: getattr(meters, f) for f in METER_FIELDS})
@@ -1215,15 +1280,26 @@ def _poll_all_meters(
         # soft per-field skip. Folding it in unconditionally would abort
         # every cycle's row write on such a machine; see --skip-last-
         # accepted-bill-poll.
-        bill = poll("send_last_accepted_bill_information", client.send_last_accepted_bill_information)
-        values.update(zip(LP48_METER_COLUMNS, (bill.country_code, bill.denomination_code, bill.bill_meter)))
+        bill = poll_optional(
+            "send_last_accepted_bill_information", client.send_last_accepted_bill_information
+        )
+        if bill is None:
+            # The docstring above anticipated exactly this: machines that do
+            # not implement LP 0x48 ignore it, and aborting on that would end
+            # every cycle. NULL the three columns instead.
+            for column in LP48_METER_COLUMNS:
+                values[column] = None
+        else:
+            values.update(
+                zip(LP48_METER_COLUMNS, (bill.country_code, bill.denomination_code, bill.bill_meter))
+            )
     else:
         for column in LP48_METER_COLUMNS:
             values[column] = None
 
     if full_sweep:
         for lp, column in SINGLE_METER_COLUMNS.items():
-            values[column] = poll(f"send_meter({lp.name})", client.send_meter, lp)
+            values[column] = poll_optional(f"send_meter({lp.name})", client.send_meter, lp)
     else:
         for column in SINGLE_METER_COLUMNS.values():
             values[column] = None

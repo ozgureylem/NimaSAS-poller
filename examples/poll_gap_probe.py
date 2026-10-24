@@ -40,7 +40,7 @@ from saspy.exceptions import SASError
 from saspy.serial_port import open_serial_port
 from saspy.transport import SASTransport
 
-from sql_poll_logger import _poll_all_meters  # the real sweep, not a copy
+from sql_poll_logger import _MeterPollFailure, _poll_all_meters  # the real sweep, not a copy
 
 # Measured, not assumed. Override both if your machine differs.
 DEFAULT_EVENT_RATE = 2.4   # exceptions/sec at turbo play, measured
@@ -48,13 +48,22 @@ DEFAULT_QUEUE_DEPTH = 35   # measured on an EGT Premier; spec floor is 20
 SPEC_MINIMUM_QUEUE = 20
 
 
-def time_sweep(client, **flags) -> tuple[float, int, int]:
-    """Run one sweep; return (seconds, values obtained, values NULL)."""
+def time_sweep(client, **flags) -> tuple[float, int, int, str | None]:
+    """Run one sweep; return (seconds, values obtained, values NULL, abort).
+
+    A sweep that aborts is still a measurement -- the gap it leaves in the
+    general poll is however long it ran before giving up -- so the duration
+    is returned either way, with the reason it stopped.
+    """
     started = time.monotonic()
-    values = _poll_all_meters(client, **flags)
+    try:
+        values = _poll_all_meters(client, **flags)
+    except _MeterPollFailure as failure:
+        elapsed = time.monotonic() - started
+        return elapsed, 0, 0, f"{failure.poll_name}: {failure.original}"
     elapsed = time.monotonic() - started
     got = sum(1 for v in values.values() if v is not None)
-    return elapsed, got, len(values) - got
+    return elapsed, len(values) - got, got, None
 
 
 def main() -> int:
@@ -103,15 +112,18 @@ def main() -> int:
     results = []
     for label, flags in configs:
         try:
-            elapsed, got, nulls = time_sweep(client, **flags)
+            elapsed, nulls, got, abort = time_sweep(client, **flags)
         except SASError as e:
-            print(f"  {label:34} FAILED: {type(e).__name__}: {e}")
+            print(f"  {label:34} link failure: {type(e).__name__}: {e}")
             continue
-        lost = max(0, (elapsed - 0) * args.event_rate)
+        lost = elapsed * args.event_rate
         verdict = "OVERFLOWS" if elapsed > budget else "ok"
         results.append((label, elapsed, got, nulls, lost, verdict))
-        print(f"  {label:34} {elapsed:6.2f}s  {got:3} meters  "
+        detail = f"{got:3} meters" if abort is None else "ABORTED"
+        print(f"  {label:34} {elapsed:6.2f}s  {detail}  "
               f"~{lost:4.0f} exceptions queued  {verdict}")
+        if abort:
+            print(f"       aborted on {abort}")
         # Keep the machine answered between configurations so this probe is
         # not itself the thing that overflows the queue.
         for _ in range(5):
@@ -124,6 +136,13 @@ def main() -> int:
     if not results:
         print("No sweep completed. Fix the link before reading anything into this.")
         return 1
+
+    aborted = [r for r in results if r[2] == 0 and r[3] == 0]
+    if aborted:
+        print("\nSome sweeps aborted before finishing. On a build from before the")
+        print("unsupported-meter fix that is expected on any machine missing an")
+        print("optional meter -- a cashless machine has no hopper, so LP 0x2C never")
+        print("answers and the whole cycle used to abort there. Pull and re-run.")
 
     worst = max(results, key=lambda r: r[1])
     print(f"Longest gap without a general poll: {worst[1]:.2f}s  ({worst[0]})")
