@@ -194,3 +194,64 @@ def test_the_exception_queue_is_specified_as_at_least_twenty_deep():
     # never queued at all.
     assert describe_exception(0x11) == "slot door was opened"
     assert describe_exception(0x12) == "slot door was closed"
+
+
+def test_interrogation_poll_is_table_8_3b_not_a_full_transfer_body():
+    """The poll that stops exception 0x69. Table 8.3b is length 02 -- transfer
+    code plus transaction index, nothing else. Sending a full Table 8.3a body
+    with transfer code FF would be a different message entirely.
+
+    Observed on an EGT Premier: a transfer answered with pending status 0x40
+    completed, and the machine then reissued exception 0x69 every 15.2 seconds
+    for minutes, exactly as section 8.8 requires, because nothing had sent
+    this. It is mandatory for any host that transfers funds, not optional.
+    """
+    from saspy.crc import crc16_bytes
+    from saspy.transport import SASTransport
+    from tests.test_client import FakeSerial
+
+    # Table 8.3c response, enough of it to parse: command, length, then the
+    # fixed head and the three length-prefixed meters at the tail.
+    data = (
+        bytes([0x01, 0x00, 0x00, 0x00])            # buffer position, status, receipt, type
+        + encode_bcd(2000, 5) + encode_bcd(0, 5) + encode_bcd(0, 5)
+        + bytes([0x00]) + bytes([246, 0, 0, 0])    # flags, asset number (LE)
+        + bytes([4]) + b"TEST"                     # transaction ID
+        + encode_bcd(10232026, 4) + encode_bcd(184500, 3)
+        + encode_bcd(0, 4) + bytes([0x00, 0x00])   # expiration, pool id
+        + bytes([5]) + encode_bcd(6341558, 5)
+        + bytes([5]) + encode_bcd(0, 5)
+        + bytes([5]) + encode_bcd(0, 5)
+    )
+    # The length byte counts everything after it, excluding the CRC -- get it
+    # wrong and exchange_length_prefixed reads the wrong number of bytes.
+    body = bytes([ADDRESS, 0x72, len(data)]) + data
+    fake = FakeSerial(body + crc16_bytes(body))
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=1.0)
+
+    client.aft_interrogate_transfer(0x00, acknowledge=True)
+
+    sent = bytes(fake.written)
+    assert sent[:4] == bytes([ADDRESS, 0x72, 0x02, 0xFF]), "length 02, transfer code FF"
+    assert sent[4] == 0x00, "transaction index 00 = current/most recent"
+    assert sent[5:] == crc16_bytes(sent[:5])
+
+
+def test_interrogation_can_read_without_acknowledging():
+    """Table 8.3b: transfer code FE is "identical to FF, except a response to
+    an FE interrogation does not in any way affect the current transfer
+    cycle". So FE reads status but does NOT stop the 0x69 reissue, and
+    machines without FE support answer with status C1.
+    """
+    from saspy.crc import crc16_bytes
+    from saspy.transport import SASTransport
+    from tests.test_client import FakeSerial
+
+    fake = FakeSerial(b"")
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=0.01)
+    try:
+        client.aft_interrogate_transfer(0x00, acknowledge=False)
+    except Exception:
+        pass  # no response in the fake; the frame is what is under test
+
+    assert bytes(fake.written)[:4] == bytes([ADDRESS, 0x72, 0x02, 0xFE])

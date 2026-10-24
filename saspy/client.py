@@ -867,6 +867,44 @@ class SASClient:
         command_and_data += bytes([len(body)]) + body
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
         raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        return self._parse_aft_transfer_response(raw)
+
+    def aft_interrogate_transfer(
+        self, transaction_index: int = 0x00, *, acknowledge: bool = True
+    ) -> models.AftTransferResult:
+        """LP 0x72 interrogation form (Table 8.3b) -- length 02, no body.
+
+        This is what stops a machine nagging. Section 8.8: when a transfer
+        that was answered with pending status 40 completes, the machine
+        issues exception 69, AFT transfer complete, and "if the host does not
+        respond with a proper interrogation poll, the gaming machine must
+        reissue exception 69 every 15 seconds until the host polls for and
+        acknowledges the completion status". Measured on an EGT Premier:
+        15.2 seconds, indefinitely, until this poll is sent.
+
+        That makes this mandatory rather than optional for any host that
+        transfers funds -- an unacknowledged completion is a permanent
+        15-second beat in the exception stream, and exception 69 is a
+        priority exception, so it is delivered ahead of anything queued.
+
+        ``acknowledge=False`` sends transfer code FE instead of FF, which
+        Table 8.3b defines as identical "except a response to an FE
+        interrogation does not in any way affect the current transfer cycle".
+        Use it to read status without acknowledging -- and note it does NOT
+        stop the reissue, and that machines without FE support answer with
+        transfer status C1, unsupported transfer code.
+
+        ``transaction_index``: 00 is the current or most recent transaction,
+        01-7F an absolute history buffer position, 81-FF a relative index.
+        """
+        poll = LongPoll.AFT_TRANSFER_FUNDS
+        command_and_data = bytes([poll, 0x02, 0xFF if acknowledge else 0xFE, transaction_index])
+        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        return self._parse_aft_transfer_response(raw)
+
+    def _parse_aft_transfer_response(self, raw: bytes) -> models.AftTransferResult:
+        """Table 8.3c, shared by the initiating poll and the interrogation."""
         payload = self._strip(raw)
 
         idx = 2  # skip command + length

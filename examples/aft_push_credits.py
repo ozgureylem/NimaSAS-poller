@@ -76,14 +76,24 @@ def main() -> int:
     ap.add_argument("--address", type=int, default=1)
     ap.add_argument("--baud", type=int, default=19200)
     ap.add_argument("--timeout", type=float, default=1.0)
-    ap.add_argument("--amount", type=float, required=True,
+    ap.add_argument("--amount", type=float, default=None,
                     help="cashable amount to transfer, in currency units (e.g. 20.00)")
     ap.add_argument("--transaction-id", default=None,
                     help="ASCII, 1-20 chars; defaults to a timestamp, which keeps it "
                          "unique (status 81 rejects a repeat of the last successful one)")
     ap.add_argument("--yes", action="store_true", help="skip the typed confirmation")
+    ap.add_argument("--acknowledge-only", action="store_true",
+                    help="send nothing but the interrogation poll (0x72 transfer code FF) "
+                         "to acknowledge an already-completed transfer and stop a machine "
+                         "reissuing exception 0x69 every 15 seconds. Moves no money.")
     args = ap.parse_args()
 
+    if args.acknowledge_only:
+        return acknowledge_only(args)
+
+    if args.amount is None:
+        print("--amount is required (or use --acknowledge-only).", file=sys.stderr)
+        return 2
     cents = int(round(args.amount * 100))
     if cents <= 0:
         print("Amount must be positive.", file=sys.stderr)
@@ -191,9 +201,36 @@ def main() -> int:
         print(f"amount reported  {result.cashable_amount / 100:,.2f}")
 
     if category == "PENDING":
-        print("\nPending is not done. The machine has accepted the transfer but not"
-              " finished it; poll 0x72 with transfer code FF (status query) or watch"
-              " for exception 0x69, AFT transfer complete.")
+        # Mandatory, not optional. Section 8.8: a transfer answered with
+        # pending 40 that then completes makes the machine issue exception 69
+        # and "reissue exception 69 every 15 seconds until the host polls for
+        # and acknowledges the completion status". Measured at 15.2s,
+        # indefinitely. Leaving it unacknowledged puts a permanent beat in the
+        # machine's exception stream -- and as a priority exception it is
+        # delivered ahead of anything queued.
+        print("\nPending is not done. Acknowledging with the interrogation poll"
+              " (0x72 transfer code FF) so the machine does not reissue")
+        print("exception 0x69 every 15 seconds forever...")
+        for attempt in range(1, 13):
+            time.sleep(1.0)
+            try:
+                final = client.aft_interrogate_transfer(0x00, acknowledge=True)
+            except SASError as e:
+                print(f"  interrogation failed: {type(e).__name__}: {e}", file=sys.stderr)
+                break
+            cat, desc = describe_aft_transfer_status(final.transfer_status)
+            if cat != "PENDING":
+                print(f"  final status   0x{final.transfer_status:02X}  {cat}")
+                print(f"                 {desc}")
+                print(f"  buffer position {final.transaction_buffer_position}")
+                result = final
+                category, description = cat, desc
+                break
+            print(f"  still pending (attempt {attempt})...")
+        else:
+            print("  Still pending after 12 attempts. The machine will keep issuing"
+                  " 0x69 every 15s until acknowledged -- re-run the interrogation"
+                  " poll, or see the note in the README.", file=sys.stderr)
 
     time.sleep(0.5)
     after = read_meters(client)
@@ -202,6 +239,34 @@ def main() -> int:
     print("\nThe status byte is what the machine decided; the meter deltas are what"
           "\nhappened. Check the machine's own credit display too -- that is the"
           "\nthird source, and the only one not coming from this client.")
+    return 0
+
+
+def acknowledge_only(args) -> int:
+    """Clear a stuck exception 0x69 without transferring anything."""
+    try:
+        port = open_serial_port(args.port, baudrate=args.baud)
+    except Exception as e:  # noqa: BLE001
+        print(f"Could not open {args.port}: {e}", file=sys.stderr)
+        return 2
+    client = SASClient(
+        SASTransport(port, byte_timeout=args.timeout), args.address, timeout=args.timeout
+    )
+    print("Sending the interrogation poll (0x72, transfer code FF, index 00).")
+    print("This acknowledges the most recent transfer's completion status and")
+    print("moves no money.\n")
+    try:
+        result = client.aft_interrogate_transfer(0x00, acknowledge=True)
+    except SASError as e:
+        print(f"Interrogation failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    category, description = describe_aft_transfer_status(result.transfer_status)
+    print(f"  transfer status  0x{result.transfer_status:02X}  {category}")
+    print(f"                   {description}")
+    print(f"  buffer position  {result.transaction_buffer_position}")
+    print(f"  amount           {result.cashable_amount / 100:,.2f}")
+    print("\nIf that reported a completion status, exception 0x69 should stop.")
+    print("Confirm with exception_monitor.py -- it is the only way to be sure.")
     return 0
 
 

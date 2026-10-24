@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 249 tests, all against fake serial ports; run them with
+- **`tests/`** — 251 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -151,6 +151,17 @@ step-by-step guide to structuring a local SQL layer around a poller.
   byte is what the machine decided and the deltas are what happened.
   ```
   python3 examples/aft_push_credits.py /dev/ttyS0 --address 1 --amount 20.00
+  ```
+  A transfer answered with **pending** status `0x40` is not finished, and
+  leaving it unacknowledged is not harmless: §8.8 requires the machine to
+  issue exception `0x69` on completion and "reissue exception 69 **every 15
+  seconds** until the host polls for and acknowledges the completion status".
+  Measured on an EGT Premier at 15.2s, indefinitely — and `0x69` is a
+  *priority* exception, so it is delivered ahead of anything queued. The tool
+  therefore follows up with the Table 8.3b interrogation poll automatically.
+  To clear a machine already stuck in that loop, without moving money:
+  ```
+  python3 examples/aft_push_credits.py /dev/ttyS0 --address 1 --acknowledge-only
   ```
 - **`examples/exception_buffer_probe.py`** — read-only. Measures how many
   exceptions a machine really buffers. §2.2.1 requires "a first in/first out
