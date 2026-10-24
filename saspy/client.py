@@ -838,11 +838,20 @@ class SASClient:
 
         poll = LongPoll.AFT_TRANSFER_FUNDS
         command_and_data = bytes([poll])
-        # BUG FIX vs legacy: no `lock_timeout` field exists on long poll 0x72 —
-        # that belongs to 0x74. Legacy appended two extra bytes here that the
-        # spec's table 8.3a has no place for, and its length byte was computed
-        # to match (double-counting transaction_id length instead of counting
-        # receipt_data), which would desync framing on a real machine.
+        # CORRECTION to an earlier note here, which claimed long poll 0x72 has
+        # no lock_timeout field and that legacy's two extra bytes had no place
+        # in Table 8.3a. The table does list one, as its final field before the
+        # CRC: "Lock timeout 2 BCD ... Only used for Lock After Transfer
+        # request." It belongs to transfer flags bit 4 and Section 8.9 (new in
+        # 6.02), not to long poll 0x74. This method does not request Lock After
+        # Transfer, so it correctly omits the field -- Table 8.3a's length is
+        # variable (01-nn) and trailing fields may be left off -- but the
+        # omission is a consequence of not using the feature, not of the field
+        # not existing. Implementing Lock After Transfer means appending it.
+        #
+        # The other half of the original note stands: legacy's length byte
+        # double-counted transaction_id instead of counting receipt_data, which
+        # desyncs framing on a real machine.
         body = bytes([transfer_code, transaction_index, transfer_type])
         body += encode_bcd(cashable_amount, 5)
         body += encode_bcd(restricted_amount, 5)

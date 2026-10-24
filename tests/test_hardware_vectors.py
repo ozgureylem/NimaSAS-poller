@@ -145,3 +145,31 @@ def test_game_start_and_end_are_not_rte_only():
     assert 0x7F not in GENERAL_POLL_EXCEPTIONS_RTE_ONLY
     assert describe_exception(0x7E) == "GAME HAS STARTED"
     assert describe_exception(0x7F) == "GAME HAS ENDED"
+
+
+def test_aft_transfer_status_categories_come_from_the_top_three_bits():
+    """Table 8.3e's own note: the 3 MSbits give the category. A host that
+    only compares against 0x00 reads "partial transfer successful" as a
+    failure, and an undocumented code as nothing at all.
+    """
+    from saspy.constants import describe_aft_transfer_status
+
+    assert describe_aft_transfer_status(0x00)[0] == "SUCCESSFUL"
+    assert describe_aft_transfer_status(0x01)[0] == "SUCCESSFUL"
+    assert describe_aft_transfer_status(0x40)[0] == "PENDING"
+    for failed in (0x81, 0x84, 0x87, 0x93, 0x9F):
+        assert describe_aft_transfer_status(failed)[0] == "FAILED"
+    assert describe_aft_transfer_status(0xC1)[0] == "UNSUPPORTED POLL"
+    assert describe_aft_transfer_status(0xFF)[0] == "NO INFORMATION"
+
+
+def test_the_machines_own_aft_status_byte_decodes_as_observed():
+    """0xB2, read from the EGT Premier: AFT on, in-house and bonus transfers
+    enabled, debit off, not registered. Registration being absent is not a
+    blocker for in-house transfers -- section 8.1 requires it for debit only.
+    """
+    status = 0xB2
+    assert status & 0x80, "any AFT enabled"
+    assert status & 0x10, "in-house transfers enabled"
+    assert not status & 0x40, "debit transfers disabled"
+    assert not status & 0x08, "not registered"

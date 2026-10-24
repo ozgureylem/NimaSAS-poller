@@ -854,3 +854,81 @@ def rte_data_length(code: int) -> int:
 def describe_exception(code: int) -> str:
     """Plain-language name for a general poll exception code."""
     return GENERAL_POLL_EXCEPTIONS.get(code, f"unknown/unassigned code 0x{code:02X}")
+
+
+# --- Table 8.3e: AFT transfer status codes --------------------------------
+# The 3 most significant bits give the category, which is the part worth
+# checking first: 000 successful, 010 pending, 100 failed, 110 unsupported
+# poll, 111 no information. A host that only compares against 0x00 will read
+# "partial transfer successful" (0x01) as a failure.
+AFT_TRANSFER_STATUS: dict[int, str] = {
+    0x00: "full transfer successful",
+    0x01: "partial transfer successful",
+    0x40: "transfer pending (not complete)",
+    0x80: "transfer cancelled by host",
+    0x81: "transaction ID not unique (same as last successful transfer in history)",
+    0x82: "not a valid transfer function (unsupported type, amount, index)",
+    0x83: "not a valid transfer amount or expiration (non-BCD)",
+    0x84: "transfer amount exceeds the gaming machine transfer limit",
+    0x85: "transfer amount not an even multiple of gaming machine denomination",
+    0x86: "gaming machine unable to perform partial transfers to the host",
+    0x87: "gaming machine unable to perform transfers at this time "
+          "(door open, tilt, disabled, cashout in progress)",
+    0x88: "gaming machine not registered (required for debit transfers)",
+    0x89: "registration key does not match",
+    0x8A: "no POS ID (required for debit transfers)",
+    0x8B: "no won credits available for cashout",
+    0x8C: "no gaming machine denomination set (cannot convert cents to credits)",
+    0x8D: "expiration not valid for transfer to ticket (already expired)",
+    0x8E: "transfer to ticket device not available",
+    0x8F: "unable to accept transfer due to existing restricted amounts from a different pool",
+    0x90: "unable to print transaction receipt (receipt device not available)",
+    0x91: "insufficient data to print transaction receipt (required fields missing)",
+    0x92: "transaction receipt not allowed for specified transfer type",
+    0x93: "asset number zero or does not match",
+    0x94: "gaming machine not locked (transfer specified lock required)",
+    0x95: "transaction ID not valid",
+    0x9F: "unexpected error",
+    0xC0: "not compatible with current transfer in progress",
+    0xC1: "unsupported transfer code",
+    0xFF: "no transfer information available",
+}
+
+AFT_STATUS_CATEGORIES = {
+    0b000: "SUCCESSFUL",
+    0b010: "PENDING",
+    0b100: "FAILED",
+    0b110: "UNSUPPORTED POLL",
+    0b111: "NO INFORMATION",
+}
+
+
+def describe_aft_transfer_status(code: int) -> tuple[str, str]:
+    """(category, description) for a Table 8.3e status code.
+
+    The category comes from the 3 most significant bits, as the table's own
+    note directs, so an unlisted code still resolves to the right verdict
+    rather than to "unknown".
+    """
+    category = AFT_STATUS_CATEGORIES.get(code >> 5, f"unrecognised category (0x{code:02X})")
+    return category, AFT_TRANSFER_STATUS.get(code, f"undocumented status 0x{code:02X}")
+
+
+# Table 8.3d: AFT transfer types. 0x00 is the one for putting cashable
+# credits on a machine; Table C-7 confirms it by metering those transfers at
+# codes 00A0/00A1, which is how a push can be verified afterwards.
+class AftTransferType(enum.IntEnum):
+    IN_HOUSE_TO_GAMING_MACHINE = 0x00
+    BONUS_COIN_OUT_WIN_TO_GAMING_MACHINE = 0x10
+    BONUS_JACKPOT_WIN_TO_GAMING_MACHINE = 0x11  # forces an attendant pay lockup
+    IN_HOUSE_TO_TICKET = 0x20
+    DEBIT_TO_GAMING_MACHINE = 0x40
+    DEBIT_TO_TICKET = 0x60
+    IN_HOUSE_FROM_GAMING_MACHINE_TO_HOST = 0x80
+    WIN_AMOUNT_FROM_GAMING_MACHINE_TO_HOST = 0x90
+
+
+# Table 8.3a transfer codes.
+AFT_TRANSFER_CODE_FULL_ONLY = 0x00
+AFT_TRANSFER_CODE_PARTIAL_ALLOWED = 0x01
+AFT_TRANSFER_CODE_CANCEL = 0x80

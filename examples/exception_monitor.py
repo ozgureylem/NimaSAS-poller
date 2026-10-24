@@ -31,6 +31,13 @@ will happily send 0x0E 01), the machine looks dead and the fix is to send
 non-RTE polling on power up.
 
 Everything 0x7E/0x7F gives you works today, without any of that.
+
+OBSERVED DEVIATION: section 12.6 says a machine in RTE mode does not report
+exception code 00 (no activity) and implies idle by sending nothing at all.
+The EGT Premier tested here sends it anyway, as a well-formed five-byte
+event with a valid CRC, roughly every poll. This tool treats an RTE event
+with code 00 as idle for that reason. Anything relying on "an event arrived,
+therefore something happened" needs the same guard.
 """
 
 from __future__ import annotations
@@ -120,6 +127,15 @@ def main() -> int:
                         time.sleep(args.interval)
                         continue
                     seen[event.code] += 1
+                    if event.code == 0x00 and not args.show_idle:
+                        # Section 12.6 says a machine in this mode does not
+                        # report code 00 at all, and implies idle by sending
+                        # nothing. The EGT Premier sends it anyway, as a
+                        # well-formed 5-byte event with a valid CRC. Treat it
+                        # as the idle it plainly is rather than printing a
+                        # "no activity" line twice a second.
+                        time.sleep(args.interval)
+                        continue
                     mark = " *" if event.code in HIGHLIGHT else "  "
                     extra = ""
                     if event.fields:

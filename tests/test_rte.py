@@ -131,3 +131,19 @@ def test_data_lengths_come_from_the_tables_not_from_guessing():
     assert rte_data_length(0x8B) == 1   # 12.5.7
     assert rte_data_length(0x8C) == 2   # 12.5.8
     assert rte_data_length(0x11) == 0   # no 12.5.x table
+
+
+def test_rte_event_with_code_zero_is_still_a_valid_frame():
+    """Observed on the EGT Premier: section 12.6 says a machine in RTE mode
+    does not report code 00 and implies idle by sending nothing, but this one
+    sends a well-formed five-byte event with code 00 and a valid CRC on
+    almost every poll. The parser must accept it -- rejecting it would make a
+    chatty-but-idle machine look like a framing fault -- and callers must not
+    read "an event arrived" as "something happened".
+    """
+    event = _client(_event(0x00)).general_poll_rte()
+
+    assert event is not None
+    assert event.code == 0x00
+    assert event.description == "no activity"
+    assert event.fields == {}

@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 245 tests, all against fake serial ports; run them with
+- **`tests/`** — 248 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -137,6 +137,21 @@ step-by-step guide to structuring a local SQL layer around a poller.
   `finally` so a crash or Ctrl-C cannot leave the machine in a mode the
   ordinary poll loop mis-frames; if the restore itself fails it says so
   loudly, because nothing else will.
+- **`examples/aft_push_credits.py`** — **moves money.** Puts cashable
+  credits on a machine by AFT (Table 8.3d type `00`, in-house host→machine,
+  full transfer only). Registration is not needed: Table 8.3a states
+  "registration key (0 = registration not required)" and §8.1 that "a POS ID
+  is never required for in-house transfers". It pre-checks the things that
+  otherwise come back as a status code to look up — AFT and in-house enabled,
+  transfer-to-machine currently available (all-zero is usually the operator
+  menu or an open door, §8.3, and becomes status `87`), the amount against
+  the machine's limit (`84`), the asset number read from the machine rather
+  than guessed (`93`), and a transaction ID unique per run (`81`) — then
+  reads Table C-7 meters `00A0`/`00A1` before and after, because the status
+  byte is what the machine decided and the deltas are what happened.
+  ```
+  python3 examples/aft_push_credits.py /dev/ttyS0 --address 1 --amount 20.00
+  ```
 - **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
   and says whether the link held. It buckets failures by hour and minute
   and reports the worst minute alongside the mean, because the failure mode
