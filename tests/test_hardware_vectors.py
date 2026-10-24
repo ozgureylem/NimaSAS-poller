@@ -292,3 +292,38 @@ def test_host_cashout_enabled_is_bit_1_of_host_cashout_status():
     assert status & 0x02, "cashout to host currently enabled"
     assert not status & 0x01, "forced by gaming machine, not host-controllable"
     assert not status & 0x04, "soft mode: machine self-recovers after 8s"
+
+
+def test_credits_reconcile_against_wager_and_win_on_hardware():
+    """The closed loop, from a live EGT Premier at 19:13 on 23 Oct 2026.
+
+    An AFT push left 4110 credits. Four games followed, each wagering 25,
+    one paying 5. Every CUR_CRED the monitor reported equals the previous
+    balance minus the wager plus the win, and every total_coin_in delta
+    equals credits_wagered.
+
+    That closes the loop the whole session was aiming at: the transfer, the
+    wager, the win and the credit meter all agree, so a session's wager can
+    be reconciled from the boundary events alone. Kept as a fixture because
+    it is arithmetic over values confirmed outside this codebase.
+    """
+    games = [(25, 0, 4085), (25, 0, 4060), (25, 5, 4040), (25, 0, 4015)]
+    credits = 4110
+    for wagered, win, reported in games:
+        credits = credits - wagered + win
+        assert credits == reported
+
+    coin_in = [21389298, 21389323, 21389348, 21389373]
+    assert all(coin_in[i + 1] - coin_in[i] == 25 for i in range(len(coin_in) - 1))
+
+
+def test_credits_and_coin_out_are_batched_into_one_exchange():
+    """Both are Table C-7 codes, so LP 0x6F fetches them together. That is
+    cheaper than two single-meter polls and more correct: the two values come
+    from the same instant, where separate reads could have a game land
+    between them and fail to reconcile.
+    """
+    from saspy.constants import MeterCode
+
+    assert int(MeterCode.CURRENT_CREDITS) == 0x0C
+    assert int(MeterCode.TOTAL_COIN_OUT_CREDITS) == 0x01

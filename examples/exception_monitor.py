@@ -32,9 +32,12 @@ non-RTE polling on power up.
 
 Everything 0x7E/0x7F gives you works today, without any of that.
 
---credits adds the machine's current credit meter to each GAME HAS ENDED
-line. Table 12.5.4 carries only the game win, so that figure is a separate
-read (LP 0x1A) rather than part of the event -- one extra exchange per game.
+--credits adds the machine's current credits and total coin out to each
+GAME HAS ENDED line. Table 12.5.4 carries only the game win, so both are a
+separate read -- one LP 0x6F exchange, since they are Table C-7 codes 0x0C
+and 0x01 and can be fetched together. Batching is also the more correct
+choice: both values then come from the same instant and reconcile against
+each other, where two single-meter polls could have a game land between them.
 Under RTE that read can itself be pre-empted by the next event, which
 section 12.3 permits and 12.4 requires the host to treat as a NACK; the
 client reissues the poll and keeps the event, and any event collected that
@@ -60,7 +63,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from saspy.client import SASClient
-from saspy.constants import LongPoll
+from saspy.constants import MeterCode
 from saspy.constants import (
     GENERAL_POLL_EXCEPTIONS_RTE_ONLY,
     describe_exception,
@@ -71,6 +74,9 @@ from saspy.transport import SASTransport
 
 # Worth making visually obvious as they scroll past during play.
 HIGHLIGHT = {0x7E, 0x7F, 0x66, 0x4F, 0x51, 0x52, 0x3D, 0x3E, 0x67, 0x68, 0x8C}
+
+# Read together in one LP 0x6F exchange so both come from the same instant.
+CREDIT_METERS = [int(MeterCode.CURRENT_CREDITS), int(MeterCode.TOTAL_COIN_OUT_CREDITS)]
 
 
 def main() -> int:
@@ -85,8 +91,9 @@ def main() -> int:
     ap.add_argument("--show-idle", action="store_true",
                     help="also print 0x00 no-activity polls (noisy; off by default)")
     ap.add_argument("--credits", action="store_true",
-                    help="after each GAME HAS ENDED, read current credits (LP 0x1A) and show "
-                         "them on the line. Costs one extra exchange per game.")
+                    help="after each GAME HAS ENDED, read current credits and total coin out "
+                         "and show them on the line. One extra exchange per game: both are "
+                         "Table C-7 codes, so LP 0x6F fetches them together.")
     ap.add_argument("--rte", action="store_true",
                     help="enable real time event reporting (LP 0x0E) for this run and "
                          "turn it back off on exit -- adds reel stops, cards held, and "
@@ -153,14 +160,22 @@ def main() -> int:
                     if event.fields:
                         extra = "  " + "  ".join(f"{k}={v}" for k, v in event.fields.items())
                     if args.credits and event.code == 0x7F:
-                        # Table 12.5.4 carries only the win, so the credit
-                        # meter has to be read separately. Under RTE that read
-                        # can itself be pre-empted by the next event (12.3) --
+                        # Table 12.5.4 carries only the win, so these have to be
+                        # read separately. Both are Table C-7 codes, so one LP
+                        # 0x6F exchange fetches them together -- which is not
+                        # just cheaper than two single-meter polls but more
+                        # correct: both values come from the same instant, so
+                        # they reconcile against each other without a game
+                        # landing between the two reads.
+                        #
+                        # Under RTE this read is exactly what 12.3 may pre-empt;
                         # the client reissues it and keeps the event, which
                         # drain_rte_events() below collects so nothing is lost.
                         try:
-                            now_credits = client.send_meter(LongPoll.SEND_CURRENT_CREDITS)
-                            extra += f"  CUR_CRED={now_credits}"
+                            m = client.send_extended_meters(CREDIT_METERS)
+                            cur = m.meters.get(int(MeterCode.CURRENT_CREDITS))
+                            out = m.meters.get(int(MeterCode.TOTAL_COIN_OUT_CREDITS))
+                            extra += f"  CUR_CRED={cur}  COIN_OUT={out}"
                         except SASError as e:
                             extra += f"  CUR_CRED=({type(e).__name__})"
                     for pre_empted in client.drain_rte_events():
