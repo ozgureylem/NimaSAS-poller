@@ -689,3 +689,144 @@ class ValidationType(enum.IntEnum):
     CASHABLE_TICKET_REDEEMED = 0x80
     RESTRICTED_PROMOTIONAL_TICKET_REDEEMED = 0x81
     NONRESTRICTED_PROMOTIONAL_TICKET_REDEEMED = 0x82
+
+
+# --- Appendix A, Table A-1: general poll exception codes -------------------
+# The full table, transcribed from the spec. ExceptionCode above stays as the
+# handful the poll loop acts on; this is for reporting -- a monitor that shows
+# "0x84" instead of "self test or operator menu has been entered" makes an
+# operator look the code up by hand, and the lookup is the useful part.
+#
+# "(RTE only)" marks exceptions the spec says are sent ONLY when real time
+# event reporting is enabled (long poll 0x0E). They will never appear in the
+# default polling mode, so their absence is not a fault -- see
+# GENERAL_POLL_EXCEPTIONS_RTE_ONLY below and Section 12.
+GENERAL_POLL_EXCEPTIONS: dict[int, str] = {
+    0x00: "no activity",
+    0x11: "slot door was opened",
+    0x12: "slot door was closed",
+    0x13: "drop door was opened",
+    0x14: "drop door was closed",
+    0x15: "card cage was opened",
+    0x16: "card cage was closed",
+    0x17: "AC power was applied to gaming machine",
+    0x18: "AC power was lost from gaming machine",
+    0x19: "cashbox door was opened",
+    0x1A: "cashbox door was closed",
+    0x1B: "cashbox was removed",
+    0x1C: "cashbox was installed",
+    0x1D: "belly door was opened",
+    0x1E: "belly door was closed",
+    0x1F: "no activity and waiting for player input (obsolete)",
+    0x20: "general tilt",
+    0x21: "coin in tilt",
+    0x22: "coin out tilt",
+    0x23: "hopper empty detected",
+    0x24: "extra coin paid",
+    0x25: "diverter malfunction",
+    0x27: "cashbox full detected",
+    0x28: "bill jam",
+    0x29: "bill acceptor hardware failure",
+    0x2A: "reverse bill detected",
+    0x2B: "bill rejected",
+    0x2C: "counterfeit bill detected",
+    0x2D: "reverse coin in detected",
+    0x2E: "cashbox near full detected",
+    0x31: "CMOS RAM error (data recovered from EEPROM)",
+    0x32: "CMOS RAM error (no data recovered from EEPROM)",
+    0x33: "CMOS RAM error (bad device)",
+    0x34: "EEPROM error (data error)",
+    0x35: "EEPROM error (bad device)",
+    0x36: "EPROM error (different checksum - version changed)",
+    0x37: "EPROM error (bad checksum compare)",
+    0x38: "partitioned EPROM error (checksum - version changed)",
+    0x39: "partitioned EPROM error (bad checksum compare)",
+    0x3A: "memory error reset (operator used self test switch)",
+    0x3B: "low backup battery detected",
+    0x3C: "operator changed options",
+    0x3D: "a cash out ticket has been printed",
+    0x3E: "a handpay has been validated",
+    0x3F: "validation ID not configured",
+    0x40: "reel tilt (which reel not specified)",
+    0x41: "reel 1 tilt",
+    0x42: "reel 2 tilt",
+    0x43: "reel 3 tilt",
+    0x44: "reel 4 tilt",
+    0x45: "reel 5 tilt",
+    0x46: "reel mechanism disconnected",
+    0x47: "$1.00 bill accepted (non-RTE only)",
+    0x48: "$5.00 bill accepted (non-RTE only)",
+    0x49: "$10.00 bill accepted (non-RTE only)",
+    0x4A: "$20.00 bill accepted (non-RTE only)",
+    0x4B: "$50.00 bill accepted (non-RTE only)",
+    0x4C: "$100.00 bill accepted (non-RTE only)",
+    0x4D: "$2.00 bill accepted (non-RTE only)",
+    0x4E: "$500.00 bill accepted (non-RTE only)",
+    0x4F: "bill accepted",
+    0x50: "$200.00 bill accepted (non-RTE only)",
+    0x51: "handpay is pending (progressive, non-progressive or cancelled credits)",
+    0x52: "handpay was reset (jackpot reset switch activated)",
+    0x53: "no progressive information has been received for 5 seconds",
+    0x54: "progressive win (cashout device/credit paid)",
+    0x55: "player has cancelled the handpay request",
+    0x56: "SAS progressive level hit",
+    0x57: "system validation request",
+    0x60: "printer communication error",
+    0x61: "printer paper out error",
+    0x66: "cash out button pressed",
+    0x67: "ticket has been inserted",
+    0x68: "ticket transfer complete",
+    0x69: "AFT transfer complete",
+    0x6A: "AFT request for host cashout",
+    0x6B: "AFT request for host to cash out win",
+    0x6C: "AFT request to register",
+    0x6D: "AFT registration acknowledged",
+    0x6E: "AFT registration cancelled",
+    0x6F: "game locked",
+    0x70: "exception buffer overflow",
+    0x71: "change lamp on",
+    0x72: "change lamp off",
+    0x74: "printer paper low",
+    0x75: "printer power off",
+    0x76: "printer power on",
+    0x77: "replace printer ribbon",
+    0x78: "printer carriage jammed",
+    0x79: "coin in lockout malfunction (coin accepted while coin mech disabled)",
+    0x7A: "gaming machine soft (lifetime-to-date) meters reset to zero",
+    0x7B: "bill validator (period) totals reset by an attendant/operator",
+    0x7C: "legacy bonus pay awarded and/or multiplied jackpot occurred",
+    0x7E: "GAME HAS STARTED",
+    0x7F: "GAME HAS ENDED",
+    0x80: "hopper full detected",
+    0x81: "hopper level low detected",
+    0x82: "display meters or attendant menu has been entered",
+    0x83: "display meters or attendant menu has been exited",
+    0x84: "self test or operator menu has been entered",
+    0x85: "self test or operator menu has been exited",
+    0x86: "gaming machine is out of service (by attendant)",
+    0x87: "player has requested draw cards (RTE only)",
+    0x88: "reel N has stopped (RTE only)",
+    0x89: "coin/credit wagered (RTE only, and only if max bet is 10 or less)",
+    0x8A: "game recall entry has been displayed",
+    0x8B: "card held/not held (RTE only)",
+    0x8C: "game selected",
+    0x8E: "component list changed",
+    0x8F: "authentication complete",
+    0x98: "power off card cage access",
+    0x99: "power off slot door access",
+    0x9A: "power off cashbox door access",
+    0x9B: "power off drop door access",
+}
+
+# Sent only when real time event reporting is on (long poll 0x0E, Section 12).
+# Their absence in the default polling mode is correct behaviour, not a fault.
+GENERAL_POLL_EXCEPTIONS_RTE_ONLY = frozenset({0x87, 0x88, 0x89, 0x8B})
+
+# Real time event message identifier (Table 12.5). Under RTE, exceptions stop
+# being single bytes: the machine replies address, FF, code, data..., CRC.
+RTE_EVENT_IDENTIFIER = 0xFF
+
+
+def describe_exception(code: int) -> str:
+    """Plain-language name for a general poll exception code."""
+    return GENERAL_POLL_EXCEPTIONS.get(code, f"unknown/unassigned code 0x{code:02X}")

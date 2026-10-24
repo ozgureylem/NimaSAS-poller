@@ -109,6 +109,29 @@ step-by-step guide to structuring a local SQL layer around a poller.
   **backend** enforces, not just the UI. `--lab-mode` drops that
   confirmation for a bench where a locked machine is a non-event — a
   deliberate startup flag, never the default.
+- **`examples/exception_monitor.py`** — read-only. General-polls and names
+  what comes back in plain language, so somebody can play the machine and
+  watch events scroll: `0x7E` **game has started**, `0x7F` **game has
+  ended**, doors, bills, cashout button, handpays. The full Appendix A
+  table (114 codes) lives in `saspy.constants`, so a raw `0x84` reads as
+  "self test or operator menu has been entered". On exit it summarises what
+  was seen.
+  ```
+  python3 examples/exception_monitor.py /dev/ttyS0 --address 1
+  ```
+  **On RTE (real time event reporting):** codes for reel stops, cards held,
+  draw-card requests and coin/credit wagered are sent *only* with RTE on,
+  which the host enables with long poll `0x0E` (§12.1). **This library does
+  not implement `0x0E`, deliberately** — §12.5 says that once RTE is on
+  "gaming machines no longer report exceptions as single byte codes": every
+  exception arrives as `address, FF, code, data…, CRC`, §12.3 lets an event
+  pre-empt a long poll's response, and §12.4 requires the host to treat that
+  as a NACK and re-queue. So enabling RTE breaks this client everywhere at
+  once — `general_poll()` reads exactly one byte, and any long poll may come
+  back as an event. `poll_test_tool.py` will happily send `0x0E 01`; if
+  someone does, the machine looks dead and the fix is `0x0E 00` or a power
+  cycle (the spec requires machines to default to non-RTE on power up).
+  Game start/end need none of this.
 - **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
   and says whether the link held. It buckets failures by hour and minute
   and reports the worst minute alongside the mean, because the failure mode

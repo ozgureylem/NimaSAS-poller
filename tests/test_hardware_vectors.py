@@ -99,3 +99,49 @@ def test_gaming_machine_id_round_trip():
     assert result.max_bet == 255
     assert result.paytable_id == "MGDJE3"
     assert result.base_percentage == "9546"  # 95.46%
+
+
+def test_exception_table_names_the_codes_seen_on_hardware():
+    """0x11, 0x12 and 0x84 were observed live on the EGT machine: the slot
+    door was opened and closed, and the operator menu was entered. Pinning
+    their descriptions keeps the Appendix A transcription honest about the
+    three codes we have independent confirmation for.
+    """
+    from saspy.constants import describe_exception
+
+    assert describe_exception(0x11) == "slot door was opened"
+    assert describe_exception(0x12) == "slot door was closed"
+    assert describe_exception(0x84) == "self test or operator menu has been entered"
+
+
+def test_rte_only_codes_are_flagged_as_such():
+    """These four are sent only when real time event reporting is enabled
+    (long poll 0x0E, Section 12). Their absence in the default polling mode
+    is correct behaviour, and a monitor that does not say so invites someone
+    to chase a fault that is not there.
+    """
+    from saspy.constants import (
+        GENERAL_POLL_EXCEPTIONS_RTE_ONLY,
+        describe_exception,
+    )
+
+    assert GENERAL_POLL_EXCEPTIONS_RTE_ONLY == {0x87, 0x88, 0x89, 0x8B}
+    for code in GENERAL_POLL_EXCEPTIONS_RTE_ONLY:
+        assert "RTE only" in describe_exception(code)
+
+
+def test_game_start_and_end_are_not_rte_only():
+    """The point of the distinction. 0x7E/0x7F are queued exceptions in the
+    ordinary polling mode, so watching play does not require RTE -- which
+    matters because enabling RTE changes the response format library-wide
+    (Section 12.5) and nothing here parses that yet.
+    """
+    from saspy.constants import (
+        GENERAL_POLL_EXCEPTIONS_RTE_ONLY,
+        describe_exception,
+    )
+
+    assert 0x7E not in GENERAL_POLL_EXCEPTIONS_RTE_ONLY
+    assert 0x7F not in GENERAL_POLL_EXCEPTIONS_RTE_ONLY
+    assert describe_exception(0x7E) == "GAME HAS STARTED"
+    assert describe_exception(0x7F) == "GAME HAS ENDED"
