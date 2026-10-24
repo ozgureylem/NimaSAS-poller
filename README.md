@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 248 tests, all against fake serial ports; run them with
+- **`tests/`** — 249 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -152,6 +152,21 @@ step-by-step guide to structuring a local SQL layer around a poller.
   ```
   python3 examples/aft_push_credits.py /dev/ttyS0 --address 1 --amount 20.00
   ```
+- **`examples/exception_buffer_probe.py`** — read-only. Measures how many
+  exceptions a machine really buffers. §2.2.1 requires "a first in/first out
+  (FIFO) exception queue of **at least 20 elements** in non-volatile
+  memory", discards the **oldest** on overrun, and requires exception `0x70`
+  to report any loss — which contradicts the common belief that SAS holds
+  only one pending exception. Since a general poll pulls exactly one
+  exception, the queue can only be filled while nobody polls: the tool
+  drains it, stops polling while you cycle the slot door a known number of
+  times, then polls flat out and counts what returns.
+  ```
+  python3 examples/exception_buffer_probe.py /dev/ttyS0 --address 1 --cycles 15
+  ```
+  The diagnostic value is in `0x70`'s absence as much as its presence: a
+  gateway losing exceptions that never sees `0x70` is not losing them to
+  queue overrun, and the cause is elsewhere.
 - **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
   and says whether the link held. It buckets failures by hour and minute
   and reports the worst minute alongside the mean, because the failure mode

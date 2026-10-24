@@ -173,3 +173,24 @@ def test_the_machines_own_aft_status_byte_decodes_as_observed():
     assert status & 0x10, "in-house transfers enabled"
     assert not status & 0x40, "debit transfers disabled"
     assert not status & 0x08, "not registered"
+
+
+def test_the_exception_queue_is_specified_as_at_least_twenty_deep():
+    """Section 2.2.1 requires "a first in/first out (FIFO) exception queue of
+    at least 20 elements in non-volatile memory", drops the OLDEST on
+    overrun, and requires exception 70 to report any loss.
+
+    Recorded here because a project design document attributed observed
+    exception loss to SAS holding only one pending exception per machine.
+    The spec says the opposite, and the difference changes the diagnosis: a
+    gateway losing exceptions without ever seeing 0x70 is not losing them to
+    queue overrun.
+    """
+    from saspy.constants import describe_exception
+
+    assert describe_exception(0x70) == "exception buffer overflow"
+    # Both door exceptions are Type Q (queued), which is what makes them a
+    # usable generator for measuring the queue -- priority exceptions are
+    # never queued at all.
+    assert describe_exception(0x11) == "slot door was opened"
+    assert describe_exception(0x12) == "slot door was closed"
