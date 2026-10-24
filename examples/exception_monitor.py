@@ -68,6 +68,11 @@ def main() -> int:
                          "0.04 under RTE, which this tool does not use)")
     ap.add_argument("--show-idle", action="store_true",
                     help="also print 0x00 no-activity polls (noisy; off by default)")
+    ap.add_argument("--rte", action="store_true",
+                    help="enable real time event reporting (LP 0x0E) for this run and "
+                         "turn it back off on exit -- adds reel stops, cards held, and "
+                         "the data carried by game start/end. A real state change: read "
+                         "the RTE notes in this file's docstring first.")
     args = ap.parse_args()
 
     try:
@@ -85,6 +90,21 @@ def main() -> int:
     print(f"{'time':12} {'code':6} description")
     print("-" * 78)
 
+    rte = False
+    if args.rte:
+        # Enabling is the easy half; guaranteeing it gets turned off again is
+        # the half that matters. Everything below runs inside try/finally so a
+        # crash or a Ctrl-C cannot walk away leaving the machine in a mode this
+        # client's ordinary poll loop cannot read.
+        try:
+            client.enable_real_time_events(True)
+            rte = True
+            print("RTE ENABLED (LP 0x0E). Exceptions now arrive as Table 12.5 event")
+            print("messages, and will be disabled again on exit.\n")
+        except SASError as e:
+            print(f"Could not enable RTE: {type(e).__name__}: {e}", file=sys.stderr)
+            print("Continuing in the ordinary polling mode.\n", file=sys.stderr)
+
     seen = Counter()
     polls = failures = 0
     started = time.monotonic()
@@ -92,6 +112,22 @@ def main() -> int:
         while True:
             polls += 1
             try:
+                if rte:
+                    event = client.general_poll_rte()
+                    if event is None:
+                        # Section 12.6: silence IS no activity in this mode.
+                        seen[0x00] += 1
+                        time.sleep(args.interval)
+                        continue
+                    seen[event.code] += 1
+                    mark = " *" if event.code in HIGHLIGHT else "  "
+                    extra = ""
+                    if event.fields:
+                        extra = "  " + "  ".join(f"{k}={v}" for k, v in event.fields.items())
+                    print(f"{datetime.now():%H:%M:%S.%f}"[:12]
+                          + f" 0x{event.code:02X}{mark} {event.description}{extra}")
+                    time.sleep(args.interval)
+                    continue
                 code = client.general_poll()
             except SASError as e:
                 failures += 1
@@ -115,6 +151,19 @@ def main() -> int:
             time.sleep(args.interval)
     except KeyboardInterrupt:
         pass
+    finally:
+        if rte:
+            try:
+                client.enable_real_time_events(False)
+                print("\nRTE disabled.")
+            except SASError as e:
+                # Loud, because the machine is now in a mode the ordinary
+                # poll loop mis-frames, and nothing else will say so.
+                print(f"\nWARNING: could not disable RTE: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+                print("The machine is still in real time event mode. Send LP 0x0E 00, or"
+                      " power cycle it -- section 12 requires machines to default to the"
+                      " ordinary polling mode on power up.", file=sys.stderr)
 
     elapsed = time.monotonic() - started
     print("\n" + "=" * 78)

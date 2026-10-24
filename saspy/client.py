@@ -18,12 +18,75 @@ from __future__ import annotations
 from . import models
 from .bcd import decode_bcd, encode_bcd
 from .binary import decode_binary_le, encode_binary_le
-from .constants import LONG_POLL_TYPES, METER_CODE_SIZES_BCD, SIMPLE_METER_WIDTH_BCD, LongPoll, PollType
+from .constants import (
+    LONG_POLL_TYPES,
+    METER_CODE_SIZES_BCD,
+    RTE_EVENT_IDENTIFIER,
+    SIMPLE_METER_WIDTH_BCD,
+    LongPoll,
+    PollType,
+    describe_exception,
+    rte_data_length,
+)
 from .exceptions import SASAddressMismatchError, SASCommandNackedError, SASEncodingError, SASError
 from .framing import build_command, parse_response
 from .transport import SASTransport
 
 DEFAULT_TIMEOUT = 1.0
+
+
+def decode_rte_event_fields(code: int, data: bytes) -> dict:
+    """Decode an RTE event's data per Tables 12.5.1-12.5.8.
+
+    Returns {} for exceptions with no 12.5.x layout -- those still arrive
+    under RTE, just as the bare code with no data.
+
+    The field worth noticing is game start's total_coin_in. Section 12.5.3
+    says it is the coin in meter *after* the wager, so the event carries the
+    meter it affected, and a session's wager can be reconciled from its
+    boundary events without separate meter reads.
+    """
+    try:
+        if code == 0x7E and len(data) >= 8:  # 12.5.3 game start
+            wager_type = data[6]
+            return {
+                "credits_wagered": decode_bcd(data[0:2]),
+                "total_coin_in": decode_bcd(data[2:6]),
+                "denomination_code": wager_type & 0b00111111,
+                "multi_denom": bool(wager_type & 0b01000000),
+                "max_bet_wagered": bool(wager_type & 0b10000000),
+                "progressive_group": data[7],
+            }
+        if code == 0x7F and len(data) >= 4:  # 12.5.4 game end
+            return {"game_win": decode_bcd(data[0:4])}
+        if code == 0x4F and len(data) >= 6:  # 12.5.1 bill accepted
+            return {
+                "country_code": decode_bcd(data[0:1]),
+                "denomination_code": decode_bcd(data[1:2]),
+                "bills_of_this_type": decode_bcd(data[2:6]),
+            }
+        if code == 0x88 and len(data) >= 2:  # 12.5.5 reel N stopped
+            return {"reel_number": data[0], "physical_stop": data[1]}
+        if code == 0x8B and len(data) >= 1:  # 12.5.7 card held/not held
+            return {"card_number": data[0] & 0x7F, "held": bool(data[0] & 0x80)}
+        if code == 0x8C and len(data) >= 2:  # 12.5.8 game selected
+            return {"game_number": decode_bcd(data[0:2])}
+        if code == 0x8A and len(data) >= 4:  # 12.5.6 game recall displayed
+            return {"game_number": decode_bcd(data[0:2]), "recall_index": decode_bcd(data[2:4])}
+        if code == 0x7C and len(data) >= 10:  # 12.5.2 legacy bonus awarded
+            multiplier = data[0]
+            return {
+                "multiplier": multiplier & 0x7F,
+                "non_deductible": bool(multiplier & 0x80),
+                "multiplied_win": decode_bcd(data[1:5]),
+                "tax_status": data[5],
+                "bonus_amount": decode_bcd(data[6:10]),
+            }
+    except SASEncodingError:
+        # A machine sending non-BCD where the table says BCD is a finding,
+        # not a reason to lose the event: the raw bytes stay on the model.
+        return {"decode_error": data.hex(" ").upper()}
+    return {}
 
 
 class SASClient:
@@ -47,6 +110,72 @@ class SASClient:
     # bill acceptor, maintenance mode, ...) is deliberately not implemented,
     # not an oversight; _check_enable_disable_ack() below is written to be
     # reusable if that scope ever changes, but nothing else calls it yet.
+
+    def enable_real_time_events(self, enable: bool = True) -> None:
+        """LP 0x0E (Table 12.1) -- turn real time event reporting on or off.
+
+        This is a real state change, and a wide one. Section 12.5: once RTE
+        is on, "gaming machines no longer report exceptions as single byte
+        codes" -- every exception arrives as address, FF, code, data, CRC.
+        So after enabling, poll with general_poll_rte(); general_poll() reads
+        exactly one byte and will mis-frame everything. Section 12.3 also
+        lets a pending event pre-empt a long poll's own response, and 12.4
+        requires the host to treat that as a NACK and re-queue the poll --
+        which this client does not yet do, so expect long polls to need
+        retrying while RTE is on and events are flowing.
+
+        Recovery if it is enabled by accident: call this with enable=False,
+        or power cycle. Section 12 opens by requiring machines to "default
+        to the polling and response structure detailed in Sections 2 and 3
+        on initial power up".
+
+        What RTE buys, concretely: the four exceptions that are only ever
+        sent in this mode (reel stops, cards held, draw-card requests,
+        coin/credit wagered), a poll rate that may rise to 40ms (12.2), and
+        -- the one that usually decides it -- data attached to the events
+        themselves. Game start carries the total coin in meter *after* the
+        wager (12.5.3), so a session's wager can be reconciled from the
+        boundary events alone rather than from separate meter reads.
+
+        Returning normally means the machine ACKed per Table 7.4b; it raises
+        SASCommandNackedError on a NACK.
+        """
+        poll = LongPoll.ENABLE_DISABLE_REAL_TIME_EVENTS
+        command_and_data = bytes([poll, 0x01 if enable else 0x00])
+        frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
+        raw = self.transport.exchange_fixed(frame, response_length=1, timeout=self.timeout)
+        self._check_enable_disable_ack(raw)
+
+    def general_poll_rte(self) -> models.RealTimeEvent | None:
+        """General poll while the machine is in RTE mode (see
+        enable_real_time_events). Returns None for no activity.
+
+        None is the idle case, not an error: section 12.6 says a machine in
+        this mode does not report codes 00 or 1F at all, and that "no
+        activity is implied when the gaming machine does not send a real
+        time event".
+        """
+        raw = self.transport.general_poll_rte(
+            self.address, timeout=self.timeout, data_len_for=rte_data_length
+        )
+        if not raw:
+            return None
+        if len(raw) == 3 and raw[1] != RTE_EVENT_IDENTIFIER:
+            # Section 12.7: a ROM signature response omits the FF identifier.
+            raise SASError(
+                f"expected a real time event (identifier 0xFF) but got "
+                f"{raw.hex(' ').upper()} -- per section 12.7 this is how a ROM "
+                f"signature response is distinguished from an event"
+            )
+        payload = self._strip(raw)
+        code = payload[1]
+        data = bytes(payload[2:])
+        return models.RealTimeEvent(
+            code=code,
+            description=describe_exception(code),
+            data=data,
+            fields=decode_rte_event_fields(code, data),
+        )
 
     def send_shutdown(self) -> None:
         """LP 0x01 (§7.4.1) -- makes the gaming machine unplayable ("lock

@@ -360,3 +360,27 @@ class ExtendedGameNInfo:
     game_name: str
     paytable_name: str
     wager_categories: int
+
+
+@dataclass(frozen=True)
+class RealTimeEvent:
+    """One real time event message (Table 12.5), as returned under RTE.
+
+    ``fields`` is decoded for the exceptions Tables 12.5.1-12.5.8 give a
+    layout for, and empty for the rest -- which still arrive, just as the
+    bare code. ``data`` is always the raw bytes, so an exception whose
+    layout this library does not yet decode is still fully recoverable.
+    """
+
+    code: int
+    description: str
+    data: bytes
+    fields: dict
+
+    @property
+    def is_game_start(self) -> bool:
+        return self.code == 0x7E
+
+    @property
+    def is_game_end(self) -> bool:
+        return self.code == 0x7F

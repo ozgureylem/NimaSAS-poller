@@ -46,6 +46,7 @@ class LongPoll(enum.IntEnum):
     DISABLE_BILL_ACCEPTOR = 0x07
     CONFIGURE_BILL_DENOM = 0x08
 
+    ENABLE_DISABLE_REAL_TIME_EVENTS = 0x0E  # Table 12.1 -- see SASClient.enable_real_time_events
     SEND_METERS_10_THROUGH_15 = 0x0F  # Table 7.2
 
     SEND_CURRENT_CREDITS = 0x1A
@@ -629,6 +630,7 @@ LONG_POLL_TYPES: dict[LongPoll, PollType] = {
     LongPoll.ENABLE_BILL_ACCEPTOR: PollType.S,
     LongPoll.DISABLE_BILL_ACCEPTOR: PollType.S,
     LongPoll.CONFIGURE_BILL_DENOM: PollType.S,
+    LongPoll.ENABLE_DISABLE_REAL_TIME_EVENTS: PollType.S,  # Table 12.1: carries a CRC and one data byte
     LongPoll.SEND_METERS_10_THROUGH_15: PollType.R,
     LongPoll.SEND_CURRENT_CREDITS: PollType.R,
     LongPoll.SEND_METERS_EXTENDED_GROUP: PollType.R,
@@ -825,6 +827,28 @@ GENERAL_POLL_EXCEPTIONS_RTE_ONLY = frozenset({0x87, 0x88, 0x89, 0x8B})
 # Real time event message identifier (Table 12.5). Under RTE, exceptions stop
 # being single bytes: the machine replies address, FF, code, data..., CRC.
 RTE_EVENT_IDENTIFIER = 0xFF
+
+# Data bytes between the exception code and the CRC, per exception, from
+# Tables 12.5.1 through 12.5.8. Table 12.5 carries NO length field, so a host
+# cannot frame an RTE response without knowing this per code -- it reads the
+# first three bytes, looks the code up here, and then knows how much is left.
+# A code absent from this table carries no data at all (5 bytes total).
+RTE_EVENT_DATA_BYTES: dict[int, int] = {
+    0x4F: 6,   # 12.5.1 bill accepted: country, denomination, count
+    0x7C: 10,  # 12.5.2 legacy bonus: multiplier, multiplied win, tax, bonus
+    0x7E: 8,   # 12.5.3 game start: credits wagered, TOTAL COIN IN, wager type, prog group
+    0x7F: 4,   # 12.5.4 game end: game win
+    0x88: 2,   # 12.5.5 reel N stopped: reel number, physical stop
+    0x8A: 4,   # 12.5.6 game recall: game number, recall index
+    0x8B: 1,   # 12.5.7 card held/not held
+    0x8C: 2,   # 12.5.8 game selected: game number
+}
+
+
+def rte_data_length(code: int) -> int:
+    """Data bytes carried by an RTE event, excluding address/identifier/code
+    and the trailing CRC. Zero for every exception without a 12.5.x table."""
+    return RTE_EVENT_DATA_BYTES.get(code, 0)
 
 
 def describe_exception(code: int) -> str:

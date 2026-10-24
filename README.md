@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 233 tests, all against fake serial ports; run them with
+- **`tests/`** — 245 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -132,6 +132,11 @@ step-by-step guide to structuring a local SQL layer around a poller.
   someone does, the machine looks dead and the fix is `0x0E 00` or a power
   cycle (the spec requires machines to default to non-RTE on power up).
   Game start/end need none of this.
+
+  `--rte` enables it for one run and turns it back off on exit, inside a
+  `finally` so a crash or Ctrl-C cannot leave the machine in a mode the
+  ordinary poll loop mis-frames; if the restore itself fails it says so
+  loudly, because nothing else will.
 - **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
   and says whether the link held. It buckets failures by hour and minute
   and reports the worst minute alongside the mean, because the failure mode
@@ -254,6 +259,17 @@ of the run, precisely so drift cannot pose as a property of the byte.
   wager category info (0xB4), extended game info (0xB5), current
   date/time (0x7E), physical reel stops (0x8F).
 - **AFT**: register (0x73), lock/status (0x74), transfer funds (0x72).
+- **Real time event reporting** (0x0E): `enable_real_time_events()` plus
+  `general_poll_rte()`, which returns a `RealTimeEvent` decoded per Tables
+  12.5.1–12.5.8, or `None` for no activity (§12.6 makes silence the idle
+  signal in this mode, the opposite of `general_poll()`). Table 12.5 has no
+  length field, so `RTE_EVENT_DATA_BYTES` **is** the framing: a wrong entry
+  desynchronises the stream rather than spoiling one field. The reason to
+  turn it on is usually §12.5.3 — game start carries the total coin in meter
+  *after* the wager, so a session's wager reconciles from its boundary events
+  rather than from separate meter reads. §12.7's ROM-signature response
+  (which omits the `FF` identifier) raises rather than being parsed as a
+  bogus exception code.
 - **Ticketing**: secure enhanced validation ID (0x4C), enhanced
   validation information / ticket-out history (0x4D), extended
   validation status (0x7B), ticket validation data (0x70), redeem ticket

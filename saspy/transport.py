@@ -44,6 +44,7 @@ import threading
 import time
 from typing import Protocol
 
+from .constants import RTE_EVENT_IDENTIFIER
 from .exceptions import SASPortCapabilityError, SASTimeoutError
 
 
@@ -250,6 +251,43 @@ class SASTransport:
             data_length = header[-1]
             rest = self._read_exact(data_length + crc_length, deadline)
             return header + rest
+
+    def general_poll_rte(
+        self, address: int, *, timeout: float, data_len_for
+    ) -> bytes:
+        """General poll while the machine is in real time event mode.
+
+        Returns b"" for no activity, which under RTE is silence rather than
+        a 0x00 byte: section 12.6 removes exception codes 00 and 1F from the
+        response set entirely and says "no activity on the gaming machine is
+        implied when the gaming machine does not send a real time event".
+        So a timeout here is the normal idle case, not a fault -- which is
+        the opposite of what it means in the default polling mode, and the
+        reason this is a separate method rather than a flag on general_poll.
+
+        Table 12.5 has no length field, so the frame cannot be read in one
+        go: the first three bytes give address, the FF identifier and the
+        exception code, and only then is the remaining length known.
+        ``data_len_for`` supplies it per code, keeping the table in
+        constants rather than in the transport.
+
+        A response whose second byte is not FF is returned as-is after those
+        three bytes. Section 12.7: a ROM signature response may also arrive
+        in reply to a poll and deliberately omits the identifier, "which
+        distinguishes a ROM signature response from a coin in tilt exception
+        response" -- so the caller, not the transport, decides what it is.
+        """
+        with self._lock:
+            self._serial.reset_input_buffer()
+            self.write_with_wakeup(bytes([address | 0x80]))
+            deadline = time.monotonic() + timeout
+            try:
+                head = self._read_exact(3, deadline)
+            except SASTimeoutError:
+                return b""
+            if head[1] != RTE_EVENT_IDENTIFIER:
+                return head
+            return head + self._read_exact(data_len_for(head[2]) + 2, deadline)
 
     def general_poll(self, address: int, *, timeout: float) -> bytes:
         """Send a general poll (address ORed with 0x80) and read the single
