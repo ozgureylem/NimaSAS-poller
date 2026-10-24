@@ -145,8 +145,21 @@ def main() -> int:
         print("answers and the whole cycle used to abort there. Pull and re-run.")
 
     worst = max(results, key=lambda r: r[1])
-    print(f"Longest gap without a general poll: {worst[1]:.2f}s  ({worst[0]})")
-    print(f"Budget before the queue overflows:  {budget:.1f}s")
+    print(f"Longest sweep: {worst[1]:.2f}s  ({worst[0]})")
+    print(f"Budget before the queue overflows: {budget:.1f}s")
+    # The sweep is not the whole gap. sql_poll_logger does one general poll per
+    # cycle, so the interval between general polls is sweep + database write +
+    # the configured sleep -- reporting the sweep alone understates it.
+    print("\nBut the gap between GENERAL polls is the whole cycle:")
+    for interval in (0.2, 1.0, 2.0):
+        gap = worst[1] + interval + 0.1
+        pct = gap / budget * 100
+        flag = "  <- OVER BUDGET" if gap > budget else ""
+        print(f"  --interval {interval:<4} -> {gap:5.2f}s between general polls, "
+              f"~{gap * args.event_rate:4.1f} exceptions queued ({pct:3.0f}% of the queue){flag}")
+    print(f"\nThe sweep alone overflows at {args.queue_depth / worst[1]:.1f} exceptions/sec.")
+    print("Games are not the only source: change-lamp on/off, game selected, bills")
+    print("and doors are all queued too, and all count against the same queue.")
 
     if worst[1] > budget:
         print("\n=> THIS IS A SOURCE OF 0x70. A sweep this long leaves the exception")
@@ -160,6 +173,12 @@ def main() -> int:
         print("   2. Sweep less: the flags above show what each one buys back.")
         print("      Table C-7 and the validation-meter sweep are the expensive")
         print("      ones and are both explicitly redundant with other reads.")
+    elif worst[1] + 1.1 > budget * 0.75:
+        print("\n=> The sweep fits, but not comfortably. A cycle is already using")
+        print("   most of the queue, so the margin absorbs no slowdown: a growing")
+        print("   database, a busier machine, or a second event source puts it over.")
+        print("   Interleaving general polls into the sweep removes the whole class")
+        print("   of risk and costs only ordering.")
     else:
         print("\n=> The sweep fits inside the budget, so on these numbers it is not")
         print("   the source of 0x70. Look instead for anything else that stops the")

@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 262 tests, all against fake serial ports; run them with
+- **`tests/`** — 265 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -132,6 +132,19 @@ step-by-step guide to structuring a local SQL layer around a poller.
   someone does, the machine looks dead and the fix is `0x0E 00` or a power
   cycle (the spec requires machines to default to non-RTE on power up).
   Game start/end need none of this.
+
+  **§12.4 is handled.** Every long poll goes through one place in the client,
+  so while RTE is on a reply whose second byte is the `FF` identifier is
+  recognised as an event rather than decoded as meter data: the poll is
+  reissued (§12.4 — "the host… considers the long poll NACKed and reinserts
+  the long poll into its transmit queue") and the event is **kept**, not
+  dropped. Discarding it would reintroduce the very exception loss RTE is
+  being used to avoid. Collect them with `drain_rte_events()`.
+
+  `--credits` adds the machine's credit meter to each GAME HAS ENDED line.
+  Table 12.5.4 carries only the game win, so that is a separate LP `0x1A`
+  read — and it is exactly the read §12.3 can pre-empt, which is why the
+  above had to exist first.
 
   `--rte` enables it for one run and turns it back off on exit, inside a
   `finally` so a crash or Ctrl-C cannot leave the machine in a mode the

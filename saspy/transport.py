@@ -252,6 +252,65 @@ class SASTransport:
             rest = self._read_exact(data_length + crc_length, deadline)
             return header + rest
 
+    def exchange_rte_aware(
+        self,
+        frame: bytes,
+        *,
+        timeout: float,
+        data_len_for,
+        on_event,
+        response_length: int | None = None,
+        header_length: int = 3,
+        crc_length: int = 2,
+        max_requeue: int = 4,
+    ) -> bytes:
+        """A long poll that survives being pre-empted by a real time event.
+
+        Section 12.3: "Event reporting takes priority over long poll
+        responses. If a gaming machine has any outstanding events to report
+        when it receives a long poll, it reports the event." Section 12.4:
+        "When the host receives an event response to a long poll, it
+        considers the long poll NACKed and reinserts the long poll into its
+        transmit queue."
+
+        So while RTE is on, any long poll may come back as an event instead
+        of its own answer, and the host has to notice and ask again. Without
+        this a meter read under RTE silently decodes an event as meter data.
+
+        The event is handed to ``on_event`` rather than discarded. Dropping
+        it would reintroduce exactly the exception loss RTE is being used to
+        avoid -- it is a real event, it simply arrived in the wrong slot.
+
+        Telling the two apart is unambiguous: an event's second byte is the
+        FF identifier (Table 12.5) and no long poll command is FF, so a
+        response whose second byte is FF is an event. Section 12.7's ROM
+        signature response deliberately omits the identifier for the same
+        reason, so it is not confused with one either.
+
+        Pass ``response_length`` for a fixed-length reply, or leave it None
+        for the length-prefixed shape.
+        """
+        with self._lock:
+            deadline = time.monotonic() + timeout
+            for _ in range(max_requeue):
+                self._serial.reset_input_buffer()
+                self.write_with_wakeup(frame)
+                head = self._read_exact(2, deadline)
+                if head[1] == RTE_EVENT_IDENTIFIER:
+                    code = self._read_exact(1, deadline)[0]
+                    body = self._read_exact(data_len_for(code) + crc_length, deadline)
+                    on_event(head + bytes([code]) + body)
+                    continue  # 12.4: treat as a NACK and reissue
+                if response_length is not None:
+                    return head + self._read_exact(response_length - 2, deadline)
+                header = head + self._read_exact(header_length - 2, deadline)
+                return header + self._read_exact(header[-1] + crc_length, deadline)
+            raise SASTimeoutError(
+                f"long poll pre-empted by a real time event {max_requeue} times "
+                f"(section 12.3); the machine has more events queued than this "
+                f"poll has retries"
+            )
+
     def general_poll_rte(
         self, address: int, *, timeout: float, data_len_for
     ) -> bytes:

@@ -32,6 +32,14 @@ non-RTE polling on power up.
 
 Everything 0x7E/0x7F gives you works today, without any of that.
 
+--credits adds the machine's current credit meter to each GAME HAS ENDED
+line. Table 12.5.4 carries only the game win, so that figure is a separate
+read (LP 0x1A) rather than part of the event -- one extra exchange per game.
+Under RTE that read can itself be pre-empted by the next event, which
+section 12.3 permits and 12.4 requires the host to treat as a NACK; the
+client reissues the poll and keeps the event, and any event collected that
+way is printed marked "arrived during a long poll" rather than dropped.
+
 OBSERVED DEVIATION: section 12.6 says a machine in RTE mode does not report
 exception code 00 (no activity) and implies idle by sending nothing at all.
 The EGT Premier tested here sends it anyway, as a well-formed five-byte
@@ -52,6 +60,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from saspy.client import SASClient
+from saspy.constants import LongPoll
 from saspy.constants import (
     GENERAL_POLL_EXCEPTIONS_RTE_ONLY,
     describe_exception,
@@ -75,6 +84,9 @@ def main() -> int:
                          "0.04 under RTE, which this tool does not use)")
     ap.add_argument("--show-idle", action="store_true",
                     help="also print 0x00 no-activity polls (noisy; off by default)")
+    ap.add_argument("--credits", action="store_true",
+                    help="after each GAME HAS ENDED, read current credits (LP 0x1A) and show "
+                         "them on the line. Costs one extra exchange per game.")
     ap.add_argument("--rte", action="store_true",
                     help="enable real time event reporting (LP 0x0E) for this run and "
                          "turn it back off on exit -- adds reel stops, cards held, and "
@@ -140,6 +152,24 @@ def main() -> int:
                     extra = ""
                     if event.fields:
                         extra = "  " + "  ".join(f"{k}={v}" for k, v in event.fields.items())
+                    if args.credits and event.code == 0x7F:
+                        # Table 12.5.4 carries only the win, so the credit
+                        # meter has to be read separately. Under RTE that read
+                        # can itself be pre-empted by the next event (12.3) --
+                        # the client reissues it and keeps the event, which
+                        # drain_rte_events() below collects so nothing is lost.
+                        try:
+                            now_credits = client.send_meter(LongPoll.SEND_CURRENT_CREDITS)
+                            extra += f"  CUR_CRED={now_credits}"
+                        except SASError as e:
+                            extra += f"  CUR_CRED=({type(e).__name__})"
+                    for pre_empted in client.drain_rte_events():
+                        seen[pre_empted.code] += 1
+                        pre_fields = ("  " + "  ".join(f"{k}={v}" for k, v in pre_empted.fields.items())
+                                      if pre_empted.fields else "")
+                        print(f"{datetime.now():%H:%M:%S.%f}"[:12]
+                              + f" 0x{pre_empted.code:02X}  {pre_empted.description}{pre_fields}"
+                              + "   [arrived during a long poll]")
                     print(f"{datetime.now():%H:%M:%S.%f}"[:12]
                           + f" 0x{event.code:02X}{mark} {event.description}{extra}")
                     time.sleep(args.interval)

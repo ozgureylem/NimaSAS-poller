@@ -96,6 +96,10 @@ class SASClient:
         self.transport = transport
         self.address = address
         self.timeout = timeout
+        # Real time event mode changes how EVERY response is framed, so the
+        # client has to know whether it is on -- see enable_real_time_events().
+        self._rte_active = False
+        self._pending_rte_events: list = []
 
     # -- General poll ------------------------------------------------------
 
@@ -110,6 +114,59 @@ class SASClient:
     # bill acceptor, maintenance mode, ...) is deliberately not implemented,
     # not an oversight; _check_enable_disable_ack() below is written to be
     # reusable if that scope ever changes, but nothing else calls it yet.
+
+    # -- long poll plumbing -------------------------------------------------
+    # Every long poll goes through these two, so that real time event mode is
+    # handled in one place rather than 40. See enable_real_time_events().
+
+    def _exchange_fixed(self, frame: bytes, response_length: int, *, timeout: float) -> bytes:
+        if not self._rte_active:
+            return self.transport.exchange_fixed(frame, response_length, timeout=timeout)
+        return self.transport.exchange_rte_aware(
+            frame,
+            timeout=timeout,
+            data_len_for=rte_data_length,
+            on_event=self._capture_rte_event,
+            response_length=response_length,
+        )
+
+    def _exchange_length_prefixed(self, frame: bytes, *, timeout: float, **kwargs) -> bytes:
+        if not self._rte_active:
+            return self.transport.exchange_length_prefixed(frame, timeout=timeout, **kwargs)
+        return self.transport.exchange_rte_aware(
+            frame,
+            timeout=timeout,
+            data_len_for=rte_data_length,
+            on_event=self._capture_rte_event,
+            **kwargs,
+        )
+
+    def _capture_rte_event(self, raw: bytes) -> None:
+        """Keep an event that arrived in a long poll's place (12.3).
+
+        Discarding it would reintroduce the exception loss RTE exists to
+        avoid. Callers collect these with drain_rte_events().
+        """
+        payload = self._strip(raw)
+        code = payload[1]
+        self._pending_rte_events.append(
+            models.RealTimeEvent(
+                code=code,
+                description=describe_exception(code),
+                data=bytes(payload[2:]),
+                fields=decode_rte_event_fields(code, bytes(payload[2:])),
+            )
+        )
+
+    def drain_rte_events(self) -> list:
+        """Events that pre-empted a long poll since the last call.
+
+        A poll loop must drain these or they accumulate: they are real
+        exceptions that happened to arrive while a long poll was in flight,
+        and they will not be delivered again.
+        """
+        events, self._pending_rte_events = self._pending_rte_events, []
+        return events
 
     def enable_real_time_events(self, enable: bool = True) -> None:
         """LP 0x0E (Table 12.1) -- turn real time event reporting on or off.
@@ -143,8 +200,11 @@ class SASClient:
         poll = LongPoll.ENABLE_DISABLE_REAL_TIME_EVENTS
         command_and_data = bytes([poll, 0x01 if enable else 0x00])
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=1, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=1, timeout=self.timeout)
         self._check_enable_disable_ack(raw)
+        # Only after the machine has ACKed: until then its response format has
+        # not changed, and flipping early would mis-frame the very next poll.
+        self._rte_active = enable
 
     def general_poll_rte(self) -> models.RealTimeEvent | None:
         """General poll while the machine is in RTE mode (see
@@ -190,7 +250,7 @@ class SASClient:
         """
         poll = LongPoll.SHUTDOWN
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=1, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=1, timeout=self.timeout)
         self._check_enable_disable_ack(raw)
 
     def send_startup(self) -> None:
@@ -200,7 +260,7 @@ class SASClient:
         """
         poll = LongPoll.STARTUP
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=1, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=1, timeout=self.timeout)
         self._check_enable_disable_ack(raw)
 
     def _check_enable_disable_ack(self, raw: bytes) -> None:
@@ -231,14 +291,14 @@ class SASClient:
         if width is None:
             raise SASError(f"{poll!r} is not a simple single-meter poll — see SIMPLE_METER_WIDTH_BCD")
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=1 + 1 + width + 2, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=1 + 1 + width + 2, timeout=self.timeout)
         payload = self._strip(raw)
         return decode_bcd(payload[1:1 + width])
 
     def send_games_since_power_up_and_door_closure(self) -> models.GamesSincePowerUpAndDoorClosure:
         poll = LongPoll.SEND_GAMES_SINCE_POWER_UP_AND_DOOR_CLOSURE
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=8, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=8, timeout=self.timeout)
         payload = self._strip(raw)
         return models.GamesSincePowerUpAndDoorClosure(
             games_since_power_up=decode_bcd(payload[1:3]),
@@ -253,7 +313,7 @@ class SASClient:
         """
         poll = LongPoll.SEND_METERS_11_THROUGH_15
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=24, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=24, timeout=self.timeout)
         payload = self._strip(raw)
         return models.Meters11Through15(
             total_coin_in=decode_bcd(payload[1:5]),
@@ -266,7 +326,7 @@ class SASClient:
     def send_handpay_information(self) -> models.HandpayInformation:
         poll = LongPoll.HANDPAY_INFORMATION
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=24, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=24, timeout=self.timeout)
         payload = self._strip(raw)
         return models.HandpayInformation(
             progressive_group=payload[1],
@@ -279,7 +339,7 @@ class SASClient:
     def send_total_bill_meters(self) -> models.BillMeters:
         poll = LongPoll.TOTAL_BILL_METERS
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=28, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=28, timeout=self.timeout)
         payload = self._strip(raw)
         return models.BillMeters(
             bills_1=decode_bcd(payload[1:5]),
@@ -294,14 +354,14 @@ class SASClient:
         poll = LongPoll.SEND_TOTAL_HAND_PAID_CANCELLED_CREDITS
         command_and_data = bytes([poll]) + encode_bcd(game_number, 2)
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=10, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=10, timeout=self.timeout)
         payload = self._strip(raw)
         return decode_bcd(payload[3:7])
 
     def send_cash_out_ticket_information(self) -> models.CashOutTicketInfo:
         poll = LongPoll.SEND_CASH_OUT_TICKET_INFORMATION
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=13, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=13, timeout=self.timeout)
         payload = self._strip(raw)
         return models.CashOutTicketInfo(
             ticket_number=decode_bcd(payload[1:5]),
@@ -311,7 +371,7 @@ class SASClient:
     def send_current_hopper_status(self) -> models.HopperStatus:
         poll = LongPoll.SEND_CURRENT_HOPPER_STATUS
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
         length = payload[1]
         level = decode_bcd(payload[4:8]) if length == 6 else None
@@ -328,7 +388,7 @@ class SASClient:
         """
         poll = LongPoll.SEND_LAST_ACCEPTED_BILL_INFORMATION
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=10, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=10, timeout=self.timeout)
         payload = self._strip(raw)
         return models.LastAcceptedBillInfo(
             country_code=decode_bcd(payload[1:2]),
@@ -346,7 +406,7 @@ class SASClient:
         poll = LongPoll.SEND_VALIDATION_METERS
         command_and_data = bytes([poll, validation_type])
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=14, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=14, timeout=self.timeout)
         payload = self._strip(raw)
         return models.ValidationMeters(
             validation_type=payload[1],
@@ -358,7 +418,7 @@ class SASClient:
         poll = LongPoll.SEND_GAME_N_METERS
         command_and_data = bytes([poll]) + encode_bcd(game_number, 2)
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=22, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=22, timeout=self.timeout)
         payload = self._strip(raw)
         return models.GameNMeters(
             game_number=decode_bcd(payload[1:3]),
@@ -372,7 +432,7 @@ class SASClient:
         poll = LongPoll.SEND_GAME_N_CONFIGURATION
         command_and_data = bytes([poll]) + encode_bcd(game_number, 2)
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=26, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=26, timeout=self.timeout)
         payload = self._strip(raw)
         return models.GameNConfiguration(
             game_number=decode_bcd(payload[1:3]),
@@ -392,7 +452,7 @@ class SASClient:
     def send_enabled_game_numbers(self) -> list[int]:
         poll = LongPoll.SEND_ENABLED_GAME_NUMBERS
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
         length = payload[1]
         data = payload[2:2 + length]
@@ -407,7 +467,7 @@ class SASClient:
     def send_current_date_and_time(self) -> models.CurrentDateTime:
         poll = LongPoll.SEND_CURRENT_DATE_AND_TIME
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=11, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=11, timeout=self.timeout)
         payload = self._strip(raw)
         return models.CurrentDateTime(
             date=f"{decode_bcd(payload[1:5]):08d}",
@@ -417,14 +477,14 @@ class SASClient:
     def send_physical_reel_stop_information(self) -> bytes:
         poll = LongPoll.SEND_PHYSICAL_REEL_STOP_INFORMATION
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=13, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=13, timeout=self.timeout)
         payload = self._strip(raw)
         return bytes(payload[1:10])
 
     def send_token_denomination(self) -> int:
         poll = LongPoll.SEND_TOKEN_DENOMINATION
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=5, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=5, timeout=self.timeout)
         payload = self._strip(raw)
         return payload[1]
 
@@ -432,7 +492,7 @@ class SASClient:
         poll = LongPoll.SEND_WAGER_CATEGORY_INFORMATION
         command_and_data = bytes([poll]) + encode_bcd(game_number, 2) + encode_bcd(wager_category, 2)
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
         data = payload[2:2 + payload[1]]
         payback_percentage = data[4:8].decode("ascii")
@@ -444,7 +504,7 @@ class SASClient:
         poll = LongPoll.SEND_EXTENDED_GAME_N_INFORMATION
         command_and_data = bytes([poll]) + encode_bcd(game_number, 2)
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
         data = payload[2:2 + payload[1]]
         resp_game_number = decode_bcd(data[0:2])
@@ -476,7 +536,7 @@ class SASClient:
     def send_meters_10_through_15(self) -> models.BasicMeters:
         poll = LongPoll.SEND_METERS_10_THROUGH_15
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=28, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=28, timeout=self.timeout)
         payload = self._strip(raw)
         return models.BasicMeters(
             total_cancelled_credits=decode_bcd(payload[1:5]),
@@ -497,7 +557,7 @@ class SASClient:
         """
         poll = LongPoll.SEND_METERS_EXTENDED_GROUP
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=36, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=36, timeout=self.timeout)
         payload = self._strip(raw)
         return models.ExtendedMeters(
             total_coin_in=decode_bcd(payload[1:5]),
@@ -534,7 +594,7 @@ class SASClient:
         body = encode_bcd(game_number, 2) + bytes(meter_codes)
         command_and_data = bytes([poll]) + bytes([len(body)]) + body
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
 
         length = payload[1]
@@ -587,7 +647,7 @@ class SASClient:
             body += encode_binary_le(code, 2)
         command_and_data = bytes([poll]) + bytes([len(body)]) + body
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
 
         length = payload[1]
@@ -618,7 +678,7 @@ class SASClient:
         poll = LongPoll.SET_SECURE_ENHANCED_VALIDATION_ID
         command_and_data = bytes([poll]) + encode_binary_le(machine_id, 3) + encode_binary_le(sequence_number, 3)
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=10, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=10, timeout=self.timeout)
         payload = self._strip(raw)
         return models.EnhancedValidationId(
             machine_id=decode_binary_le(payload[1:4]),
@@ -640,7 +700,7 @@ class SASClient:
         poll = LongPoll.SEND_ENHANCED_VALIDATION_INFORMATION
         command_and_data = bytes([poll, function_code])
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=35, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=35, timeout=self.timeout)
         payload = self._strip(raw)
         return models.EnhancedValidationInfo(
             validation_type=payload[1],
@@ -678,7 +738,7 @@ class SASClient:
         body += encode_bcd(restricted_ticket_expiration_days, 2)
         command_and_data = bytes([poll]) + bytes([len(body)]) + body
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
         return models.ExtendedValidationStatus(
             asset_number=decode_binary_le(payload[2:6]),
@@ -692,7 +752,7 @@ class SASClient:
     def send_gaming_machine_id(self) -> models.GamingMachineInfo:
         poll = LongPoll.SEND_GAMING_MACHINE_ID
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=24, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=24, timeout=self.timeout)
         payload = self._strip(raw)
         return models.GamingMachineInfo(
             game_id=payload[1:3].decode("ascii"),
@@ -720,7 +780,7 @@ class SASClient:
         """
         poll = LongPoll.SEND_SAS_VERSION_AND_SERIAL
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
         length = payload[1]
         return models.SASVersionInfo(
@@ -734,7 +794,7 @@ class SASClient:
         poll = LongPoll.SEND_ENABLED_FEATURES
         command_and_data = bytes([poll]) + encode_bcd(game_number, 2)
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=12, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=12, timeout=self.timeout)
         payload = self._strip(raw)
         features1 = payload[3]
         # features2 (payload[4]) and features3 (payload[5]) are not yet exposed
@@ -775,7 +835,7 @@ class SASClient:
                 + encode_binary_le(pos_id, 4)
             )
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
         return models.AftRegistrationStatus(
             registration_status=payload[2],
@@ -793,7 +853,7 @@ class SASClient:
         command_and_data = bytes([poll, lock_code, transfer_condition])
         command_and_data += encode_bcd(lock_timeout, 2)
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
         return models.AftLockStatus(
             asset_number=decode_binary_le(payload[2:6]),
@@ -866,7 +926,7 @@ class SASClient:
 
         command_and_data += bytes([len(body)]) + body
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         return self._parse_aft_transfer_response(raw)
 
     def aft_interrogate_transfer(
@@ -900,7 +960,7 @@ class SASClient:
         poll = LongPoll.AFT_TRANSFER_FUNDS
         command_and_data = bytes([poll, 0x02, 0xFF if acknowledge else 0xFE, transaction_index])
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         return self._parse_aft_transfer_response(raw)
 
     def _parse_aft_transfer_response(self, raw: bytes) -> models.AftTransferResult:
@@ -960,7 +1020,7 @@ class SASClient:
         """
         poll = LongPoll.SEND_PENDING_CASHOUT_INFO
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=10, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=10, timeout=self.timeout)
         payload = self._strip(raw)
         return models.PendingCashoutInfo(
             cashout_type=payload[1],
@@ -972,7 +1032,7 @@ class SASClient:
     def send_ticket_validation_data(self) -> models.TicketValidationData:
         poll = LongPoll.SEND_TICKET_VALIDATION_DATA
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
         status = payload[2]
         if status == 0xFF:
@@ -1014,7 +1074,7 @@ class SASClient:
 
         command_and_data += bytes([len(body)]) + body
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
         return self._parse_redeem_ticket_response(payload)
 
@@ -1035,7 +1095,7 @@ class SASClient:
         poll = LongPoll.REDEEM_TICKET
         command_and_data = bytes([poll, 0x01, 0xFF])  # length=1, body=transfer_code FF only
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_length_prefixed(frame, timeout=self.timeout)
+        raw = self._exchange_length_prefixed(frame, timeout=self.timeout)
         payload = self._strip(raw)
         return self._parse_redeem_ticket_response(payload)
 
@@ -1065,7 +1125,7 @@ class SASClient:
         command_and_data += encode_bcd(validation_system_id, 1)
         command_and_data += encode_bcd(validation_number, 8)
         frame = build_command(self.address, command_and_data, crc_required=self._crc_required(poll))
-        raw = self.transport.exchange_fixed(frame, response_length=5, timeout=self.timeout)
+        raw = self._exchange_fixed(frame, response_length=5, timeout=self.timeout)
         payload = self._strip(raw)
         return payload[1]
 

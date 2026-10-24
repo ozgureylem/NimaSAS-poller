@@ -147,3 +147,64 @@ def test_rte_event_with_code_zero_is_still_a_valid_frame():
     assert event.code == 0x00
     assert event.description == "no activity"
     assert event.fields == {}
+
+
+def test_a_long_poll_preempted_by_an_event_is_reissued_and_the_event_kept():
+    """Sections 12.3 and 12.4. An event arriving in a long poll's place is
+    not an error and not the long poll's answer -- the host must reissue the
+    poll, and must not lose the event, which is a real exception that simply
+    landed in the wrong slot. Dropping it would reintroduce exactly the
+    exception loss RTE is being used to avoid.
+    """
+    from saspy.bcd import encode_bcd
+
+    event = _event(0x7F, encode_bcd(1500, 4))
+    # LP 0x1A current credits: address, command, 4 BCD, CRC
+    body = bytes([ADDRESS, 0x1A]) + encode_bcd(2110, 4)
+    real = body + crc16_bytes(body)
+
+    fake = FakeSerial(event + real)
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=1.0)
+    client._rte_active = True
+
+    from saspy.constants import LongPoll
+
+    credits = client.send_meter(LongPoll.SEND_CURRENT_CREDITS)
+
+    assert credits == 2110, "the reissued poll's answer, not the event"
+    captured = client.drain_rte_events()
+    assert len(captured) == 1
+    assert captured[0].code == 0x7F
+    assert captured[0].fields == {"game_win": 1500}
+    assert client.drain_rte_events() == [], "draining is destructive"
+
+
+def test_rte_is_only_marked_active_after_the_machine_acks():
+    """Flipping the flag before the ACK would mis-frame the very next poll,
+    since until the machine accepts 0x0E its response format is unchanged.
+    """
+    fake = FakeSerial(bytes([ADDRESS | 0x80]))  # NACK
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=1.0)
+
+    with pytest.raises(SASCommandNackedError):
+        client.enable_real_time_events(True)
+
+    assert client._rte_active is False, "a NACKed enable must not change framing"
+
+
+def test_repeated_preemption_eventually_gives_up_rather_than_looping():
+    """A machine with more queued events than the poll has retries must not
+    hang the caller forever."""
+    from saspy.bcd import encode_bcd
+
+    many = _event(0x7F, encode_bcd(0, 4)) * 10
+    client = SASClient(SASTransport(FakeSerial(many), wake_byte=None), ADDRESS, timeout=1.0)
+    client._rte_active = True
+
+    from saspy.constants import LongPoll
+
+    with pytest.raises(SASError, match="12.3"):
+        client.send_meter(LongPoll.SEND_CURRENT_CREDITS)
+
+    # The events seen along the way are still kept, not thrown away.
+    assert len(client.drain_rte_events()) >= 1
