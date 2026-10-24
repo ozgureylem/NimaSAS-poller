@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 269 tests, all against fake serial ports; run them with
+- **`tests/`** — 273 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -251,6 +251,23 @@ step-by-step guide to structuring a local SQL layer around a poller.
   (deliberately one program — see the module docstring for why). A
   runnable starting point for stress-testing over time or prototyping a
   persistence layer — see MANUAL.md §4/§6 for the schema and reasoning.
+
+  **The meter sweep interleaves general polls.** A cycle used to issue one
+  general poll and then 73 long-poll exchanges, leaving the machine's
+  exception queue unattended throughout. Measured on an EGT Premier: the
+  sweep takes 6.07s and the gap between general polls was **7.12s**
+  (observed 7.122 and 7.072) — against a queue about 35 deep which, at the
+  ~2.4 exceptions/sec one player generates in turbo mode, fills in roughly
+  15 seconds. That spent half the queue every cycle for no reason but
+  ordering, and `0x70` buffer overflow is what a machine reports once it is
+  gone. A heartbeat general poll now runs every `heartbeat_every` exchanges
+  (default 8 → 9 per sweep → a **~0.6s** gap). Codes are collected and
+  dispatched after the sweep rather than acted on inside it, since issuing a
+  ticket or cashout long poll from within the long-poll loop would nest one
+  sweep in another; one sweep of latency is well inside the 30s §15.12
+  allows for a validation response. A heartbeat that fails is ignored — the
+  cycle's own general poll has its own retry path, and draining is
+  best-effort.
 
   **An unsupported meter does not abort a cycle.** §4.4 requires a machine
   that doesn't support a long poll to ignore it silently, so a single-meter

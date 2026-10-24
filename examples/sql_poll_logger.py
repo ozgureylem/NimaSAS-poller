@@ -269,7 +269,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from saspy.config import connect_from_config
-from saspy.constants import SIMPLE_METER_WIDTH_BCD, ExceptionCode, LongPoll, MeterCode, ValidationType
+from saspy.constants import (
+    SIMPLE_METER_WIDTH_BCD,
+    ExceptionCode,
+    LongPoll,
+    MeterCode,
+    ValidationType,
+    describe_exception,
+)
 from saspy.exceptions import SASError, SASPortCapabilityError, SASTimeoutError
 from saspy.models import EnhancedValidationInfo
 
@@ -1190,6 +1197,8 @@ def _poll_all_meters(
     table_c7_sweep: bool = True,
     validation_meters_sweep: bool = True,
     last_accepted_bill_poll: bool = True,
+    heartbeat=None,
+    heartbeat_every: int = 8,
 ) -> dict:
     """Poll every meter this tool knows how to read, in one pass, and
     return {column: value} covering every name in ALL_METER_FIELDS.
@@ -1221,6 +1230,13 @@ def _poll_all_meters(
     single cycle's row write, not just leave one field NULL.
     """
     values: dict = {}
+    exchanges = 0
+
+    def beat():
+        nonlocal exchanges
+        exchanges += 1
+        if heartbeat is not None and exchanges % heartbeat_every == 0:
+            heartbeat()
 
     def poll(name, fn, *args):
         try:
@@ -1228,10 +1244,13 @@ def _poll_all_meters(
         except SASError as e:
             raise _MeterPollFailure(name, e) from e
         METER_SUPPORT.record_success(name)
+        beat()
         return result
 
     def poll_optional(name, fn, *args):
-        return _poll_optional(METER_SUPPORT, name, fn, *args)
+        result = _poll_optional(METER_SUPPORT, name, fn, *args)
+        beat()
+        return result
 
     meters = poll("send_meters_10_through_15", client.send_meters_10_through_15)
     values.update({f: getattr(meters, f) for f in METER_FIELDS})
@@ -1372,6 +1391,57 @@ def _poll_all_meters(
     return values
 
 
+def _dispatch_exception(client, conn: sqlite3.Connection, now: str, exception_code: int) -> None:
+    """Act on one general-poll exception code.
+
+    Extracted so that a heartbeat poll taken mid-sweep is handled exactly
+    like the cycle's own poll -- an exception found while draining the queue
+    is not a lesser exception, and a second copy of this dispatch would be a
+    place for the two to drift apart.
+    """
+    if exception_code == ExceptionCode.TICKET_INSERTED:
+        _capture_ticket_in(client, conn, now)
+    elif exception_code == ExceptionCode.TICKET_TRANSFER_COMPLETE:
+        _capture_ticket_in_completion(client, conn, now)
+    elif exception_code in (ExceptionCode.CASH_OUT_TICKET_PRINTED, ExceptionCode.HANDPAY_VALIDATED):
+        _drain_ticket_out_history(client, conn, now)
+    elif exception_code == ExceptionCode.SYSTEM_VALIDATION_REQUEST:
+        _handle_cashout_request(client, conn, now)
+
+
+def _make_heartbeat(client, conn: sqlite3.Connection, now: str, seen: list):
+    """A general poll to run between long polls, so the machine's exception
+    queue is drained while the meter sweep is in progress.
+
+    Without this the sweep is one long silence. Measured on an EGT Premier:
+    73 long-poll exchanges taking 6.07s, and with the cycle's sleep a gap of
+    7.12s between general polls -- against a queue about 35 deep which, at
+    the 2.4 exceptions/sec a single player generates in turbo mode, fills in
+    roughly 15 seconds. That is half the queue spent on every cycle, for no
+    reason other than ordering, and the margin vanishes with a second event
+    source or a slower disk. Exception 0x70, buffer overflow, is what the
+    machine reports once it has gone.
+
+    Codes are collected rather than acted on here, and dispatched after the
+    sweep: handling a ticket or cashout mid-sweep would mean issuing long
+    polls from inside a long poll loop. One sweep of latency is well within
+    the 30 seconds section 15.12 allows for a validation response.
+    """
+
+    def heartbeat() -> None:
+        try:
+            code = client.general_poll()
+        except SASError:
+            # A failed heartbeat is not this cycle's problem to solve -- the
+            # cycle's own general poll has its own retry path. Draining is
+            # best-effort; the sweep must not abort over it.
+            return
+        if code != ExceptionCode.NONE:
+            seen.append(code)
+
+    return heartbeat
+
+
 def _general_poll_with_retry(
     client, conn: sqlite3.Connection, now: str, *, max_attempts: int, sleep_fn=time.sleep
 ) -> tuple[int, int]:
@@ -1498,20 +1568,15 @@ def poll_and_log(
     else:
         if attempt > 1:
             print(f"[{now}] general poll recovered on attempt {attempt}/{general_poll_retries}")
-        if exception_code == ExceptionCode.TICKET_INSERTED:
-            _capture_ticket_in(client, conn, now)
-        elif exception_code == ExceptionCode.TICKET_TRANSFER_COMPLETE:
-            _capture_ticket_in_completion(client, conn, now)
-        elif exception_code in (ExceptionCode.CASH_OUT_TICKET_PRINTED, ExceptionCode.HANDPAY_VALIDATED):
-            _drain_ticket_out_history(client, conn, now)
-        elif exception_code == ExceptionCode.SYSTEM_VALIDATION_REQUEST:
-            _handle_cashout_request(client, conn, now)
+        _dispatch_exception(client, conn, now, exception_code)
 
     mono_now = monotonic_fn()
 
     try:
+        heartbeat_codes: list = []
         values = _poll_all_meters(
             client,
+            heartbeat=_make_heartbeat(client, conn, now, heartbeat_codes),
             full_sweep=full_meter_sweep,
             table_c7_sweep=table_c7_sweep,
             validation_meters_sweep=validation_meters_sweep,
@@ -1530,6 +1595,13 @@ def poll_and_log(
             f"{type(failure.original).__name__}: {failure.original}"
         )
         return
+
+    # Anything the heartbeats drained is handled now -- see _make_heartbeat()
+    # for why it is deferred rather than acted on inside the sweep.
+    for code in heartbeat_codes:
+        print(f"[{now}] exception 0x{code:02X} drained during the meter sweep: "
+              f"{describe_exception(code)}")
+        _dispatch_exception(client, conn, now, code)
 
     meter_poll_elapsed = monotonic_fn() - mono_now
     meter_poll_count = (

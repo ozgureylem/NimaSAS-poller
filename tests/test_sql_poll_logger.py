@@ -203,6 +203,14 @@ class ScriptedClient:
     def general_poll(self):
         if self._exception_script is None:
             return ExceptionCode.NONE
+        if not self._exception_script:
+            # A real machine answers every general poll, returning 00 when it
+            # has nothing pending (2.2.1). The script is the events to deliver,
+            # not a cap on how many times it may be asked -- the meter sweep
+            # now interleaves heartbeat polls to keep the exception queue
+            # drained, so a fake that ran dry would be modelling a machine
+            # that stops answering, which is not a thing.
+            return ExceptionCode.NONE
         item = self._exception_script.pop(0)
         if isinstance(item, Exception):
             raise item
