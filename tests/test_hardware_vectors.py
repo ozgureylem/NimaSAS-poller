@@ -255,3 +255,40 @@ def test_interrogation_can_read_without_acknowledging():
         pass  # no response in the fake; the frame is what is under test
 
     assert bytes(fake.written)[:4] == bytes([ADDRESS, 0x72, 0x02, 0xFE])
+
+
+def test_the_two_aft_exceptions_are_told_apart_by_their_reissue_interval():
+    """0x69 and 0x6A look alike in a log and mean opposite things, and the
+    spec gives each its own reissue rate -- which is the discriminator when
+    the cause is in doubt.
+
+    Section 8.8, exception 69 (a transfer the HOST started has finished and
+    is unacknowledged): "reissue exception 69 every 15 seconds until the host
+    polls for and acknowledges the completion status".
+
+    Section 8.7, exceptions 6A/6B (the MACHINE asking the host to take
+    credits, as when a card is removed): "as long as a cashout to the host is
+    pending, the gaming machine will reissue the exception 6A or exception 6B
+    every 800 milliseconds".
+
+    Observed on an EGT Premier: 15.2 second spacing, which is 0x69's rate and
+    nowhere near 0x6A's, so the cause was an unacknowledged transfer
+    completion rather than a cashout request.
+    """
+    from saspy.constants import describe_exception
+
+    assert describe_exception(0x69) == "AFT transfer complete"
+    assert describe_exception(0x6A) == "AFT request for host cashout"
+    assert describe_exception(0x6B) == "AFT request for host to cash out win"
+
+
+def test_host_cashout_enabled_is_bit_1_of_host_cashout_status():
+    """Table 8.2b. The machine reported 0x02: cashout to host enabled, forced
+    by the machine rather than host-controllable, soft mode. So the
+    card-removal flow that returns credits to an AFT account is live on it --
+    and will announce itself as 0x6A, not 0x69.
+    """
+    status = 0x02
+    assert status & 0x02, "cashout to host currently enabled"
+    assert not status & 0x01, "forced by gaming machine, not host-controllable"
+    assert not status & 0x04, "soft mode: machine self-recovers after 8s"

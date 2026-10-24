@@ -62,6 +62,21 @@ AVAILABLE_TRANSFER_BITS = {
 }
 GAME_LOCK = {0x00: "LOCKED", 0x40: "lock pending", 0xFF: "not locked"}
 
+# Table 8.2b host cashout status. This decides whether removing a card can
+# hand the machine's credits to the host at all, so it is worth reading
+# rather than printing as hex -- bit 1 is the whole answer.
+HOST_CASHOUT_BITS = {
+    0: ("cashout to host CONTROLLABLE by host", "cashout to host FORCED by gaming machine"),
+    1: ("cashout to host currently ENABLED", "cashout to host currently DISABLED"),
+    2: ("host cashout mode HARD", "host cashout mode SOFT (only meaningful if enabled)"),
+}
+
+
+def show_host_cashout(value: int) -> None:
+    for bit, (on, off) in HOST_CASHOUT_BITS.items():
+        set_ = value >> bit & 1
+        print(f"      bit {bit}  {set_}  {on if set_ else off}")
+
 
 def show_bits(value, names):
     for bit in sorted(names):
@@ -139,6 +154,7 @@ def main() -> int:
         print(f"    available_transfers     0x{lock.available_transfers:02X}")
         show_bits(lock.available_transfers, AVAILABLE_TRANSFER_BITS)
         print(f"    host_cashout_status     0x{lock.host_cashout_status:02X}")
+        show_host_cashout(lock.host_cashout_status)
         print(f"    transfer limit          {lock.gaming_machine_transfer_limit / 100:,.2f}")
         print(f"    credits on machine      cashable {lock.current_cashable_amount / 100:,.2f}"
               f"  restricted {lock.current_restricted_amount / 100:,.2f}"
@@ -175,12 +191,29 @@ def main() -> int:
                 print("  Registration is NOT the cause. Per section 8.1 it is required")
                 print("  for DEBIT transfers only, and debit is disabled here, so an")
                 print("  unregistered machine can still do in-house transfers.")
-        else:
+        elif to_machine:
+            print()
             print(f"  Transfer to gaming machine is currently available, in-house"
                   f" {'on' if in_house else 'OFF'}, up to"
                   f" {lock.gaming_machine_transfer_limit / 100:,.2f}.")
             if lock.game_lock_status != 0xFF:
                 print(f"  But game_lock_status is 0x{lock.game_lock_status:02X} -- resolve that first.")
+
+        if lock.host_cashout_status & 0x02:
+            print()
+            print("  Cashout to host is ENABLED. So a cashout from this machine --")
+            print("  including the card-removal flow that hands credits back to an")
+            print("  AFT account -- will raise exception 0x6A, AFT request for host")
+            print("  cashout, and section 8.7 has the machine reissue it every 800ms")
+            print("  until the host answers. Note the interval: 800ms for 0x6A/0x6B,")
+            print("  versus 15 seconds for 0x69. That is how to tell a cashout request")
+            print("  apart from an unacknowledged transfer completion without guessing.")
+            if not lock.host_cashout_status & 0x01:
+                print("  Bit 0 is clear, so cashout to host is FORCED by the machine")
+                print("  rather than controllable by the host.")
+            if not lock.host_cashout_status & 0x04:
+                print("  Mode is SOFT: if the host does not answer within 8 seconds the")
+                print("  machine cashes out by its own means instead of tilting.")
     except SASError as e:
         print(f"0x74 failed: {type(e).__name__}: {e}")
         print("  If 0x73 answered and this did not, report both -- that pairing")
