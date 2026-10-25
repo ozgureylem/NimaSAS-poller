@@ -153,18 +153,25 @@ CANDIDATE_NATIVES = [
         delta_should_be="coins or tickets to drop, which a cashless machine has none of",
     ),
     Identity(
-        label="Total Out (screen's headline)",
+        label="Total Cancelled Credits (screen's line)",
         native=0x04,
         native_wording="total cancelled credits",
         parts=(0x03, 0x18),
         parts_wording="attendant-paid cancelled credits + total electronic out",
-        delta_should_be="any way out of the machine that is not a cancelled credit",
+        delta_should_be="a cancelled credit paid by some route neither part covers",
     ),
 ]
 
 # What genuinely has no native meter anywhere. Saying so is the point: it marks
 # the one place the gateway's arithmetic is load-bearing rather than decorative.
 NO_NATIVE = [
+    ("Total Out (screen's headline)", (0x04, 0x1F, 0x20, 0x21),
+     "cancelled credits + attendant-paid winnings. 0004 alone is NOT this:"
+     " a handpaid win never reached the credit meter to be cancelled, so the"
+     " screen keeps it on its own line and adds it in. 0004 read equal to Total"
+     " Out on the lab machine for exactly as long as attendant-paid winnings"
+     " were zero, and stopped the moment an attendant paid a 150.00 win -- which"
+     " is why a meter that matches today is only a candidate, never a given."),
     ("Current nonrestricted credits", (),
      "no Table C-7 code exists -- 000C and 001B cannot be subtracted to get it,"
      " since 000C - 001B is cashable and nonrestricted together. Native only"
@@ -415,9 +422,12 @@ def main() -> int:
             print("      Something is off -- do not report either as the screen balance until")
             print("      this is explained.")
 
-    print("--- The screen's two headline totals ----------------------------\n")
+    print("--- Candidate natives: measured, never assumed ------------------\n")
     print("  Whether a native meter covers these depends on the machine, not on")
-    print("  SAS. A match here means the gateway can stop computing them.\n")
+    print("  SAS, and on what that machine has done so far. A match means the")
+    print("  gateway can read instead of computing -- today. 0004 matched the")
+    print("  screen's Total Out twice, then stopped when an attendant first paid")
+    print("  a win, which is the whole reason these are re-measured each run.\n")
     for ident in CANDIDATE_NATIVES:
         show_identity(values, ident, kind="candidate")
 

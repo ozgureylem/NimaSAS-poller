@@ -155,6 +155,7 @@ def main() -> int:
 
     wanted = [c for _l, c, _i in IN_LINES + OUT_LINES if c is not None]
     wanted += [c for _l, c in CORE + CURRENT + PLAYED]
+    wanted += [0x1F, 0x20, 0x21]           # attendant-paid wins, not cancelled credits
     wanted += [0x7F]                       # weighted average theoretical payback
     wanted = list(dict.fromkeys(wanted))   # de-duplicate, keep order
     values = read(client, wanted)
@@ -184,13 +185,39 @@ def main() -> int:
           + (f"   missing {' '.join(f'{c:04X}' for c in missing_out)}" if missing_out else ""))
     for label, code, _ in OUT_LINES[2:]:
         print(f"      {label:<36} {money(values.get(code))}   (C-7 {code:04X})")
-    total_out = None
+    # Cancelled credits, which is cashouts however they were paid: electronically
+    # to a host, or by an attendant. 0004 is the native for exactly this, and it
+    # is the screen's "Total Cancelled Credits" line.
+    cancelled = None
     if sub_out is not None and attendant is not None:
-        total_out = sub_out + attendant
-    print(f"  {'TOTAL OUT  [computed]':<40} {money(total_out)}")
-    native_out = values.get(0x04)
-    print(f"  {'  vs 0004 cancelled credits [native]':<40} {money(native_out)}"
-          + ("   same" if native_out is not None and native_out == total_out else ""))
+        cancelled = sub_out + attendant
+    print(f"  {'TOTAL CANCELLED CREDITS  [computed]':<40} {money(cancelled)}")
+    native_cancelled = values.get(0x04)
+    print(f"  {'  vs 0004 [native]':<40} {money(native_cancelled)}"
+          + ("   same" if native_cancelled is not None
+             and native_cancelled == cancelled else ""))
+
+    # Attendant-paid WINNINGS are not cancelled credits -- a handpaid win never
+    # reached the credit meter to be cancelled. The screen keeps them on a
+    # separate line and adds them into Total Out, so a Total Out computed
+    # without them is short by every handpay the machine has ever made. It read
+    # equal to cancelled credits here for as long as that figure was zero, and
+    # stopped the moment an attendant paid a 150.00 win.
+    att_wins, missing_wins = subtotal(values, (0x1F, 0x20, 0x21))
+    print(f"    {'Total Winnings Paid by Attendant':<38} {money(att_wins)}"
+          + (f"   missing {' '.join(f'{c:04X}' for c in missing_wins)}"
+             if missing_wins else "   (C-7 001F+0020+0021)"))
+    for label, code in (("Attendant Paid Paytable Winnings", 0x1F),
+                        ("Attendant Paid Progressives", 0x20),
+                        ("Attendant Paid External Bonuses", 0x21)):
+        print(f"      {label:<36} {money(values.get(code))}   (C-7 {code:04X})")
+
+    total_out = None
+    if cancelled is not None and att_wins is not None:
+        total_out = cancelled + att_wins
+    print(f"  {'TOTAL OUT  [computed]':<40} {money(total_out)}"
+          + ("   (cancelled credits + attendant-paid winnings)" if total_out is not None
+             else ""))
 
     print("\nCore meters")
     for label, code in CORE:
@@ -226,11 +253,16 @@ def main() -> int:
             print("      -> closes exactly.")
         else:
             short = got_in - got_out - played
-            print(f"      -> does NOT close: {money(short).strip()} unaccounted."
-                  " Credit still on the machine")
-            print("         shows up here too, so compare against the balances below"
-                  " before")
-            print("         treating this as a fault.")
+            print(f"      -> does NOT close: {money(short).strip()} unaccounted.")
+            print("         Two things land here and neither is a fault. Credit still ON")
+            print("         the machine has not left by any route yet -- compare the")
+            print("         balances below. And credit an ATTENDANT paid out leaves via")
+            print("         0003, which is one meter for every credit type: SAS has")
+            print("         nothing that attributes a hand-paid cancelled credit to")
+            print("         cashable, restricted or nonrestricted, so promotional money")
+            print("         paid by hand goes missing from this ledger by design. If")
+            print(f"         0003 moved by {money(short).strip()} in the same window,"
+                  " that is where it went.")
 
     print("\nOn the machine now")
     for label, code in CURRENT:
