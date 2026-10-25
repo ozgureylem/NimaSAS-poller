@@ -191,3 +191,29 @@ def test_a_port_that_will_not_open_at_all_is_not_blamed_on_parity(monkeypatch):
 
     assert not isinstance(excinfo.value, SASPortCapabilityError)
     assert "No such file" in str(excinfo.value)
+
+
+def test_a_port_held_by_another_process_says_what_to_do(monkeypatch):
+    """The lock is deliberate -- two processes sharing a SAS port interleave
+    bytes mid-frame -- but pyserial's "Could not exclusively lock port ...
+    Resource temporarily unavailable" tells nobody what to do about it. On a
+    gateway the cause is nearly always a poller left running, and that was
+    exactly what happened: an AFT test refused to start because an overnight
+    soak still owned the port.
+    """
+    module = FakeSerialModule()
+
+    def locked(**kwargs):
+        raise OSError(11, "Could not exclusively lock port /dev/ttyS0: "
+                          "[Errno 11] Resource temporarily unavailable")
+
+    module.Serial = locked
+    monkeypatch.setitem(sys.modules, "serial", module)
+
+    with pytest.raises(SASPortCapabilityError) as excinfo:
+        open_serial_port("/dev/ttyS0")
+
+    message = str(excinfo.value)
+    assert "already held by another process" in message
+    assert "pgrep" in message, "it must name the command that finds the holder"
+    assert "soak.pid" in message, "and the one that stops the usual culprit"

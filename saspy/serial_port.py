@@ -40,6 +40,21 @@ def open_serial_port(
     try:
         port_obj = _open(serial, port, baudrate, serial.PARITY_SPACE)
     except Exception as e:
+        # TIOCEXCL refused: another process already owns this port. pyserial
+        # reports it as "Could not exclusively lock port ... Resource
+        # temporarily unavailable", which is accurate and tells nobody what to
+        # do. On a gateway the answer is nearly always a poller left running,
+        # and the fix is one command -- so say which command.
+        if "exclusively lock" in str(e) or "Resource temporarily unavailable" in str(e):
+            raise SASPortCapabilityError(
+                f"{port} is already held by another process, so this one cannot open it. "
+                f"That lock is deliberate: two processes sharing a SAS port interleave "
+                f"bytes mid-frame, and the symptom is garbled responses rather than an "
+                f"obvious conflict.\n\n"
+                f"Find it with:   pgrep -af 'sql_poll_logger|exception_monitor|poll_test_tool'\n"
+                f"Stop a soak:    kill \"$(cat soak.pid)\"\n\n"
+                f"Original error: {e}"
+            ) from e
         # The port opens with PARITY_SPACE (wakeup bit clear), so an adapter
         # whose driver cannot do space parity fails here, at construction,
         # before the probe below ever runs -- and reports something as
