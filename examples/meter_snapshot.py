@@ -64,6 +64,22 @@ them with their headline figures.
 """
 
 
+def is_git_ignored(path: Path) -> bool:
+    """Whether this checkout's .gitignore excludes the file just written.
+
+    The public mirror ignores captures/ on purpose, so a snapshot taken from a
+    clone of it cannot be committed there -- and printing `git add <path>`
+    regardless sends someone to a command that fails. Better to say where the
+    file actually belongs.
+    """
+    try:
+        out = subprocess.run(["git", "check-ignore", "-q", str(path)],
+                             capture_output=True, timeout=5, check=False)
+        return out.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def git_commit() -> str | None:
     """Which revision of this gateway took the reading."""
     try:
@@ -127,6 +143,9 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=1.0)
     ap.add_argument("--dir", default="captures",
                     help="where to write (default: captures/, relative to cwd)")
+    ap.add_argument("--skip-games", action="store_true",
+                    help="skip the per-game LP 0xB5 sweep (one poll per game; a "
+                         "48-game cabinet is 48 extra exchanges)")
     ap.add_argument("--note", default=None,
                     help="what this snapshot is of -- 'before the soak', 'after a "
                          "3.00 promo push'. Recorded in the file.")
@@ -150,6 +169,32 @@ def main() -> int:
     games = try_call("LP 0x51 games implemented",
                      client.send_meter, LongPoll.SEND_TOTAL_GAMES_IMPLEMENTED)
 
+    # LP 0xB5 per game: the name, the paytable name, max bet, and how many
+    # wager categories the paytable has. Worth capturing because a game NUMBER
+    # is only meaningful next to the name it refers to, and that mapping is
+    # per-machine and changes when games are added or reordered -- so a meter
+    # history that records game numbers without it ages into something nobody
+    # can read. A machine may implement some of these fields and not others:
+    # the EGT Premier reports game names and leaves every paytable name empty.
+    game_info = []
+    if games and not args.skip_games:
+        print(f"  reading LP 0xB5 for {games} games ...", file=sys.stderr)
+        for n in range(1, games + 1):
+            info = try_call(f"LP 0xB5 game {n}",
+                            client.send_extended_game_n_information, n)
+            if info is None:
+                game_info.append({"game_number": n, "answered": False})
+                continue
+            game_info.append({
+                "game_number": info.game_number,
+                "answered": True,
+                "game_name": info.game_name.strip(),
+                "paytable_name": info.paytable_name.strip(),
+                "max_bet": info.max_bet,
+                "progressive_group": info.progressive_group,
+                "wager_categories": info.wager_categories,
+            })
+
     meters, unsupported = read_meters(client)
 
     asset = lock.asset_number if lock is not None else None
@@ -172,6 +217,7 @@ def main() -> int:
             "max_bet": machine.max_bet if machine else None,
             "games_implemented": games,
         },
+        "games": game_info,
         # From 0x74, the only native source for the nonrestricted balance --
         # Table C-7 stops at 000C and 001B. In cents.
         "balances_cents": None if lock is None else {
@@ -205,11 +251,20 @@ def main() -> int:
               f"  ({lock.current_cashable_amount / 100:,.2f} cashable"
               f" + {lock.current_restricted_amount / 100:,.2f} restricted"
               f" + {lock.current_non_restricted_amount / 100:,.2f} nonrestricted)")
-    print("\nCommit it to the PRIVATE repo:")
-    print(f"  git add {path} {readme}")
-    print('  git commit -m "capture: snapshot of asset '
-          f'{asset if asset is not None else "?"}"')
-    print("  git push")
+    label = f"asset {asset}" if asset is not None else "this machine"
+    if is_git_ignored(path):
+        print("\nThis checkout ignores captures/ -- it is the PUBLIC mirror, which")
+        print("excludes it on purpose: a snapshot carries the asset number, serial")
+        print("number and full accounting history. Move it to the private clone:")
+        print(f"  mv {path} /path/to/private-clone/captures/")
+        print(f'  cd /path/to/private-clone && git add captures/ && git commit'
+              f' -m "capture: snapshot of {label}" && git push')
+        print("\nOr re-run with --dir pointing straight into the private clone.")
+    else:
+        print("\nCommit it (private repo only -- see this tool's docstring):")
+        print(f"  git add {path} {readme}")
+        print(f'  git commit -m "capture: snapshot of {label}"')
+        print("  git push")
     return 0
 
 
