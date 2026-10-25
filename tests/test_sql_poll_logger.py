@@ -2231,3 +2231,83 @@ def test_migration_adds_epoch_id_to_a_database_that_predates_it():
     assert "epoch_id" in columns
     kept = conn.execute("SELECT polled_at, epoch_id FROM meters_history").fetchall()
     assert kept == [("old", None)], "pre-epoch rows keep their data and a NULL epoch"
+
+
+def _persist(conn, values):
+    """Write a meters_current row, the way a real cycle would."""
+    cols = ", ".join(_logger.ALL_METER_FIELDS)
+    qs = ", ".join("?" for _ in _logger.ALL_METER_FIELDS)
+    conn.execute(
+        f"INSERT OR REPLACE INTO meters_current (id, polled_at, epoch_id, {cols}) "
+        f"VALUES (1, 'T', NULL, {qs})",
+        tuple(values.get(f) for f in _logger.ALL_METER_FIELDS))
+
+
+def test_a_ram_clear_while_the_gateway_was_stopped_is_still_detected():
+    """The case in-memory state cannot see: powering down, clearing, and
+    starting again. Without the persisted baseline the new machine's meters
+    are filed under the old machine's history."""
+    conn, first = _epoch_conn(), _logger.PollState()
+    _logger.maintain_epoch(conn, _FakeIdentityClient(), first, _meters(10), "T0")
+    _persist(conn, _meters(10))
+
+    # Gateway stopped, machine RAM-cleared (which also wiped the asset
+    # number), gateway restarted.
+    resumed = _logger.PollState()
+    _logger.maintain_epoch(conn, _FakeIdentityClient(asset=0), resumed,
+                           _meters(0), "T9")
+
+    rows = _epochs(conn)
+    assert len(rows) == 2
+    assert rows[1][1] == "ram_clear", rows
+    assert "while the gateway was stopped" in rows[1][2]
+    assert resumed.epoch_id == rows[1][0]
+
+
+def test_a_cleared_asset_number_is_not_mistaken_for_a_cabinet_swap():
+    """A RAM clear wipes the operator-entered asset number. The serial is
+    burned in and survives, so serial is what identifies the cabinet."""
+    conn, state = _epoch_conn(), _logger.PollState()
+    _logger.maintain_epoch(conn, _FakeIdentityClient(serial="S", asset=246),
+                           state, _meters(10), "T0")
+
+    state.last_meters = _meters(10)
+    for cycle in range(_logger.CLEAR_CONFIRM_CYCLES):
+        if cycle:
+            state.last_meters = _meters(0)
+        _logger.maintain_epoch(conn, _FakeIdentityClient(serial="S", asset=0),
+                               state, _meters(0), f"T{cycle + 1}")
+
+    rows = _epochs(conn)
+    assert [r[1] for r in rows] == ["first_seen", "ram_clear"], rows
+
+
+def test_an_asset_change_with_intact_meters_is_recorded_as_continuous():
+    """AFT quotes the asset number, so the CMS needs to know it moved -- but
+    the meter history is unbroken and the record has to say so."""
+    conn, state = _epoch_conn(), _logger.PollState()
+    _logger.maintain_epoch(conn, _FakeIdentityClient(serial="S", asset=246),
+                           state, _meters(10), "T0")
+
+    state.last_meters = _meters(10)
+    state.cycles_since_identity = _logger.IDENTITY_CHECK_CYCLES
+    _logger.maintain_epoch(conn, _FakeIdentityClient(serial="S", asset=777),
+                           state, _meters(20), "T1")
+
+    rows = _epochs(conn)
+    assert rows[1][1] == "asset_changed"
+    assert "CONTINUOUS" in rows[1][2]
+
+
+def test_restart_against_an_unchanged_machine_still_reuses_the_epoch():
+    """The common case must stay quiet: a gateway restart with the meters
+    where they were left is not a discontinuity."""
+    conn, first = _epoch_conn(), _logger.PollState()
+    _logger.maintain_epoch(conn, _FakeIdentityClient(), first, _meters(10), "T0")
+    _persist(conn, _meters(10))
+
+    resumed = _logger.PollState()
+    _logger.maintain_epoch(conn, _FakeIdentityClient(), resumed, _meters(30), "T9")
+
+    assert resumed.epoch_id == first.epoch_id
+    assert len(_epochs(conn)) == 1

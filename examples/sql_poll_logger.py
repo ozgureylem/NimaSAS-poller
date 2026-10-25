@@ -892,19 +892,28 @@ def read_identity(client) -> dict:
     return identity
 
 
-def identity_changed(previous: dict | None, current: dict) -> str | None:
-    """A description of what changed, or None.
+def identity_changed(previous: dict | None, current: dict) -> tuple[str, str] | None:
+    """(kind, description) of what changed, or None.
 
-    Only fields that BOTH readings actually carry are compared. A machine that
-    stops answering 0x54 has not become a different machine, and treating a
-    None as a change would open an epoch every time a poll was missed.
+    The two identifiers are not equivalent and must not be treated as one.
+    The SERIAL NUMBER is burned into the machine and survives a RAM clear, so
+    a different serial means a different cabinet. The ASSET NUMBER is typed in
+    by an operator and a RAM clear wipes it, so an asset that changes while
+    the serial holds is a reconfiguration of the same machine -- calling that
+    a swap would mislabel every RAM clear as a cabinet change.
+
+    Only fields BOTH readings carry are compared. A machine that stops
+    answering 0x54 has not become a different machine, and treating a None as
+    a change would open an epoch every time a poll was missed.
     """
     if not previous:
         return None
-    for field in ("serial_number", "asset_number"):
-        was, now = previous.get(field), current.get(field)
-        if was is not None and now is not None and was != now:
-            return f"{field} {was!r} -> {now!r}"
+    was, now = previous.get("serial_number"), current.get("serial_number")
+    if was is not None and now is not None and was != now:
+        return "machine_changed", f"serial_number {was!r} -> {now!r}"
+    was, now = previous.get("asset_number"), current.get("asset_number")
+    if was is not None and now is not None and was != now:
+        return "asset_changed", f"asset_number {was!r} -> {now!r}"
     return None
 
 
@@ -927,6 +936,24 @@ def looks_cleared(previous: dict | None, current: dict) -> tuple[bool, int, int]
     if not populated:
         return False, 0, 0
     return zeroed >= max(5, populated * CLEAR_FRACTION), zeroed, populated
+
+
+def load_persisted_meters(conn: sqlite3.Connection) -> dict | None:
+    """The last reading this database holds, as a {field: value} dict.
+
+    meters_current is one row by construction, so this is cheap and is the
+    only memory a restarted gateway has of what the machine looked like
+    before it stopped.
+    """
+    try:
+        row = conn.execute(
+            f"SELECT {', '.join(ALL_METER_FIELDS)} FROM meters_current "
+            "WHERE id = 1").fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return dict(zip(ALL_METER_FIELDS, row))
 
 
 def open_epoch(conn, now: str, reason: str, identity: dict, detail: str) -> int:
@@ -988,17 +1015,49 @@ def maintain_epoch(conn, client, state, values: dict, now: str) -> None:
             return
         previous = {"serial_number": row[1], "asset_number": row[2],
                     "sas_version": row[3]}
+        state.epoch_id = int(row[0])
         changed = identity_changed(previous, identity)
-        if changed:
+
+        # A clear or a swap that happened while the gateway was STOPPED is the
+        # case in-memory state cannot see: last_meters is None on the first
+        # cycle, so nothing has fallen and nothing looks cleared. The last
+        # persisted reading is the baseline that closes that gap -- without it,
+        # powering a machine down, clearing it, and starting the gateway again
+        # files the new machine's meters under the old machine's history.
+        persisted = load_persisted_meters(conn)
+        cleared, zeroed, populated = looks_cleared(persisted, values)
+
+        if changed and changed[0] == "machine_changed":
             state.epoch_id = open_epoch(
-                conn, now, "machine_changed", identity,
-                f"on restart, {changed}")
-            print(f"[{now}] MACHINE CHANGED on restart: {changed}")
+                conn, now, "machine_changed", identity, f"on restart, {changed[1]}")
+            print(f"[{now}] MACHINE CHANGED while stopped: {changed[1]}")
             print(f"[{now}] epoch {state.epoch_id} opened (machine_changed). "
                   "New HMAC/registration keys are the CMS's to issue; polling "
                   "continues meanwhile.")
-        else:
-            state.epoch_id = int(row[0])
+        elif cleared:
+            # Same cabinet, meters gone. A RAM clear also wipes the operator's
+            # asset number, so an asset that changed alongside this is evidence
+            # FOR a clear, not evidence of a swap.
+            detail = (f"{zeroed} of {populated} populated cumulative meters "
+                      "zeroed while the gateway was stopped")
+            if changed:
+                detail += f"; {changed[1]} (a RAM clear wipes the asset number)"
+            state.epoch_id = open_epoch(conn, now, "ram_clear", identity, detail)
+            print(f"[{now}] RAM CLEAR while stopped: {detail}")
+            print(f"[{now}] epoch {state.epoch_id} opened (ram_clear). Polling "
+                  "continues; nothing before this reconciles against anything "
+                  "after.")
+        elif changed:
+            # Asset number changed with the meters intact: a reconfiguration,
+            # not a discontinuity. Still an epoch, because AFT transfers quote
+            # the asset number and the CMS has re-registration to do -- the
+            # detail says plainly that the meter history is unbroken.
+            state.epoch_id = open_epoch(
+                conn, now, "asset_changed", identity,
+                f"on restart, {changed[1]}; meters are CONTINUOUS across this")
+            print(f"[{now}] ASSET NUMBER CHANGED while stopped: {changed[1]}")
+            print(f"[{now}] epoch {state.epoch_id} opened (asset_changed). "
+                  "Meters are continuous; AFT re-registration is the CMS's.")
         return
 
     state.cycles_since_identity += 1
@@ -1015,16 +1074,25 @@ def maintain_epoch(conn, client, state, values: dict, now: str) -> None:
         state.cycles_since_identity = 0
         changed = identity_changed(state.identity, identity)
         state.identity = identity
-        if changed:
+        if changed and changed[0] == "machine_changed":
             state.clear_candidate_cycles = 0
             state.clear_first_seen_at = None
             state.clear_baseline = None
             state.epoch_id = open_epoch(
-                conn, now, "machine_changed", identity, changed)
+                conn, now, "machine_changed", identity, changed[1])
             state.burst_remaining = max(state.burst_remaining, 5)
-            print(f"[{now}] MACHINE CHANGED: {changed}")
+            print(f"[{now}] MACHINE CHANGED: {changed[1]}")
             print(f"[{now}] epoch {state.epoch_id} opened (machine_changed). "
                   "Polling continues; the CMS owns re-keying and reconciliation.")
+            return
+        if changed and not cleared:
+            # Asset reconfigured mid-run with the meters intact.
+            state.epoch_id = open_epoch(
+                conn, now, "asset_changed", identity,
+                f"{changed[1]}; meters are CONTINUOUS across this")
+            print(f"[{now}] ASSET NUMBER CHANGED: {changed[1]}")
+            print(f"[{now}] epoch {state.epoch_id} opened (asset_changed). "
+                  "Meters are continuous; AFT re-registration is the CMS's.")
             return
 
     if not cleared:
