@@ -32,9 +32,21 @@ success.
     python3 examples/host_cashout.py /dev/ttyS0 --address 1 --deny
 
 --deny sends a transfer of zero, which section 8.7 defines as instructing
-the machine to cash out by its own means. That is a legitimate answer, not
-a refusal to participate, and it is the safe way to watch the exception
-without taking any money.
+the machine to cash out by its own means. That is a legitimate answer
+rather than a refusal to participate -- but "its own means" is whatever
+cashout device the machine actually has, and that is where it stops being
+the harmless option.
+
+On a cashless machine with no printer there is no other device, so the
+cashout becomes a HANDPAY: the machine locks up with "Call Attendant" and
+needs somebody with a reset key. Observed exactly that on an EGT Premier --
+a denied $37.47 cashout produced exception 0x51, handpay pending, and sat
+locked until a 0x52 reset two minutes later.
+
+So on a machine without a printer, --deny is the MORE disruptive choice,
+not the less. Taking the money to the host is the clean path; denying
+forces an attendant. The pre-flight below works out which case applies and
+says so before anything is sent.
 """
 
 from __future__ import annotations
@@ -62,6 +74,7 @@ from saspy.transport import SASTransport
 CASHOUT_REQUEST = 0x6A       # AFT request for host cashout
 WIN_CASHOUT_REQUEST = 0x6B   # AFT request for host to cash out win
 TRANSFER_COMPLETE = 0x69
+HANDPAY_PENDING = 0x51       # a cashout that went to a handpay instead
 
 # Section 8.7: "the amount fields may all be set to 9999999999, with partial
 # transfer allowed, to transfer the entire cashout amount."
@@ -231,6 +244,18 @@ def main() -> int:
         print("  its own means and NOTHING looks wrong. Absence of a transfer here is not")
         print("  proof the exchange worked -- check the meters.")
 
+    # What "its own means" actually is decides whether --deny is the gentle
+    # option or the disruptive one, so work it out rather than assume.
+    printer = bool(lock.available_transfers & 0x04)
+    if args.deny and not printer:
+        print("\n  WARNING: this machine reports no printer available (0x74 available")
+        print("  transfers bit 2 is clear), so there is no ticket to fall back on. With")
+        print("  the host declining, its only remaining cashout device is a HANDPAY: it")
+        print("  will lock up with \"Call Attendant\" and need somebody with a reset key.")
+        print("  On a machine like this --deny is the MORE disruptive choice, not the")
+        print("  less -- taking the money to the host is the clean path.")
+        print("  Drop --deny unless a handpay lockup is what you are testing.")
+
     before = read_meters(client)
 
     print(f"\nWatching for 0x6A/0x6B. Press CASH OUT on the machine. Ctrl-C to stop.")
@@ -268,6 +293,21 @@ def main() -> int:
                     client.aft_interrogate_transfer(0x00, acknowledge=True)
                 except SASError:
                     pass
+            elif code == HANDPAY_PENDING:
+                # The exception says a handpay is pending; LP 0x1B says what
+                # it is. Worth reading rather than just announcing, because
+                # the amount and the available reset method are the two
+                # things anyone standing at the machine needs.
+                print(f"[{time.strftime('%H:%M:%S')}] 0x{code:02X} {describe_exception(code)}")
+                try:
+                    hp = client.send_handpay_information()
+                    print(f"  amount {hp.amount / 100:,.2f}   partial pay {hp.partial_pay / 100:,.2f}")
+                    print(f"  level 0x{hp.level:02X} "
+                          f"({'cancelled credits' if hp.level == 0x80 else 'progressive/other'})"
+                          f"   progressive group {hp.progressive_group}")
+                    print(f"  reset: {'to the credit meter is available' if hp.reset_id == 0x01 else 'standard handpay reset only'}")
+                except SASError as e:
+                    print(f"  could not read handpay info (0x1B): {type(e).__name__}: {e}")
             elif code != 0x00:
                 print(f"[{time.strftime('%H:%M:%S')}] 0x{code:02X} {describe_exception(code)}")
 

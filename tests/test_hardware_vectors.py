@@ -459,3 +459,48 @@ def test_the_two_cashout_exceptions_use_different_transfer_types():
     assert describe_exception(0x6B) == "AFT request for host to cash out win"
     assert int(AftTransferType.IN_HOUSE_FROM_GAMING_MACHINE_TO_HOST) == 0x80
     assert int(AftTransferType.WIN_AMOUNT_FROM_GAMING_MACHINE_TO_HOST) == 0x90
+
+
+def test_a_denied_cashout_falls_back_to_whatever_device_exists():
+    """Observed, and it inverts the advice.
+
+    Section 8.7's zero transfer instructs the machine to "perform the cashout
+    by whatever other means are available". On an EGT Premier with no printer
+    there is no other device, so a denied $37.47 cashout became a HANDPAY:
+    exception 0x51, "Call Attendant" on screen, locked until a 0x52 reset two
+    minutes later.
+
+    So on a machine without a printer, declining is the MORE disruptive
+    option -- it needs a person with a reset key -- while taking the money to
+    the host completes cleanly. Table 8.2b bit 2 of available transfers is
+    what distinguishes the two cases, and it is worth checking before
+    advising anybody that declining is the safe choice.
+    """
+    from saspy.constants import describe_exception
+
+    assert describe_exception(0x51) == (
+        "handpay is pending (progressive, non-progressive or cancelled credits)"
+    )
+    assert describe_exception(0x52) == "handpay was reset (jackpot reset switch activated)"
+    assert describe_exception(0x66) == "cash out button pressed"
+
+    no_printer = 0x00  # available transfers with bit 2 clear
+    assert not no_printer & 0x04, "no transfer-to-printer means no ticket fallback"
+
+
+def test_priority_exceptions_are_delivered_before_queued_ones():
+    """Visible in the same capture. The player pressed cash out, which is
+    0x66 and queued (Type Q in Appendix A), but 0x6A arrived FIRST because
+    section 2.2.1 sends a priority exception ahead of anything in the queue:
+
+        14:02:00  0x6A  AFT request for host cashout      (priority)
+        14:02:02  0x51  handpay is pending
+        14:02:02  0x66  cash out button pressed           (queued, from before)
+
+    A host that assumed arrival order equals event order would reconstruct
+    that sequence backwards.
+    """
+    from saspy.constants import GENERAL_POLL_EXCEPTIONS
+
+    for code in (0x6A, 0x6B, 0x69, 0x51, 0x66):
+        assert code in GENERAL_POLL_EXCEPTIONS

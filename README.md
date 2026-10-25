@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 289 tests, all against fake serial ports; run them with
+- **`tests/`** — 291 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -251,7 +251,17 @@ step-by-step guide to structuring a local SQL layer around a poller.
   the machine cashes out by its own means and nothing looks wrong, so absence
   of a transfer is not proof the exchange worked. `--deny` sends a zero
   transfer, which §8.7 defines as telling the machine to cash out by its own
-  means — a real answer, and the safe way to watch the exchange.
+  means — a real answer, **but not necessarily the gentle one**. "Its own
+  means" is whatever cashout device the machine has, and on a cashless
+  machine with no printer there isn't one: the cashout becomes a **handpay**,
+  locking the machine with "Call Attendant" until somebody with a reset key
+  arrives. Observed exactly that on an EGT Premier — a declined $37.47
+  cashout produced `0x51`, and it sat locked until a `0x52` reset two minutes
+  later. So without a printer, declining is the *more* disruptive choice and
+  taking the money to the host is the clean path; the pre-flight checks
+  Table 8.2b's available-transfers bit 2 and says which case applies. When a
+  handpay does occur the tool reads LP `0x1B` for the amount and the
+  available reset method, rather than just announcing the exception.
 - **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
   and says whether the link held. It buckets failures by hour and minute
   and reports the worst minute alongside the mean, because the failure mode
