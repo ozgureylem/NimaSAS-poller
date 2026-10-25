@@ -288,6 +288,54 @@ step-by-step guide to structuring a local SQL layer around a poller.
   Read the other way round — "promotional" meaning restricted-promotional,
   which the words invite — and the two categories swap. Both are
   promotional, so neither figure then looks obviously wrong.
+
+  It also closes each promotional ledger — everything that came in either
+  went back out or was wagered (`in = out + played`) — which is the one
+  check here that needs no second screen to read. On an EGT Premier both
+  closed to the cent: non-cashable `21.00 in = 15.60 out + 5.40 played`,
+  promotional `3.00 in = 3.00 out + 0.00 played`. That third term is what
+  makes a cashout explicable: a machine holding `7.00` restricted
+  transferred `6.60` of it to the host, because `0.40` had been wagered in
+  a game played in between.
+- **`examples/meter_crosscheck.py`** — read-only (meter polls plus one
+  query-only `0x74`). Answers "which of these figures is the machine
+  already reporting, and which is only the gateway's arithmetic?" — because
+  a computed figure is right only as long as its component list is, and one
+  unimplemented component turns the whole sum into a silent `n/a`.
+  ```
+  python3 examples/meter_crosscheck.py /dev/ttyS0 --address 1
+  ```
+  Two natives are deliberately **wider** than the sum the gateway computes,
+  per Table C-7's own wording: `0017` counts electronic transfers to the
+  credit meter *or to a ticket*, and `0018` counts transfers to host
+  *including win amounts*. A positive delta there is expected, not a fault,
+  and the tool measures `00A8+00AA+00AC` first so it can say whether the one
+  difference `0017`'s wording permits is actually present.
+
+  Two others the spec defines *as* a sum, so a delta is a real
+  disagreement between two of the machine's own meters: `0022` is "total
+  won credits (**sum of total coin out and total jackpot**)" and `0023` is
+  "total hand paid credits (**sum of** total hand paid cancelled credits
+  **and total jackpot**)". A screen line labelled Total Won is `0022`, not
+  `0001` — `0001` is coin out, and on a machine that pays jackpots the two
+  differ by every jackpot it has ever paid.
+
+  Whether the screen's two headline totals have a native meter is a property
+  of the **machine**, not of SAS, so it is measured rather than assumed:
+  `0024` is "total drop, including but not limited to coins to drop, bills
+  to drop, tickets to drop, **and electronic in**", which on a cashless
+  machine with no coin acceptor and no ticket drop counts exactly what the
+  screen's Total In counts. On the EGT Premier it matched exactly, twice,
+  across a 3.00 transfer — as did `0004` against Total Out.
+
+  One figure has no native meter anywhere: the **nonrestricted balance**.
+  C-7 stops at `000C` and `001B`, and `000C - 001B` is cashable and
+  nonrestricted *together*, so no subtraction recovers it. `LP 0x74`
+  reports all three balances as separate native fields in one poll, and is
+  the only source for the third. `000C` itself is the whole balance on the
+  EGT Premier — a report of `50.00` against a screen showing `57.00` came
+  from a tool printing `0x74`'s *cashable field alone*, not from any meter
+  disagreeing.
 - **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
   and says whether the link held. It buckets failures by hour and minute
   and reports the worst minute alongside the mean, because the failure mode

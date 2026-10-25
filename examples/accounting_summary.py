@@ -1,7 +1,8 @@
 """Print the machine's accounting figures as SAS reports them, grouped the
 way the machine's own Machine Accounting screen groups them.
 
-Read-only. Meter polls only; nothing changes machine state.
+Read-only. Meter polls plus one query-only 0x74 (lock code 0xFF, which asks
+for status without touching the lock); nothing changes machine state.
 
 Comparing the gateway's numbers against the machine's own screen has been
 this project's one validation that does not come from inside its own code.
@@ -65,11 +66,37 @@ OUT_LINES = [
 CORE = [
     ("Total Bet (Coin In)", 0x00),
     ("Total credits from bills to drop", 0x58),
-    ("Total Won", 0x01),
+    # 0x01 is total coin OUT. Table C-7 keeps "total won" for 0x22, which it
+    # defines as "sum of total coin out and total jackpot" -- so a screen line
+    # labelled Total Won is 0x22, and printing 0x01 under that label understates
+    # it by every jackpot the machine has paid. Same for hand paid: 0x03 is the
+    # cancelled-credit part only, 0x23 is "sum of total hand paid cancelled
+    # credits and total jackpot".
+    ("Total Coin Out", 0x01),
+    ("Total Won", 0x22),
+    ("Total Hand Paid", 0x23),
     ("Total Cancelled Credits", 0x04),
     ("Total Drop", 0x24),
     ("Total Jackpot", 0x02),
 ]
+# The screen's breakdown under Total Bet. These are what make a promotional
+# balance explicable: a machine holding 7.00 restricted cashed out 6.60 of it
+# because 0.40 had been wagered, and 0019 is where that 0.40 is. Cashable
+# played has no meter of its own -- the screen's "Total Cashable Played" is
+# total bet minus the other two.
+PLAYED = [
+    ("Non-cashable Played (SAS RESTRICTED)", 0x19),
+    ("Promotional Played (SAS NONrestricted)", 0x1A),
+]
+
+# Each promotional type is a closed ledger: everything that came in either went
+# back out or was wagered. These close to the cent on a healthy machine, and
+# are the one check here that needs no second screen to read.
+LEDGERS = [
+    ("Non-cashable (SAS RESTRICTED)", 0x2F, 0x33, 0x19),
+    ("Promotional  (SAS NONrestricted)", 0x30, 0x34, 0x1A),
+]
+
 CURRENT = [
     ("Current credits", 0x0C),
     ("Current restricted credits", 0x1B),
@@ -127,21 +154,16 @@ def main() -> int:
     )
 
     wanted = [c for _l, c, _i in IN_LINES + OUT_LINES if c is not None]
-    wanted += [c for _l, c in CORE + CURRENT]
+    wanted += [c for _l, c in CORE + CURRENT + PLAYED]
+    wanted += [0x7F]                       # weighted average theoretical payback
+    wanted = list(dict.fromkeys(wanted))   # de-duplicate, keep order
     values = read(client, wanted)
-
-    def show(lines):
-        for label, code, indent in lines:
-            if code is None:
-                continue
-            pad = "  " * indent
-            print(f"  {pad}{label:<38} {money(values.get(code))}   (C-7 {code:04X})")
 
     print(f"\n=== {args.port}, address {args.address} ===\n")
 
     bill_in = values.get(0x0B)
     print("Total In")
-    print(f"    {'Bill In':<38} {money(bill_in)}   (C-7 0058)")
+    print(f"    {'Bill In':<38} {money(bill_in)}   (C-7 000B)")
     sub_in, missing_in = subtotal(values, (0x2E, 0x30, 0x2F))
     print(f"    {'Cashless In  [computed]':<38} {money(sub_in)}"
           + (f"   missing {' '.join(f'{c:04X}' for c in missing_in)}" if missing_in else ""))
@@ -150,6 +172,9 @@ def main() -> int:
     total_in = sub_in + bill_in if (sub_in is not None and bill_in is not None) else None
     print(f"  {'TOTAL IN  [computed]':<40} {money(total_in)}"
           + ("   (Bill In did not answer)" if bill_in is None else ""))
+    native_in = values.get(0x24)
+    print(f"  {'  vs 0024 total drop [native]':<40} {money(native_in)}"
+          + ("   same" if native_in is not None and native_in == total_in else ""))
 
     attendant = values.get(0x03)
     print("\nTotal Out")
@@ -163,14 +188,64 @@ def main() -> int:
     if sub_out is not None and attendant is not None:
         total_out = sub_out + attendant
     print(f"  {'TOTAL OUT  [computed]':<40} {money(total_out)}")
+    native_out = values.get(0x04)
+    print(f"  {'  vs 0004 cancelled credits [native]':<40} {money(native_out)}"
+          + ("   same" if native_out is not None and native_out == total_out else ""))
 
     print("\nCore meters")
     for label, code in CORE:
         print(f"    {label:<38} {money(values.get(code))}   (C-7 {code:04X})")
+    for label, code in PLAYED:
+        print(f"    {label:<38} {money(values.get(code))}   (C-7 {code:04X})")
+    trtp = values.get(0x7F)
+    print(f"    {'Weighted Average TRTP %':<38} "
+          + ("       n/a" if trtp is None else f"{trtp / 100:>9,.2f}%")
+          + "   (C-7 007F)")
+
+    print("\nPromotional ledgers  (in = out + played)")
+    for label, in_code, out_code, played_code in LEDGERS:
+        got_in, got_out = values.get(in_code), values.get(out_code)
+        played = values.get(played_code)
+        print(f"    {label:<38} {money(got_in)} in")
+        print(f"      {'':<36} {money(got_out)} out + {money(played).strip()} played")
+        if None in (got_in, got_out, played):
+            print("      -> a component is not reported, so this ledger cannot be closed.")
+        elif got_in == got_out + played:
+            print("      -> closes exactly.")
+        else:
+            short = got_in - got_out - played
+            print(f"      -> does NOT close: {money(short).strip()} unaccounted."
+                  " Credit still on the machine")
+            print("         shows up here too, so compare against the balances below"
+                  " before")
+            print("         treating this as a fault.")
 
     print("\nOn the machine now")
     for label, code in CURRENT:
         print(f"    {label:<38} {money(values.get(code))}   (C-7 {code:04X})")
+
+    # Table C-7 has no code for the NONRESTRICTED balance -- it stops at 000C
+    # and 001B, and 000C - 001B is cashable and nonrestricted together, so no
+    # subtraction recovers it. 000C itself is the WHOLE balance on the EGT
+    # Premier (it read 57.00 against a screen showing 57.00, and 60.00 after a
+    # 3.00 nonrestricted push), so the figure above already matches the screen;
+    # what the meters cannot do is split the third amount out of it. LP 0x74
+    # reports all three as separate native fields in one poll. See
+    # examples/meter_crosscheck.py for the comparison this is drawn from.
+    try:
+        lock = client.aft_game_lock_and_status_request(lock_code=0xFF)
+    except SASError as e:
+        print(f"    (0x74 did not answer: {type(e).__name__}: {e} -- so the")
+        print("     nonrestricted balance has no source and the figures above")
+        print("     cannot be expected to match the screen's credit display)")
+    else:
+        three = (lock.current_cashable_amount, lock.current_restricted_amount,
+                 lock.current_non_restricted_amount)
+        print("\n    From LP 0x74, the three live balances natively:")
+        for label, amount in zip(("cashable", "restricted", "nonrestricted"), three):
+            print(f"      {label:<36} {money(amount)}")
+        print(f"      {'TOTAL  [computed]':<36} {money(sum(three))}"
+              "   <- the screen's credit display")
 
     print("\n" + "=" * 68)
     print("Compare against the machine's Machine Accounting screen. The two")

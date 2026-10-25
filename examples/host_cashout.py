@@ -97,6 +97,16 @@ VERIFY_METERS = (
     (0x0032, "screen 'Cashable Electronic Out'"),
     (0x0034, "screen 'Promotional Electronic Out'  (SAS NONrestricted)"),
     (0x0033, "screen 'Non-cashable Electronic Out' (SAS RESTRICTED)"),
+    # Play meters. Without these the before/after list cannot be balanced if a
+    # game runs between the two snapshots, and the report then looks like money
+    # going missing: a machine holding 7.00 restricted cashed out 6.60 of it,
+    # because 0.40 was wagered in a game played after the "before" read. The
+    # 0.40 was in 0019 the whole time; the list just wasn't showing it.
+    (MeterCode.TOTAL_COIN_IN_CREDITS, "total bet (coin in)"),
+    (MeterCode.TOTAL_RESTRICTED_AMOUNT_PLAYED_CREDITS,
+     "screen 'Total Non-cashable Played'  (SAS RESTRICTED)"),
+    (MeterCode.TOTAL_NONRESTRICTED_AMOUNT_PLAYED_CREDITS,
+     "screen 'Total Promotional Played'   (SAS NONrestricted)"),
 )
 
 

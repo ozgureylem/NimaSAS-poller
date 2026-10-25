@@ -162,7 +162,17 @@ def main() -> int:
     print(f"  in-house enabled       {in_house}")
     print(f"  transfer to GM now OK  {to_machine}")
     print(f"  transfer limit         {limit / 100:,.2f}")
-    print(f"  credits on machine     {lock.current_cashable_amount / 100:,.2f}")
+    # All three, not just cashable. Printing only current_cashable_amount here
+    # reported "credits on machine 50.00" against a machine displaying 57.00,
+    # which looked like a meter disagreement and was not one -- meter 000C had
+    # the right figure all along. 0x74 splits the balance three ways and this
+    # line was showing one third of it.
+    on_machine = (lock.current_cashable_amount + lock.current_restricted_amount
+                  + lock.current_non_restricted_amount)
+    print(f"  credits on machine     {lock.current_cashable_amount / 100:,.2f} cashable"
+          f"  + {lock.current_restricted_amount / 100:,.2f} restricted"
+          f"  + {lock.current_non_restricted_amount / 100:,.2f} nonrestricted"
+          f"  = {on_machine / 100:,.2f}")
 
     blockers = []
     if not aft_on:
