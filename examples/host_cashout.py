@@ -161,6 +161,13 @@ def answer(client, code: int, *, asset_number: int, deny: bool,
 
     category, description = describe_aft_transfer_status(result.transfer_status)
     print(f"  status 0x{result.transfer_status:02X}  {category}: {description}")
+    if result.transfer_status == 0x01:
+        # Expected, not a shortfall. The 9999999999 sentinel asks for more
+        # than the machine holds by design, so the machine transfers what it
+        # has and reports a PARTIAL success. A host testing for 0x00 alone
+        # would read every host cashout as a failure.
+        print("    (0x01 is the SUCCESS code here: asking for 9999999999 and")
+        print("     receiving the actual balance is by definition partial)")
 
     if category == "PENDING":
         for attempt in range(1, 13):
@@ -284,6 +291,15 @@ def main() -> int:
                 )
                 print(f"  answered in {time.monotonic() - started:.2f}s "
                       f"(the machine allows 8s before its own recovery)")
+                # Show the deltas HERE, not only at exit. The transfer is the
+                # whole point of the run, and leaving its result until Ctrl-C
+                # means the one thing worth reading is invisible while the
+                # tool keeps printing other exceptions over it. The 8-second
+                # deadline has already been met at this point, so the meter
+                # reads cost nothing that matters.
+                after = read_meters(client)
+                show_deltas(before, after)
+                before = after  # so a second cashout shows its own deltas
                 answered = answered or moved
                 if args.once:
                     break
@@ -315,7 +331,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nStopped.")
 
-    show_deltas(before, read_meters(client))
+    if not answered:
+        show_deltas(before, read_meters(client))
     print("\nThe status byte is what the machine decided; the meter deltas are what")
     print("happened. Check the machine's own credit display too.")
     return 0

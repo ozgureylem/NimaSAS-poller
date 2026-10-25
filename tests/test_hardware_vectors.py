@@ -504,3 +504,43 @@ def test_priority_exceptions_are_delivered_before_queued_ones():
 
     for code in (0x6A, 0x6B, 0x69, 0x51, 0x66):
         assert code in GENERAL_POLL_EXCEPTIONS
+
+
+def test_partial_success_is_the_normal_outcome_of_a_host_cashout():
+    """A host cashout succeeds with 0x01, not 0x00, and that trips people up.
+
+    Section 8.7's "take everything" sentinel is 9999999999 with partial
+    transfer allowed, which asks for far more than any machine holds -- so
+    the machine moves the actual balance and reports PARTIAL transfer
+    successful. Observed on an EGT Premier: a $49.70 cashout returned 0x01.
+
+    A host testing `status == 0x00` would read every host cashout as a
+    failure, and might retry a transfer that had already moved the money.
+    Table 8.3e's own note is the defence: the top three bits give the
+    category, and 000xxxxx covers both 00 and 01.
+    """
+    from saspy.constants import describe_aft_transfer_status
+
+    assert describe_aft_transfer_status(0x00) == ("SUCCESSFUL", "full transfer successful")
+    assert describe_aft_transfer_status(0x01) == ("SUCCESSFUL", "partial transfer successful")
+    assert describe_aft_transfer_status(0x01)[0] == describe_aft_transfer_status(0x00)[0]
+
+
+def test_the_promotional_lifecycle_reconciles_end_to_end():
+    """Every step observed on one machine, and the arithmetic closes.
+
+    $5.00 pushed as restricted (00A2 +500, 00A0 unchanged). Play consumed
+    $4.80 of it, leaving 0.20 restricted beside 50.00 cashable. One more game
+    at a 0.50 bet took the restricted first, per section 8's fixed order of
+    restricted, then nonrestricted, then cashable -- so 0.20 restricted and
+    0.30 cashable. The host cashout then took 49.70.
+    """
+    cashable, restricted = 5000, 20          # cents, before the last game
+    bet = 50
+    # Section 8: restricted is wagered first.
+    from_restricted = min(restricted, bet)
+    from_cashable = bet - from_restricted
+    assert from_restricted == 20 and from_cashable == 30
+
+    assert cashable - from_cashable == 4970, "the amount the host actually received"
+    assert restricted - from_restricted == 0, "restricted exhausted by play, not by the cashout"

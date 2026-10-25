@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 291 tests, all against fake serial ports; run them with
+- **`tests/`** — 293 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -238,7 +238,13 @@ step-by-step guide to structuring a local SQL layer around a poller.
   cashouts are enabled) and answers it with a `0x72` transfer of type `0x80`
   — the mechanism behind a card-removal flow returning credits to an
   account. §8.7's sentinel is `9999999999` **with partial transfer allowed**,
-  which together mean "take whatever is there".
+  which together mean "take whatever is there" — and therefore **a host
+  cashout succeeds with status `0x01`, not `0x00`**. Asking for more than
+  the machine holds and receiving the balance *is* a partial transfer. A
+  host testing `status == 0x00` would read every cashout as a failure and
+  might retry one that had already moved the money; Table 8.3e's top-three-
+  bits category is the defence, and `describe_aft_transfer_status()` applies
+  it.
   ```
   python3 examples/host_cashout.py /dev/ttyS0 --address 1 --deny   # watch, take nothing
   python3 examples/host_cashout.py /dev/ttyS0 --address 1
