@@ -2061,3 +2061,173 @@ def test_db_size_warning_disabled_by_default():
     # db_size_warning_mb defaults to 0 (disabled); a huge fake size must not matter.
     poll_and_log(client, conn, state, history, monotonic_fn=clock, db_size_fn=lambda c: 10**12)
     assert conn.execute("SELECT COUNT(*) FROM meters_current").fetchone()[0] == 1
+
+
+# --- Continuity: epochs -----------------------------------------------------
+#
+# A RAM clear and a machine swap are both routine on a floor and neither may
+# stop the poller; both must be recorded, because meters written across one
+# without a marker look continuous and are not.
+
+import sqlite3 as _sqlite3
+import types as _types
+
+import examples.sql_poll_logger as _logger
+from saspy.exceptions import SASError
+
+
+class _FakeIdentityClient:
+    """Answers the two identity polls, and can be made to go silent."""
+
+    def __init__(self, serial="SER-1", asset=246, silent=False):
+        self.serial, self.asset, self.silent = serial, asset, silent
+
+    def send_sas_version_and_serial(self):
+        if self.silent:
+            raise SASError("no answer")
+        return _types.SimpleNamespace(serial_number=self.serial, sas_version="602")
+
+    def aft_game_lock_and_status_request(self, lock_code=0xFF, **kw):
+        if self.silent:
+            raise SASError("no answer")
+        return _types.SimpleNamespace(asset_number=self.asset)
+
+
+def _epoch_conn():
+    conn = _sqlite3.connect(":memory:")
+    conn.executescript(_logger.SCHEMA)
+    return conn
+
+
+def _meters(value):
+    return {f: value for f in _logger.DECREASE_CHECK_FIELDS}
+
+
+def _epochs(conn):
+    return conn.execute(
+        "SELECT id, reason, detail FROM machine_epochs ORDER BY id").fetchall()
+
+
+def test_first_cycle_opens_an_epoch():
+    conn, state = _epoch_conn(), _logger.PollState()
+    _logger.maintain_epoch(conn, _FakeIdentityClient(), state, _meters(10), "T0")
+    rows = _epochs(conn)
+    assert len(rows) == 1 and rows[0][1] == "first_seen"
+    assert state.epoch_id == rows[0][0]
+
+
+def test_a_restart_against_the_same_machine_reuses_the_open_epoch():
+    """A gateway restart is not a discontinuity. Opening an epoch on every
+    restart would bury the real ones among the noise."""
+    conn = _epoch_conn()
+    first = _logger.PollState()
+    _logger.maintain_epoch(conn, _FakeIdentityClient(), first, _meters(10), "T0")
+
+    resumed = _logger.PollState()
+    _logger.maintain_epoch(conn, _FakeIdentityClient(), resumed, _meters(20), "T1")
+
+    assert resumed.epoch_id == first.epoch_id
+    assert len(_epochs(conn)) == 1
+
+
+def test_one_zeroed_read_does_not_declare_a_ram_clear():
+    """A single bad sweep must not fabricate a discontinuity -- that is the
+    same corruption this prevents, in the other direction."""
+    conn, state = _epoch_conn(), _logger.PollState()
+    client = _FakeIdentityClient()
+    _logger.maintain_epoch(conn, client, state, _meters(10), "T0")
+    opened = state.epoch_id
+
+    state.last_meters = _meters(10)
+    _logger.maintain_epoch(conn, client, state, _meters(0), "T1")
+
+    assert state.epoch_id == opened
+    assert len(_epochs(conn)) == 1
+    assert state.clear_candidate_cycles == 1
+
+
+def test_meters_recovering_after_zeroes_is_logged_as_a_read_fault():
+    conn, state = _epoch_conn(), _logger.PollState()
+    client = _FakeIdentityClient()
+    _logger.maintain_epoch(conn, client, state, _meters(10), "T0")
+
+    state.last_meters = _meters(10)
+    _logger.maintain_epoch(conn, client, state, _meters(0), "T1")
+    state.last_meters = _meters(0)
+    _logger.maintain_epoch(conn, client, state, _meters(10), "T2")
+
+    assert len(_epochs(conn)) == 1
+    assert state.clear_candidate_cycles == 0
+    errors = conn.execute(
+        "SELECT error_type FROM poll_errors").fetchall()
+    assert errors and errors[0][0] == "TransientZeroes"
+
+
+def test_a_confirmed_ram_clear_opens_an_epoch_and_keeps_polling():
+    conn, state = _epoch_conn(), _logger.PollState()
+    client = _FakeIdentityClient()
+    _logger.maintain_epoch(conn, client, state, _meters(10), "T0")
+    opened = state.epoch_id
+
+    # The machine stays zeroed, which is what a real clear looks like: the
+    # first cycle sees the fall, the rest see it has not come back.
+    for cycle in range(_logger.CLEAR_CONFIRM_CYCLES):
+        state.last_meters = _meters(10) if cycle == 0 else _meters(0)
+        _logger.maintain_epoch(conn, client, state, _meters(0), f"T{cycle + 1}")
+
+    rows = _epochs(conn)
+    assert len(rows) == 2
+    assert rows[1][1] == "ram_clear"
+    assert state.epoch_id != opened
+    assert "confirmed over" in rows[1][2]
+
+
+def test_a_different_serial_is_a_swap_not_a_clear():
+    """A RAM clear and a machine swap look identical in the meters. The
+    identity read is what tells them apart, and the reason recorded decides
+    what the CMS does about it."""
+    conn, state = _epoch_conn(), _logger.PollState()
+    _logger.maintain_epoch(conn, _FakeIdentityClient(serial="SER-1"), state,
+                           _meters(10), "T0")
+
+    state.last_meters = _meters(10)
+    swapped = _FakeIdentityClient(serial="SER-2", asset=99)
+    _logger.maintain_epoch(conn, swapped, state, _meters(0), "T1")
+
+    rows = _epochs(conn)
+    assert len(rows) == 2
+    assert rows[1][1] == "machine_changed"
+    assert "SER-1" in rows[1][2] and "SER-2" in rows[1][2]
+
+
+def test_an_unreadable_identity_is_not_a_machine_change():
+    """Section 4.4 lets a machine ignore a long poll. A missed identity read
+    is not evidence that the cabinet changed, and treating it as one would
+    open an epoch every time a poll was dropped."""
+    conn, state = _epoch_conn(), _logger.PollState()
+    _logger.maintain_epoch(conn, _FakeIdentityClient(), state, _meters(10), "T0")
+
+    state.last_meters = _meters(10)
+    _logger.maintain_epoch(conn, _FakeIdentityClient(silent=True), state,
+                           _meters(0), "T1")
+
+    rows = _epochs(conn)
+    assert len(rows) == 1, "a silent machine must not be read as a new machine"
+
+
+def test_migration_adds_epoch_id_to_a_database_that_predates_it():
+    """Soak databases are days long. Refusing to open one, or dropping its
+    history, would both be worse than an ALTER."""
+    conn = _sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE meters_history (id INTEGER PRIMARY KEY, "
+                 "polled_at TEXT)")
+    conn.execute("CREATE TABLE meters_current (id INTEGER PRIMARY KEY, "
+                 "polled_at TEXT)")
+    conn.execute("INSERT INTO meters_history (polled_at) VALUES ('old')")
+
+    _logger.migrate_epoch_columns(conn)
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(meters_history)")}
+    assert "epoch_id" in columns
+    kept = conn.execute("SELECT polled_at, epoch_id FROM meters_history").fetchall()
+    assert kept == [("old", None)], "pre-epoch rows keep their data and a NULL epoch"

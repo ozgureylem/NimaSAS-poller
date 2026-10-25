@@ -533,14 +533,31 @@ SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS meters_current (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     polled_at TEXT NOT NULL,
+    epoch_id INTEGER,
     {_METER_COLUMN_DDL}
 );
 
 CREATE TABLE IF NOT EXISTS meters_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     polled_at TEXT NOT NULL,
+    epoch_id INTEGER,
     {_METER_COLUMN_DDL}
 );
+
+CREATE TABLE IF NOT EXISTS machine_epochs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    reason TEXT NOT NULL,          -- 'first_seen' | 'ram_clear' | 'machine_changed'
+    serial_number TEXT,
+    asset_number INTEGER,
+    sas_version TEXT,
+    detail TEXT,
+    acknowledged_at TEXT           -- set by the CMS, never by the gateway
+);
+
+CREATE INDEX IF NOT EXISTS idx_machine_epochs_unack
+    ON machine_epochs (acknowledged_at);
 
 CREATE TABLE IF NOT EXISTS machine_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -790,6 +807,268 @@ class PollState:
     last_meters: dict | None = None
     last_history_write: float | None = None  # None: never written yet, forces a write on the first cycle
     burst_remaining: int = 0
+    # Continuity. epoch_id is the epoch every meter row written this cycle
+    # belongs to; see "Continuity: epochs" above.
+    epoch_id: int | None = None
+    identity: dict | None = None
+    cycles_since_identity: int = 0
+    clear_candidate_cycles: int = 0
+    clear_first_seen_at: str | None = None
+    # The meters as they stood BEFORE the first zeroed reading. Confirmation
+    # has to compare against this, not against the previous cycle: once the
+    # first zero is in, last_meters is zero too, nothing can "fall to zero"
+    # again, and a check against the previous cycle would decide the meters
+    # had recovered on the very next poll.
+    clear_baseline: dict | None = None
+
+
+# --- Continuity: epochs -----------------------------------------------------
+#
+# A gateway on a floor does not stay pointed at one unchanging machine. The
+# two events that break a meter history are both routine:
+#
+#   RAM CLEAR -- on EGT especially, a progressive change or a game package
+#   change requires one, and every meter goes to zero. It is scheduled
+#   maintenance, not a fault.
+#
+#   MACHINE SWAP -- the gateway is moved to a different cabinet, which needs
+#   new HMAC keys and has an entirely unrelated meter history.
+#
+# Neither may stop the poller. A technician on a floor has no screen and no
+# keyboard, and a gateway that needs attention after every RAM clear is a
+# gateway that generates callouts. So the poller records the discontinuity and
+# keeps going; resolving it is the CMS's job, which is where the history to
+# resolve it with lives.
+#
+# Silence would be worse than stopping, though. Writing post-clear meters into
+# the same history as pre-clear ones produces a record that looks continuous
+# and is not -- every total computed across the boundary is wrong, and nothing
+# says so. Hence epochs: each row of meter history belongs to one, and a new
+# epoch is an explicit, queryable statement that nothing before it reconciles
+# against anything after it.
+#
+# acknowledged_at is for the CMS and the gateway never sets it, so
+# "SELECT * FROM machine_epochs WHERE acknowledged_at IS NULL" is the
+# complete list of discontinuities nobody has dealt with yet.
+
+# How many consecutive cycles must agree before a mass-zero reading is called
+# a RAM clear. A single sweep can come back wrong -- a cable nudged, a machine
+# mid-reset, a decode fault -- and declaring an epoch on one bad read would
+# fabricate a discontinuity that never happened, which is the same corruption
+# this exists to prevent, just in the other direction. Three cycles of the
+# same answer is cheap; the meters are not going anywhere.
+CLEAR_CONFIRM_CYCLES = 3
+
+# A mass-zero is this fraction of the cumulative meters that previously held a
+# non-zero value. Not all of them: a machine can legitimately report a few
+# meters it no longer populates, and demanding 100% would miss real clears.
+CLEAR_FRACTION = 0.8
+
+# Identity is 2-3 extra long polls, so it is not read every cycle. It IS read
+# whenever the meters look cleared, because that is the one moment it matters:
+# a RAM clear and a machine swap look identical in the meters and are told
+# apart only by who is answering.
+IDENTITY_CHECK_CYCLES = 120
+
+
+def read_identity(client) -> dict:
+    """Who is answering. Every field is optional -- section 4.4 lets a machine
+    ignore a long poll it does not support, and an unreadable identity is not
+    evidence that the machine changed.
+    """
+    identity: dict = {"serial_number": None, "asset_number": None,
+                      "sas_version": None}
+    try:
+        version = client.send_sas_version_and_serial()
+        identity["serial_number"] = version.serial_number.strip()
+        identity["sas_version"] = version.sas_version.strip()
+    except SASError:
+        pass
+    try:
+        identity["asset_number"] = client.aft_game_lock_and_status_request(
+            lock_code=0xFF).asset_number
+    except SASError:
+        pass
+    return identity
+
+
+def identity_changed(previous: dict | None, current: dict) -> str | None:
+    """A description of what changed, or None.
+
+    Only fields that BOTH readings actually carry are compared. A machine that
+    stops answering 0x54 has not become a different machine, and treating a
+    None as a change would open an epoch every time a poll was missed.
+    """
+    if not previous:
+        return None
+    for field in ("serial_number", "asset_number"):
+        was, now = previous.get(field), current.get(field)
+        if was is not None and now is not None and was != now:
+            return f"{field} {was!r} -> {now!r}"
+    return None
+
+
+def looks_cleared(previous: dict | None, current: dict) -> tuple[bool, int, int]:
+    """Whether the cumulative meters just went to zero en masse.
+
+    Returns (verdict, how many fell to zero, how many were populated), so a
+    caller can report the evidence rather than just the conclusion.
+    """
+    if not previous:
+        return False, 0, 0
+    populated = zeroed = 0
+    for field in DECREASE_CHECK_FIELDS:
+        was, now = previous.get(field), current.get(field)
+        if was is None or not was > 0:
+            continue
+        populated += 1
+        if now == 0:
+            zeroed += 1
+    if not populated:
+        return False, 0, 0
+    return zeroed >= max(5, populated * CLEAR_FRACTION), zeroed, populated
+
+
+def open_epoch(conn, now: str, reason: str, identity: dict, detail: str) -> int:
+    """Close the open epoch, start a new one, return its id."""
+    conn.execute(
+        "UPDATE machine_epochs SET ended_at = ? WHERE ended_at IS NULL", (now,))
+    cursor = conn.execute(
+        "INSERT INTO machine_epochs (started_at, reason, serial_number, "
+        "asset_number, sas_version, detail) VALUES (?, ?, ?, ?, ?, ?)",
+        (now, reason, identity.get("serial_number"), identity.get("asset_number"),
+         identity.get("sas_version"), detail))
+    return int(cursor.lastrowid)
+
+
+def migrate_epoch_columns(conn: sqlite3.Connection) -> None:
+    """Add epoch_id to meter tables created before epochs existed.
+
+    CREATE TABLE IF NOT EXISTS is a no-op on a table that already exists, so
+    a database from an earlier run keeps its old shape and every INSERT naming
+    epoch_id fails. Soak databases are the point of this tool and are days
+    long; silently refusing to open them, or quietly dropping their history,
+    would both be worse than a one-line ALTER.
+
+    Existing rows get NULL, which is correct and honest: those readings were
+    taken before continuity was tracked, so which epoch they belong to is
+    genuinely unknown rather than epoch 1.
+    """
+    for table in ("meters_current", "meters_history"):
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if columns and "epoch_id" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN epoch_id INTEGER")
+            print(f"migrated: added epoch_id to {table} "
+                  "(existing rows keep NULL -- they predate epoch tracking)")
+    conn.commit()
+
+
+def maintain_epoch(conn, client, state, values: dict, now: str) -> None:
+    """Keep state.epoch_id pointing at the right epoch, opening a new one when
+    the machine's history has demonstrably broken. Never raises, never exits.
+    """
+    if state.epoch_id is None:
+        # First cycle of this run. Adopt the open epoch if the database has
+        # one -- a restarted gateway polling the same machine has not had a
+        # discontinuity, and inventing one on every restart would bury the
+        # real ones among the noise.
+        row = conn.execute(
+            "SELECT id, serial_number, asset_number, sas_version FROM machine_epochs "
+            "WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+        identity = read_identity(client)
+        state.identity = identity
+        state.cycles_since_identity = 0
+        if row is None:
+            state.epoch_id = open_epoch(
+                conn, now, "first_seen", identity,
+                "first run against this database")
+            print(f"[{now}] epoch {state.epoch_id} opened (first_seen): "
+                  f"serial {identity.get('serial_number')} "
+                  f"asset {identity.get('asset_number')}")
+            return
+        previous = {"serial_number": row[1], "asset_number": row[2],
+                    "sas_version": row[3]}
+        changed = identity_changed(previous, identity)
+        if changed:
+            state.epoch_id = open_epoch(
+                conn, now, "machine_changed", identity,
+                f"on restart, {changed}")
+            print(f"[{now}] MACHINE CHANGED on restart: {changed}")
+            print(f"[{now}] epoch {state.epoch_id} opened (machine_changed). "
+                  "New HMAC/registration keys are the CMS's to issue; polling "
+                  "continues meanwhile.")
+        else:
+            state.epoch_id = int(row[0])
+        return
+
+    state.cycles_since_identity += 1
+    # While a clear is pending, every confirmation is measured against the
+    # pre-clear baseline, so "still zero" keeps counting as evidence.
+    baseline = state.clear_baseline if state.clear_candidate_cycles else state.last_meters
+    cleared, zeroed, populated = looks_cleared(baseline, values)
+
+    # Identity is read on a slow schedule, and immediately whenever the meters
+    # look cleared -- a RAM clear and a machine swap are indistinguishable in
+    # the meters, and only the identity tells them apart.
+    if cleared or state.cycles_since_identity >= IDENTITY_CHECK_CYCLES:
+        identity = read_identity(client)
+        state.cycles_since_identity = 0
+        changed = identity_changed(state.identity, identity)
+        state.identity = identity
+        if changed:
+            state.clear_candidate_cycles = 0
+            state.clear_first_seen_at = None
+            state.clear_baseline = None
+            state.epoch_id = open_epoch(
+                conn, now, "machine_changed", identity, changed)
+            state.burst_remaining = max(state.burst_remaining, 5)
+            print(f"[{now}] MACHINE CHANGED: {changed}")
+            print(f"[{now}] epoch {state.epoch_id} opened (machine_changed). "
+                  "Polling continues; the CMS owns re-keying and reconciliation.")
+            return
+
+    if not cleared:
+        if state.clear_candidate_cycles:
+            # The meters came back. That was a bad read, not a clear, and
+            # saying so matters: it is the evidence that the confirmation
+            # requirement earned its keep.
+            print(f"[{now}] meters recovered after "
+                  f"{state.clear_candidate_cycles} zeroed cycle(s) -- a read "
+                  "fault, not a RAM clear. No epoch opened.")
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, "
+                "message) VALUES (?, ?, ?, ?)",
+                (now, "meter_continuity", "TransientZeroes",
+                 f"{state.clear_candidate_cycles} cycle(s) read as zeroed, "
+                 "then recovered"))
+        state.clear_candidate_cycles = 0
+        state.clear_first_seen_at = None
+        state.clear_baseline = None
+        return
+
+    if not state.clear_candidate_cycles:
+        state.clear_baseline = state.last_meters
+    state.clear_candidate_cycles += 1
+    state.burst_remaining = max(state.burst_remaining, CLEAR_CONFIRM_CYCLES)
+    if state.clear_first_seen_at is None:
+        state.clear_first_seen_at = now
+
+    if state.clear_candidate_cycles < CLEAR_CONFIRM_CYCLES:
+        print(f"[{now}] {zeroed}/{populated} cumulative meters read as zero "
+              f"({state.clear_candidate_cycles}/{CLEAR_CONFIRM_CYCLES}) -- not "
+              "declaring a RAM clear until it is confirmed.")
+        return
+
+    detail = (f"{zeroed} of {populated} populated cumulative meters zeroed, "
+              f"confirmed over {CLEAR_CONFIRM_CYCLES} cycles; first seen "
+              f"{state.clear_first_seen_at}")
+    state.epoch_id = open_epoch(conn, now, "ram_clear", state.identity or {}, detail)
+    state.clear_candidate_cycles = 0
+    state.clear_first_seen_at = None
+    state.clear_baseline = None
+    print(f"[{now}] RAM CLEAR confirmed: {detail}")
+    print(f"[{now}] epoch {state.epoch_id} opened (ram_clear). Polling "
+          "continues; nothing before this reconciles against anything after.")
 
 
 def utc_now() -> str:
@@ -1682,13 +1961,26 @@ def poll_and_log(
             "--skip-table-c7-sweep, --skip-validation-meters-sweep, or a larger --interval."
         )
 
+    # Decide which epoch these readings belong to BEFORE writing them, so a
+    # clear or a swap never lands rows in the epoch it ended.
+    try:
+        maintain_epoch(conn, client, state, values, now)
+    except Exception as e:  # noqa: BLE001
+        # Continuity bookkeeping must never be the reason a gateway stops
+        # logging. A missed epoch boundary is recoverable at the CMS; a poller
+        # that died on a floor at 3am is not.
+        print(f"[{now}] WARNING: epoch bookkeeping failed ({type(e).__name__}: "
+              f"{e}); continuing to log into epoch {state.epoch_id}.",
+              file=sys.stderr)
+
     columns = ", ".join(ALL_METER_FIELDS)
     qmarks = ", ".join("?" for _ in ALL_METER_FIELDS)
     bind = tuple(values[f] for f in ALL_METER_FIELDS)
 
     conn.execute(
-        f"INSERT OR REPLACE INTO meters_current (id, polled_at, {columns}) VALUES (1, ?, {qmarks})",
-        (now, *bind),
+        f"INSERT OR REPLACE INTO meters_current (id, polled_at, epoch_id, {columns}) "
+        f"VALUES (1, ?, ?, {qmarks})",
+        (now, state.epoch_id, *bind),
     )
 
     decreased = state.last_meters is not None and any(
@@ -1711,8 +2003,9 @@ def poll_and_log(
 
     if write_history:
         conn.execute(
-            f"INSERT INTO meters_history (polled_at, {columns}) VALUES (?, {qmarks})",
-            (now, *bind),
+            f"INSERT INTO meters_history (polled_at, epoch_id, {columns}) "
+            f"VALUES (?, ?, {qmarks})",
+            (now, state.epoch_id, *bind),
         )
         state.last_history_write = mono_now
         if history.mode == "ring" and history.cap:
@@ -1917,6 +2210,7 @@ def main() -> int:
         return 2
     conn = sqlite3.connect(args.db)
     conn.executescript(SCHEMA)
+    migrate_epoch_columns(conn)
     conn.commit()
 
     print(f"Polling {args.config} every {args.interval}s, writing to {args.db} (mode={args.mode}).")
