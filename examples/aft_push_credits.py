@@ -65,6 +65,13 @@ VERIFY_METERS = (
     (0x00A5, "NONRESTRICTED transfers to GM (quantity)"),
     (MeterCode.TOTAL_RESTRICTED_AMOUNT_PLAYED_CREDITS, "restricted amount played"),
     (MeterCode.TOTAL_NONRESTRICTED_AMOUNT_PLAYED_CREDITS, "nonrestricted amount played"),
+    # The same movement as the machine's own Machine Accounting screen shows,
+    # so a push can be checked against it line for line. Note the wording
+    # inverts: the screen's "non-cashable" is SAS restricted, and its
+    # "promotional" is SAS nonrestricted.
+    (0x002E, "screen 'Cashable Electronic In'"),
+    (0x0030, "screen 'Promotional Electronic In'  (SAS NONrestricted)"),
+    (0x002F, "screen 'Non-cashable Electronic In' (SAS RESTRICTED)"),
 )
 
 

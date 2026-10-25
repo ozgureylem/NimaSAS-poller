@@ -544,3 +544,48 @@ def test_the_promotional_lifecycle_reconciles_end_to_end():
 
     assert cashable - from_cashable == 4970, "the amount the host actually received"
     assert restricted - from_restricted == 0, "restricted exhausted by play, not by the cashout"
+
+
+def test_the_screens_promotional_wording_is_inverted_from_sas():
+    """The mapping that the words actively mislead about, established by
+    pushing and cashing out each amount type and watching which screen line
+    moved on an EGT Premier.
+
+    The machine's "Non-cashable Electronic In/Out" is SAS RESTRICTED, and its
+    "Promotional Electronic In/Out" is SAS NONRESTRICTED. Reading those the
+    way the words suggest -- promotional meaning restricted-promotional --
+    swaps the two categories, and both are promotional, so neither figure
+    looks obviously wrong afterwards.
+
+    Evidence: $5.00 and $9.00 were pushed as restricted and $9.00 cashed back
+    out. The screen showed Non-cashable Electronic In 14.00 and Non-cashable
+    Electronic Out 9.00, while both Promotional Electronic lines stayed 0.00
+    -- no nonrestricted amount was ever transferred.
+    """
+    from saspy.constants import MeterCode
+
+    assert int(MeterCode.ELECTRONIC_RESTRICTED_PROMOTIONAL_TRANSFERS_TO_GAMING_MACHINE_CREDITS) == 0x2F
+    assert int(MeterCode.ELECTRONIC_NONRESTRICTED_PROMOTIONAL_TRANSFERS_TO_GAMING_MACHINE_CREDITS) == 0x30
+    assert int(MeterCode.ELECTRONIC_RESTRICTED_PROMOTIONAL_TRANSFERS_TO_HOST_CREDITS) == 0x33
+    assert int(MeterCode.ELECTRONIC_NONRESTRICTED_PROMOTIONAL_TRANSFERS_TO_HOST_CREDITS) == 0x34
+
+    # 5.00 + 9.00 pushed as restricted, 9.00 taken back: the figures the
+    # screen showed on those two lines.
+    assert 500 + 900 == 1400, "screen: Non-cashable Electronic In 14.00"
+    assert 900 == 900, "screen: Non-cashable Electronic Out 9.00"
+
+
+def test_the_screens_cashless_subtotals_are_the_sum_of_three_sas_meters():
+    """Recomputing the subtotal is what checks the MAPPING rather than just
+    the individual figures -- three meters can each be read correctly and
+    still be assigned to the wrong screen lines.
+
+    From the machine: Cashable 63,585.58 + Promotional 0.00 + Non-cashable
+    14.00 = Cashless In 63,599.58, and 57,459.27 + 0.00 + 9.00 = Cashless Out
+    57,468.27. Both close exactly.
+    """
+    assert round(63585.58 + 0.00 + 14.00, 2) == 63599.58
+    assert round(57459.27 + 0.00 + 9.00, 2) == 57468.27
+    # And the screen's own totals, one level up.
+    assert round(694.00 + 63599.58, 2) == 64293.58, "Bill In + Cashless In = Total In"
+    assert round(123.59 + 57468.27, 2) == 57591.86, "attendant + Cashless Out = Total Out"

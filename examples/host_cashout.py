@@ -91,6 +91,12 @@ VERIFY_METERS = (
     (0x00BB, "RESTRICTED transfers to HOST (quantity)"),
     (0x00BC, "NONRESTRICTED transfers to HOST (cents)"),
     (0x00BD, "NONRESTRICTED transfers to HOST (quantity)"),
+    # The machine's own Machine Accounting screen lines, so a cashout can be
+    # checked against it directly. The screen's "non-cashable" is SAS
+    # restricted; its "promotional" is SAS nonrestricted.
+    (0x0032, "screen 'Cashable Electronic Out'"),
+    (0x0034, "screen 'Promotional Electronic Out'  (SAS NONrestricted)"),
+    (0x0033, "screen 'Non-cashable Electronic Out' (SAS RESTRICTED)"),
 )
 
 

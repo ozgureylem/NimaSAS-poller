@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 293 tests, all against fake serial ports; run them with
+- **`tests/`** — 295 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -268,6 +268,26 @@ step-by-step guide to structuring a local SQL layer around a poller.
   Table 8.2b's available-transfers bit 2 and says which case applies. When a
   handpay does occur the tool reads LP `0x1B` for the amount and the
   available reset method, rather than just announcing the exception.
+- **`examples/accounting_summary.py`** — read-only. Prints the machine's
+  accounting figures as SAS reports them, grouped the way the machine's own
+  Machine Accounting screen groups them, and **recomputes that screen's
+  Cashless In/Out subtotals** from the component meters — so a match
+  confirms the *mapping*, not just the individual numbers.
+  ```
+  python3 examples/accounting_summary.py /dev/ttyS0 --address 1
+  ```
+  The mapping the wording inverts, established by pushing and cashing out
+  each amount type and watching which line moved:
+
+  | machine's screen | SAS / Table C-7 |
+  |---|---|
+  | Cashable Electronic In / Out | `002E` / `0032` |
+  | **Promotional** Electronic In / Out | `0030` / `0034` — SAS **NONrestricted** |
+  | **Non-cashable** Electronic In / Out | `002F` / `0033` — SAS **RESTRICTED** |
+
+  Read the other way round — "promotional" meaning restricted-promotional,
+  which the words invite — and the two categories swap. Both are
+  promotional, so neither figure then looks obviously wrong.
 - **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
   and says whether the link held. It buckets failures by hour and minute
   and reports the worst minute alongside the mean, because the failure mode
