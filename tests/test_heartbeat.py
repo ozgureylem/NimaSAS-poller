@@ -239,3 +239,45 @@ def test_heartbeat_sourced_events_are_distinguishable():
 
     sources = [r[0] for r in conn.execute("SELECT source FROM machine_events ORDER BY id")]
     assert sources == ["heartbeat", "cycle"]
+
+
+def test_the_attendance_check_covers_every_door_not_just_the_slot_door():
+    """The blind spot a 24-hour soak found.
+
+    The report printed "0x1D x3 belly door was opened", "0x18 AC power was
+    lost" and then, three lines later, "nobody was at the machine" -- because
+    the check only knew the slot door, the menus, options-changed and the
+    meter reset. It contradicted its own evidence, which is worse than
+    printing nothing at all.
+
+    On the EGT Premier the BILL VALIDATOR door reports as 0x1D/0x1E, which
+    Appendix A names "belly door" -- so somebody checking the stacker shows
+    up under a name that does not mention the bill validator. Covering only
+    the obvious doors is not enough.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "soak_report", str(Path(__file__).resolve().parent.parent / "examples" / "soak_report.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # Read the sets out of the source, since they are local to main().
+    src = (Path(__file__).resolve().parent.parent / "examples" / "soak_report.py").read_text()
+    for code in (0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x19, 0x1A, 0x1B, 0x1C,
+                 0x1D, 0x1E, 0x3A, 0x3C, 0x7A, 0x7B, 0x82, 0x83, 0x84, 0x85, 0x86,
+                 0x98, 0x99, 0x9A, 0x9B):
+        assert f"0x{code:02X}:" in src, f"0x{code:02X} missing from the attendance set"
+
+
+def test_power_events_are_reported_separately_from_attendance():
+    """AC power lost is not somebody at the machine -- it is the machine not
+    running. Both ruin a stability number, for different reasons, and a
+    report that conflates them explains an outage as a flaky link.
+    """
+    src = (Path(__file__).resolve().parent.parent / "examples" / "soak_report.py").read_text()
+    assert "INTERRUPTED" in src
+    for code in (0x17, 0x18):
+        assert f"0x{code:02X}:" in src
+    assert "one end was off" in src

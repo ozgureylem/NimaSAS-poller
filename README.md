@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 278 tests, all against fake serial ports; run them with
+- **`tests/`** — 280 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -276,9 +276,17 @@ step-by-step guide to structuring a local SQL layer around a poller.
   as exceptions `0x11`, `0x12`, `0x82` and `0x83`, and discarded it because
   it only acted on tickets and cashouts. A failure log without the machine's
   own state beside it cannot be read. Everything now lands in
-  `machine_events`, and `soak_report.py` flags door/menu/operator events
-  explicitly — turning "the loop stalled, investigate" into "the door was
-  open".
+  `machine_events`, and `soak_report.py` flags them under two headings —
+  **someone was at the machine** (every door and access panel in Appendix A,
+  not just the slot door, plus the attendant and operator menus) and **the
+  machine was interrupted** (AC power, RAM errors, buffer overflow). Those
+  are separated because they invalidate a stability number differently: one
+  is a machine being serviced, the other is a machine that was off. It turns
+  "the loop stalled, investigate" into "the power went out at 02:57".
+
+  Worth knowing when reading those events: on the EGT Premier the **bill
+  validator door reports as `0x1D`/`0x1E`**, which Appendix A names "belly
+  door". Expect that kind of mapping to vary by model.
 
   **The meter sweep interleaves general polls.** A cycle used to issue one
   general poll and then 73 long-poll exchanges, leaving the machine's

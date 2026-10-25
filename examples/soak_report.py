@@ -197,11 +197,51 @@ def main() -> int:
     # run -- which the machine had reported over the wire as exceptions 0x11,
     # 0x12, 0x82 and 0x83, and which the poller used to discard. A failure log
     # without the machine's own state beside it cannot be read.
-    ATTENDED = {0x11: "door opened", 0x12: "door closed",
-                0x82: "attendant/meter menu entered", 0x83: "attendant/meter menu exited",
-                0x84: "operator menu entered", 0x85: "operator menu exited",
-                0x3C: "operator changed options", 0x7A: "soft meters reset",
-                0x86: "out of service (by attendant)"}
+    # Two separate reasons a run is not a clean stability measurement, kept
+    # apart because they invalidate it differently.
+    #
+    # The first version of this listed only the slot door, the menus, options
+    # changed and the meter reset -- and then printed "nobody was at the
+    # machine" on a run whose own event table showed a belly door opened three
+    # times and AC power lost. It contradicted the data three lines above it.
+    # The lesson is the same one this file already records about the
+    # monotonicity check: a verdict that confidently states the opposite of
+    # its own evidence is worse than printing nothing. Every door, every
+    # access panel and every attendant action from Appendix A is here now.
+    #
+    # Note on reading them: on the EGT Premier the BILL VALIDATOR door is
+    # reported as 0x1D/0x1E, which Appendix A names "belly door". The
+    # machine's own log said "Bill Validator door was just opened" for the
+    # same event. Expect that kind of mapping per model.
+    ATTENDED = {
+        0x11: "slot door opened", 0x12: "slot door closed",
+        0x13: "drop door opened", 0x14: "drop door closed",
+        0x15: "card cage opened", 0x16: "card cage closed",
+        0x19: "cashbox door opened", 0x1A: "cashbox door closed",
+        0x1B: "cashbox removed", 0x1C: "cashbox installed",
+        0x1D: "belly door opened (bill validator door on some models)",
+        0x1E: "belly door closed (bill validator door on some models)",
+        0x3A: "memory error reset (operator used self test switch)",
+        0x3C: "operator changed options",
+        0x7A: "soft meters reset to zero",
+        0x7B: "bill validator totals reset by an attendant",
+        0x82: "attendant/meter menu entered", 0x83: "attendant/meter menu exited",
+        0x84: "operator menu entered", 0x85: "operator menu exited",
+        0x86: "out of service (by attendant)",
+        0x98: "power off card cage access", 0x99: "power off slot door access",
+        0x9A: "power off cashbox door access", 0x9B: "power off drop door access",
+    }
+    # Not someone at the machine -- the machine not running. Equally fatal to a
+    # stability number, for a different reason: the link cannot be measured
+    # across an interval when one end was off.
+    INTERRUPTED = {
+        0x17: "AC power was APPLIED to the machine",
+        0x18: "AC power was LOST from the machine",
+        0x31: "CMOS RAM error (data recovered from EEPROM)",
+        0x32: "CMOS RAM error (no data recovered)",
+        0x33: "CMOS RAM error (bad device)",
+        0x70: "exception buffer overflow",
+    }
     print()
     if not table_exists(conn, "machine_events"):
         print("no machine_events table -- this database predates exception recording,")
@@ -217,26 +257,42 @@ def main() -> int:
                 "GROUP BY exception_code ORDER BY COUNT(*) DESC LIMIT 10"):
                 print(f"    0x{code:02X}  x{n:<6} {desc}")
 
-            attended = list(conn.execute(
-                "SELECT occurred_at, exception_code, description FROM machine_events "
-                f"WHERE exception_code IN ({','.join(str(c) for c in ATTENDED)}) "
-                "ORDER BY occurred_at"))
-            if attended:
-                print(f"\n  SOMEONE WAS AT THE MACHINE ({len(attended)} event(s)):")
-                for occurred, code, desc in attended[:20]:
-                    print(f"    {occurred}  0x{code:02X}  {desc}")
-                if len(attended) > 20:
-                    print(f"    ... {len(attended) - 20} more")
-                print("\n  => Failures overlapping these are not link failures. A machine")
-                print("     with its door open or sitting in an attendant menu is being")
-                print("     serviced, and section 8.3 lists exactly those states as ones")
-                print("     where it cannot act normally. Treat this run as a robustness")
-                print("     test, not a stability measurement -- and re-soak untouched if")
-                print("     stability is what you were measuring.")
+            def listed(codes, heading, explanation):
+                rows = list(conn.execute(
+                    "SELECT occurred_at, exception_code, description FROM machine_events "
+                    f"WHERE exception_code IN ({','.join(str(c) for c in codes)}) "
+                    "ORDER BY occurred_at"))
+                if not rows:
+                    return False
+                print(f"\n  {heading} ({len(rows)} event(s)):")
+                for occurred, code, _desc in rows[:25]:
+                    print(f"    {occurred}  0x{code:02X}  {codes[code]}")
+                if len(rows) > 25:
+                    print(f"    ... {len(rows) - 25} more")
+                for line in explanation:
+                    print(f"  {line}")
+                return True
+
+            touched = listed(
+                ATTENDED, "SOMEONE WAS AT THE MACHINE",
+                ["=> Failures overlapping these are not link failures. A machine with a",
+                 "   door open or sitting in an attendant menu is being serviced, and",
+                 "   section 8.3 names exactly those states as ones where it cannot act",
+                 "   normally."])
+            down = listed(
+                INTERRUPTED, "THE MACHINE WAS INTERRUPTED",
+                ["=> A link cannot be measured across an interval when one end was off.",
+                 "   Failures bracketing a power event are the outage, not the link, and",
+                 "   the stall above is almost certainly the same event."])
+
+            if touched or down:
+                print("\n  => Treat this run as a robustness test rather than a stability")
+                print("     measurement, and re-soak undisturbed if stability is the")
+                print("     number you need.")
             else:
-                print("\n  No door, menu or operator events: nobody was at the machine.")
-                print("  Failures here are the link's own, which is what a stability")
-                print("  measurement needs.")
+                print("\n  No door, access-panel, attendant or power events: the machine")
+                print("  was undisturbed and running throughout. Failures here are the")
+                print("  link's own, which is what a stability measurement needs.")
 
     # --- did any meter go backwards? -------------------------------------
     # Meters are cumulative, so a decrease means a RAM clear, a decode fault,
