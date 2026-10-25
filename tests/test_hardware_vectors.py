@@ -589,3 +589,40 @@ def test_the_screens_cashless_subtotals_are_the_sum_of_three_sas_meters():
     # And the screen's own totals, one level up.
     assert round(694.00 + 63599.58, 2) == 64293.58, "Bill In + Cashless In = Total In"
     assert round(123.59 + 57468.27, 2) == 57591.86, "attendant + Cashless Out = Total Out"
+
+
+def test_bill_in_is_bills_accepted_not_bills_to_drop():
+    """Two meters that sound alike and are not.
+
+    0x0B is total credits from bills ACCEPTED, which is the screen's "Bill
+    In". 0x58 is total credits from bills TO DROP -- where accepted bills end
+    up afterwards, and which a cashless machine with no drop box does not
+    report at all. Using 0x58 printed "n/a" against a screen reading 694.00.
+    """
+    from saspy.constants import MeterCode
+
+    assert int(MeterCode.TOTAL_CREDITS_FROM_BILLS_ACCEPTED) == 0x0B
+    assert int(MeterCode.TOTAL_CREDITS_FROM_BILLS_TO_DROP) == 0x58
+    # And neither is the stacker level, which falls when the box is emptied.
+    assert int(MeterCode.TOTAL_VALUE_OF_BILLS_CURRENTLY_IN_STACKER_CREDITS) == 0x3F
+
+
+def test_a_subtotal_names_the_meter_that_did_not_answer():
+    """An n/a subtotal hides WHICH component is missing, and the answer is
+    usually that the machine does not implement it -- a fact about the
+    machine worth printing rather than an error to swallow.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "accounting_summary",
+        str(Path(__file__).resolve().parent.parent / "examples" / "accounting_summary.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    total, missing = mod.subtotal({0x2E: 100, 0x30: 0, 0x2F: 400}, (0x2E, 0x30, 0x2F))
+    assert total == 500 and missing == []
+
+    total, missing = mod.subtotal({0x2E: 100, 0x30: None, 0x2F: 400}, (0x2E, 0x30, 0x2F))
+    assert total is None and missing == [0x30]

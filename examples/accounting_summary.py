@@ -45,7 +45,11 @@ from saspy.transport import SASTransport
 # so a mismatch against the machine's own screen is visible rather than
 # hidden behind agreement on the components.
 IN_LINES = [
-    ("Bill In", 0x58, 1),
+    # 0x0B, total credits from bills ACCEPTED -- not 0x58, total credits from
+    # bills TO DROP, which is where accepted bills end up afterwards and which
+    # a cashless machine with no drop box does not report at all. The first
+    # version used 0x58 and printed "n/a" against a screen showing 694.00.
+    ("Bill In", 0x0B, 1),
     ("Cashless In", None, 1),            # computed
     ("Cashable Electronic In", 0x2E, 2),
     ("Promotional Electronic In", 0x30, 2),
@@ -60,6 +64,7 @@ OUT_LINES = [
 ]
 CORE = [
     ("Total Bet (Coin In)", 0x00),
+    ("Total credits from bills to drop", 0x58),
     ("Total Won", 0x01),
     ("Total Cancelled Credits", 0x04),
     ("Total Drop", 0x24),
@@ -88,6 +93,19 @@ def read(client, codes: list[int]) -> dict[int, int | None]:
 
 def money(value: int | None) -> str:
     return "       n/a" if value is None else f"{value / 100:>10,.2f}"
+
+
+def subtotal(values: dict, codes: tuple[int, ...]) -> tuple[int | None, list[int]]:
+    """Sum the components, and name any that did not answer.
+
+    A subtotal silently reported as n/a hides WHICH meter is missing, and the
+    answer is usually that the machine does not implement it -- which is a
+    fact about the machine worth printing, not an error.
+    """
+    missing = [c for c in codes if values.get(c) is None]
+    if missing:
+        return None, missing
+    return sum(values[c] for c in codes), []
 
 
 def main() -> int:
@@ -121,27 +139,24 @@ def main() -> int:
 
     print(f"\n=== {args.port}, address {args.address} ===\n")
 
-    cashless_in = [values.get(c) for c in (0x2E, 0x30, 0x2F)]
-    bill_in = values.get(0x58)
+    bill_in = values.get(0x0B)
     print("Total In")
     print(f"    {'Bill In':<38} {money(bill_in)}   (C-7 0058)")
-    sub_in = sum(v for v in cashless_in if v is not None) if any(
-        v is not None for v in cashless_in) else None
-    print(f"    {'Cashless In  [computed]':<38} {money(sub_in)}")
+    sub_in, missing_in = subtotal(values, (0x2E, 0x30, 0x2F))
+    print(f"    {'Cashless In  [computed]':<38} {money(sub_in)}"
+          + (f"   missing {' '.join(f'{c:04X}' for c in missing_in)}" if missing_in else ""))
     for label, code, _ in IN_LINES[2:]:
         print(f"      {label:<36} {money(values.get(code))}   (C-7 {code:04X})")
-    total_in = None
-    if sub_in is not None and bill_in is not None:
-        total_in = sub_in + bill_in
-    print(f"  {'TOTAL IN  [computed]':<40} {money(total_in)}")
+    total_in = sub_in + bill_in if (sub_in is not None and bill_in is not None) else None
+    print(f"  {'TOTAL IN  [computed]':<40} {money(total_in)}"
+          + ("   (Bill In did not answer)" if bill_in is None else ""))
 
-    cashless_out = [values.get(c) for c in (0x32, 0x34, 0x33)]
     attendant = values.get(0x03)
     print("\nTotal Out")
     print(f"    {'Cancelled Credits Paid by Attendant':<38} {money(attendant)}   (C-7 0003)")
-    sub_out = sum(v for v in cashless_out if v is not None) if any(
-        v is not None for v in cashless_out) else None
-    print(f"    {'Cashless Out  [computed]':<38} {money(sub_out)}")
+    sub_out, missing_out = subtotal(values, (0x32, 0x34, 0x33))
+    print(f"    {'Cashless Out  [computed]':<38} {money(sub_out)}"
+          + (f"   missing {' '.join(f'{c:04X}' for c in missing_out)}" if missing_out else ""))
     for label, code, _ in OUT_LINES[2:]:
         print(f"      {label:<36} {money(values.get(code))}   (C-7 {code:04X})")
     total_out = None
