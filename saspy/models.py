@@ -322,6 +322,12 @@ class WagerCategoryInfo:
 
     payback_percentage: str  # ASCII "??.??", decimal implied
     coin_in_meter: int
+    # The machine states its own Coin In meter width here, 0-9 bytes BCD, so a
+    # caller can work out where that meter wraps instead of assuming a width.
+    # Size 0 together with an all-null payback is Table 7.24b's way of saying
+    # the category is not supported, which is otherwise indistinguishable from
+    # a supported category sitting at zero.
+    coin_in_meter_size: int = 0
 
 
 @dataclass(frozen=True)

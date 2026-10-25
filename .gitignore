@@ -102,3 +102,13 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Machine state snapshots from examples/meter_snapshot.py.
+#
+# Ignored HERE, in the public mirror, on purpose. A snapshot carries a
+# machine's asset number, serial number and complete accounting history, which
+# is operator business data. It belongs in the private repository, which does
+# NOT ignore this folder. The warning in meter_snapshot.py's docstring says the
+# same thing; this is the part that survives a copy-paste mirror of the
+# examples/ directory.
+captures/

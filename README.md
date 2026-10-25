@@ -336,6 +336,52 @@ step-by-step guide to structuring a local SQL layer around a poller.
   EGT Premier — a report of `50.00` against a screen showing `57.00` came
   from a tool printing `0x74`'s *cashable field alone*, not from any meter
   disagreeing.
+- **`examples/wager_categories.py`** — read-only. Per-wager-category
+  theoretical payback and Coin In, read raw from LP `0xB4`. This is the
+  other route section 7.24 describes to the payback figure, for machines
+  that decline meter `007F` — which §7.24.1 explicitly permits ("may …
+  choose to not support meter 007F for that paytable"), and which the lab
+  machine does while still showing 95.82% on its own screen.
+  ```
+  python3 examples/wager_categories.py /dev/ttyS0 --address 1
+  python3 examples/wager_categories.py /dev/ttyS0 --address 1 --weighted-average
+  ```
+  It does **not** form the weighted average by default, which is the point.
+  An average computed at the gateway is correct only until a Coin In meter
+  rolls over: past that the meter has dropped its high-order digits, the
+  gateway holds no record of how many times it wrapped, and the figure
+  drifts with nothing to show that it has. Reconstructing wrapped digits is
+  the CMS's job, because the CMS holds the history to do it with.
+
+  So what the tool contributes is not the percentage but the raw figures
+  plus each meter's **declared width** — LP `0xB4` carries a Coin In meter
+  size byte (0–9 BCD bytes), so the wrap ceiling is the machine's own
+  statement rather than an assumption. Any meter past 90% of its ceiling is
+  flagged, since that is the one downstream consumers need warning about.
+  `--weighted-average` computes it anyway for cross-checking, with the
+  caveat attached; it will not print a bare number.
+
+  Table 7.24b's "not supported" answer — an all-null payback with size `0` —
+  is reported as such rather than as a supported category sitting at zero.
+  Those two are indistinguishable without the size byte, which the client
+  previously parsed and discarded.
+- **`examples/meter_snapshot.py`** — read-only. Writes one machine's whole
+  readable state — identity, every Table C-7 meter this client knows, and
+  `0x74`'s three balances — to a single committable JSON file, values raw in
+  accounting units exactly as the machine reported them. One file per
+  snapshot, so `git log` on the folder is the machine's history and
+  `git diff` between two of them is precisely what moved. Meters the machine
+  does not implement are recorded as `null` and listed, since that is a fact
+  about the machine rather than a gap to fill.
+  ```
+  python3 examples/meter_snapshot.py /dev/ttyS0 --address 1 --note "after a 3.00 promo push"
+  ```
+  **Commit snapshots to the private repository only.** A snapshot carries the
+  machine's asset number, serial number and complete accounting history, which
+  is operator business data; a public repo is indexed and forked, and removing
+  a file later does not remove it from the history. `captures/` is in this
+  mirror's `.gitignore` for that reason — the warning in the tool's docstring
+  is advice, the ignore rule is what survives a copy-paste of `examples/`.
 - **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
   and says whether the link held. It buckets failures by hour and minute
   and reports the worst minute alongside the mean, because the failure mode

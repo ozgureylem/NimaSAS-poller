@@ -514,7 +514,11 @@ class SASClient:
         payback_percentage = data[4:8].decode("ascii")
         coin_in_size = data[8]
         coin_in_meter = decode_bcd(data[9:9 + coin_in_size]) if coin_in_size else 0
-        return models.WagerCategoryInfo(payback_percentage=payback_percentage, coin_in_meter=coin_in_meter)
+        return models.WagerCategoryInfo(
+            payback_percentage=payback_percentage,
+            coin_in_meter=coin_in_meter,
+            coin_in_meter_size=coin_in_size,
+        )
 
     def send_extended_game_n_information(self, game_number: int = 0) -> models.ExtendedGameNInfo:
         poll = LongPoll.SEND_EXTENDED_GAME_N_INFORMATION

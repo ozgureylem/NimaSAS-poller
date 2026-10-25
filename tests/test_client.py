@@ -807,3 +807,44 @@ def test_send_extended_game_n_information():
     assert result.game_name == "ABC"
     assert result.paytable_name == "XY"
     assert result.wager_categories == 1
+
+
+# --- LP 0xB4, send wager category information (Table 7.24a/7.24b) ---------
+
+
+def _wager_category_response(payback: bytes, coin_in: bytes, size: int) -> bytes:
+    data = encode_bcd(1, 2)          # game number
+    data += encode_bcd(2, 2)         # wager category
+    data += payback                  # 4 ASCII, decimal implied
+    data += bytes([size])            # Coin In meter size, 0-9 bytes
+    data += coin_in
+    return bytes([ADDRESS, 0xB4, len(data)]) + data
+
+
+def test_wager_category_information_reports_the_coin_in_meter_size():
+    """The size byte says where that meter wraps, which is the only thing that
+    says how much headroom is left. It used to be parsed and thrown away."""
+    body = _wager_category_response(b"9582", encode_bcd(21392098, 4), 4)
+    fake = FakeSerial(body + crc16_bytes(body))
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=1.0)
+
+    result = client.send_wager_category_information(game_number=1, wager_category=2)
+
+    assert result.payback_percentage == "9582"
+    assert result.coin_in_meter == 21392098
+    assert result.coin_in_meter_size == 4
+
+
+def test_wager_category_information_unsupported_category_is_distinguishable():
+    """Table 7.24b: an unsupported category answers with an all-null payback and
+    size 0. Without the size byte that is indistinguishable from a supported
+    category sitting at zero Coin In."""
+    body = _wager_category_response(b"\x00\x00\x00\x00", b"", 0)
+    fake = FakeSerial(body + crc16_bytes(body))
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=1.0)
+
+    result = client.send_wager_category_information(game_number=1, wager_category=2)
+
+    assert result.coin_in_meter == 0
+    assert result.coin_in_meter_size == 0
+    assert result.payback_percentage == "\x00\x00\x00\x00"
