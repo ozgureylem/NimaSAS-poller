@@ -13,7 +13,8 @@ snapshot and stopped holding in the second. That is how the Total Out identity
 was caught: 0004 matched the screen's Total Out until an attendant first paid
 a win, then silently did not.
 
-    python3 examples/capture_diff.py captures/BEFORE.json captures/AFTER.json
+    python3 examples/capture_diff.py                    # the two most recent
+    python3 examples/capture_diff.py BEFORE.json AFTER.json
 """
 
 from __future__ import annotations
@@ -121,8 +122,16 @@ def check(snapshot: dict, native: int, parts: tuple[int, ...]) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("before")
-    ap.add_argument("after")
+    # Optional, because the overwhelmingly common case is "the last two", and
+    # typing ISO-8601 filenames by hand is both tedious and a trap: a shell
+    # reads <before>.json as a redirection, not as a placeholder, and answers
+    # with "No such file or directory" about a file nobody meant to name.
+    ap.add_argument("before", nargs="?",
+                    help="older snapshot. Omit BOTH to use the two most recent "
+                         "in --dir.")
+    ap.add_argument("after", nargs="?", help="newer snapshot")
+    ap.add_argument("--dir", default="captures",
+                    help="where to look when no files are named (default: captures/)")
     ap.add_argument("--all", action="store_true",
                     help="also list meters that did not change")
     ap.add_argument("--raw", action="store_true",
@@ -134,9 +143,27 @@ def main() -> int:
     global RAW
     RAW = args.raw
 
+    if args.before and args.after:
+        before_path, after_path = Path(args.before), Path(args.after)
+    elif args.before or args.after:
+        print("Name both snapshots or neither.", file=sys.stderr)
+        return 2
+    else:
+        # Snapshot names start with an ISO-8601 UTC timestamp, so sorting them
+        # as text sorts them in time.
+        found = sorted(Path(args.dir).glob("*.json"))
+        if len(found) < 2:
+            print(f"Need two snapshots in {args.dir}/ to compare; found "
+                  f"{len(found)}. Name them explicitly, or point --dir elsewhere.",
+                  file=sys.stderr)
+            return 2
+        before_path, after_path = found[-2], found[-1]
+        print(f"\nComparing the two most recent snapshots in {args.dir}/:")
+        print(f"  {before_path.name}\n  {after_path.name}")
+
     try:
-        before = json.loads(Path(args.before).read_text())
-        after = json.loads(Path(args.after).read_text())
+        before = json.loads(before_path.read_text())
+        after = json.loads(after_path.read_text())
     except (OSError, json.JSONDecodeError) as e:
         print(f"Could not read both snapshots: {e}", file=sys.stderr)
         return 2
