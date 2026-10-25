@@ -382,6 +382,29 @@ step-by-step guide to structuring a local SQL layer around a poller.
   a file later does not remove it from the history. `captures/` is in this
   mirror's `.gitignore` for that reason — the warning in the tool's docstring
   is advice, the ignore rule is what survives a copy-paste of `examples/`.
+- **`examples/capture_diff.py`** — offline; compares two snapshot files and
+  touches no hardware.
+  ```
+  python3 examples/capture_diff.py captures/BEFORE.json captures/AFTER.json
+  ```
+  `git diff` already shows which numbers changed, but as four-digit hex codes
+  and raw units — not a form anyone reads a test result out of. This names
+  each meter and prints the delta, and **re-checks every identity on both
+  ends**, because the case worth catching is not a meter that moved but an
+  identity that held before and stopped after. That is how `0004` was caught
+  passing for the screen's Total Out until an attendant first paid a win.
+
+  Counts print as counts: Table C-7 mixes money and quantities freely and the
+  wire says nothing about which is which, so dividing everything by 100 turns
+  665,755 games played into a plausible-looking `6,657.55`. Ledgers print in
+  **raw accounting units** — a ledger is held against itself, and dividing by
+  100 adds an assumption it does not need; `--raw` applies that to the whole
+  diff.
+
+  Ledgers also net off credit still **on** the machine, which has not left by
+  any route yet. Without that the shortfall moves every time money is pushed
+  or spent and tells you nothing; with it, the remainder is what is genuinely
+  unattributable and should stay still between runs.
 - **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
   and says whether the link held. It buckets failures by hour and minute
   and reports the worst minute alongside the mean, because the failure mode

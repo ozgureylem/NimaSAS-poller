@@ -93,8 +93,8 @@ PLAYED = [
 # back out or was wagered. These close to the cent on a healthy machine, and
 # are the one check here that needs no second screen to read.
 LEDGERS = [
-    ("Non-cashable (SAS RESTRICTED)", 0x2F, 0x33, 0x19),
-    ("Promotional  (SAS NONrestricted)", 0x30, 0x34, 0x1A),
+    ("Non-cashable (SAS RESTRICTED)", 0x2F, 0x33, 0x19, "restricted"),
+    ("Promotional  (SAS NONrestricted)", 0x30, 0x34, 0x1A, "nonrestricted"),
 ]
 
 CURRENT = [
@@ -241,28 +241,55 @@ def main() -> int:
         print("         SAS you would have to weight LP 0xB4's per-wager-category payback")
         print("         by its coin-in yourself.")
 
-    print("\nPromotional ledgers  (in = out + played)")
-    for label, in_code, out_code, played_code in LEDGERS:
+    # Read before the ledgers, not after: credit still ON the machine has not
+    # left by any route, so it is part of any shortfall and moves it every time
+    # money is pushed or spent. Netting it off leaves the amount that is
+    # genuinely unattributed, which is the figure worth watching.
+    try:
+        lock = client.aft_game_lock_and_status_request(lock_code=0xFF)
+    except SASError as exc:
+        lock, lock_error = None, exc
+    else:
+        lock_error = None
+    held_by_type = {} if lock is None else {
+        "restricted": lock.current_restricted_amount,
+        "nonrestricted": lock.current_non_restricted_amount,
+    }
+
+    # RAW accounting units here, not currency. Everything above is formatted to
+    # be held against the machine's own screen, which shows currency; a ledger
+    # is held against itself. Dividing by 100 adds an assumption about the
+    # accounting unit that the ledger does not need and cannot check, and a
+    # sum that balances exactly in integers is the whole evidence.
+    print("\nPromotional ledgers  (raw accounting units; in = out + played + on machine)")
+    def raw(value: int | None) -> str:
+        return "n/a" if value is None else f"{value:,}"
+
+    for label, in_code, out_code, played_code, balance_key in LEDGERS:
         got_in, got_out = values.get(in_code), values.get(out_code)
         played = values.get(played_code)
-        print(f"    {label:<38} {money(got_in)} in")
-        print(f"      {'':<36} {money(got_out)} out + {money(played).strip()} played")
-        if None in (got_in, got_out, played):
-            print("      -> a component is not reported, so this ledger cannot be closed.")
-        elif got_in == got_out + played:
+        held = held_by_type.get(balance_key)
+        print(f"    {label}")
+        print(f"      {raw(got_in):>12}  in       ({in_code:04X})")
+        print(f"      {raw(got_out):>12}  out      ({out_code:04X})")
+        print(f"      {raw(played):>12}  played   ({played_code:04X})")
+        print(f"      {raw(held):>12}  on machine (0x74 {balance_key})")
+        if None in (got_in, got_out, played, held):
+            print("      -> a component is not reported, so this ledger cannot be"
+                  " closed.")
+        elif got_in == got_out + played + held:
             print("      -> closes exactly.")
         else:
-            short = got_in - got_out - played
-            print(f"      -> does NOT close: {money(short).strip()} unaccounted.")
-            print("         Two things land here and neither is a fault. Credit still ON")
-            print("         the machine has not left by any route yet -- compare the")
-            print("         balances below. And credit an ATTENDANT paid out leaves via")
-            print("         0003, which is one meter for every credit type: SAS has")
-            print("         nothing that attributes a hand-paid cancelled credit to")
-            print("         cashable, restricted or nonrestricted, so promotional money")
-            print("         paid by hand goes missing from this ledger by design. If")
-            print(f"         0003 moved by {money(short).strip()} in the same window,"
-                  " that is where it went.")
+            short = got_in - got_out - played - held
+            print(f"      -> {short:,} unattributed, and that is not a fault by itself.")
+            print("         Credit an ATTENDANT paid out leaves via 0003, one meter")
+            print("         covering every credit type: SAS has nothing that attributes")
+            print("         a hand-paid cancelled credit to cashable, restricted or")
+            print("         nonrestricted, so promotional money paid by hand is")
+            print("         unattributable here by design. What matters is that this")
+            print("         figure STAYS STILL. If it grew since the last reading,")
+            print("         something new happened -- examples/capture_diff.py compares")
+            print("         two snapshots and reports exactly that.")
 
     print("\nOn the machine now")
     for label, code in CURRENT:
@@ -276,10 +303,9 @@ def main() -> int:
     # what the meters cannot do is split the third amount out of it. LP 0x74
     # reports all three as separate native fields in one poll. See
     # examples/meter_crosscheck.py for the comparison this is drawn from.
-    try:
-        lock = client.aft_game_lock_and_status_request(lock_code=0xFF)
-    except SASError as e:
-        print(f"    (0x74 did not answer: {type(e).__name__}: {e} -- so the")
+    if lock is None:
+        print(f"    (0x74 did not answer: {type(lock_error).__name__}: {lock_error}"
+              " -- so the")
         print("     nonrestricted balance has no source and the figures above")
         print("     cannot be expected to match the screen's credit display)")
     else:
