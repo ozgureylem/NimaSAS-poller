@@ -382,3 +382,80 @@ def test_the_amount_types_are_separate_meters():
     # And the credit meters they land in are distinct too.
     assert int(MeterCode.CURRENT_CREDITS) == 0x0C
     assert int(MeterCode.CURRENT_RESTRICTED_CREDITS) == 0x1B
+
+
+def test_host_cashout_uses_the_whole_cashout_sentinel():
+    """Section 8.7: "the amount fields may all be set to 9999999999, with
+    partial transfer allowed, to transfer the entire cashout amount."
+
+    The pairing matters. 9999999999 with FULL-transfer-only would ask the
+    machine to move ten billion units or nothing, which it cannot, so the
+    partial-allowed code is what makes the sentinel mean "whatever is there".
+    """
+    from saspy.constants import AFT_TRANSFER_CODE_PARTIAL_ALLOWED, AftTransferType
+    from saspy.crc import crc16_bytes
+    from saspy.transport import SASTransport
+    from tests.test_client import FakeSerial
+
+    fake = FakeSerial(b"")
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=0.01)
+    try:
+        client.aft_transfer_funds(
+            transfer_code=AFT_TRANSFER_CODE_PARTIAL_ALLOWED,
+            transfer_type=int(AftTransferType.IN_HOUSE_FROM_GAMING_MACHINE_TO_HOST),
+            cashable_amount=9_999_999_999,
+            restricted_amount=9_999_999_999,
+            nonrestricted_amount=9_999_999_999,
+            asset_number=246,
+            transaction_id="OUT1",
+        )
+    except Exception:
+        pass
+
+    sent = bytes(fake.written)
+    assert sent[3] == 0x01, "partial transfer allowed"
+    assert sent[5] == 0x80, "in-house transfer FROM gaming machine TO host"
+    for offset in (6, 11, 16):
+        assert sent[offset:offset + 5] == encode_bcd(9_999_999_999, 5)
+
+
+def test_a_zero_transfer_is_how_a_cashout_is_declined():
+    """Section 8.7: "all amounts may be set to zero to instruct the gaming
+    machine to perform the cashout by whatever other means are available."
+
+    That is an answer, not a no-op -- and it is the only way to observe the
+    exchange without taking money. Ignoring 0x6A instead lets the 8-second
+    deadline expire, which in soft mode is silent.
+    """
+    from saspy.constants import AFT_TRANSFER_CODE_FULL_ONLY, AftTransferType
+    from saspy.transport import SASTransport
+    from tests.test_client import FakeSerial
+
+    fake = FakeSerial(b"")
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=0.01)
+    try:
+        client.aft_transfer_funds(
+            transfer_code=AFT_TRANSFER_CODE_FULL_ONLY,
+            transfer_type=int(AftTransferType.IN_HOUSE_FROM_GAMING_MACHINE_TO_HOST),
+            cashable_amount=0, restricted_amount=0, nonrestricted_amount=0,
+            asset_number=246, transaction_id="DENY1",
+        )
+    except Exception:
+        pass
+
+    sent = bytes(fake.written)
+    for offset in (6, 11, 16):
+        assert sent[offset:offset + 5] == encode_bcd(0, 5)
+
+
+def test_the_two_cashout_exceptions_use_different_transfer_types():
+    """6A is a cashout from the credit meter and takes type 80. 6B is a win
+    ready to be cashed out and takes type 90, which section 8 notes is
+    "metered as an in-house transfer to the host" even so.
+    """
+    from saspy.constants import AftTransferType, describe_exception
+
+    assert describe_exception(0x6A) == "AFT request for host cashout"
+    assert describe_exception(0x6B) == "AFT request for host to cash out win"
+    assert int(AftTransferType.IN_HOUSE_FROM_GAMING_MACHINE_TO_HOST) == 0x80
+    assert int(AftTransferType.WIN_AMOUNT_FROM_GAMING_MACHINE_TO_HOST) == 0x90

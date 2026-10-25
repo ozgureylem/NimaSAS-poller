@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 286 tests, all against fake serial ports; run them with
+- **`tests/`** — 289 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -232,6 +232,26 @@ step-by-step guide to structuring a local SQL layer around a poller.
   The diagnostic value is in `0x70`'s absence as much as its presence: a
   gateway losing exceptions that never sees `0x70` is not losing them to
   queue overrun, and the cause is elsewhere.
+- **`examples/host_cashout.py`** — **moves money, off the machine.** The
+  other half of `aft_push_credits`: watches for exception `0x6A` (AFT
+  request for host cashout, raised when a player presses cash out and host
+  cashouts are enabled) and answers it with a `0x72` transfer of type `0x80`
+  — the mechanism behind a card-removal flow returning credits to an
+  account. §8.7's sentinel is `9999999999` **with partial transfer allowed**,
+  which together mean "take whatever is there".
+  ```
+  python3 examples/host_cashout.py /dev/ttyS0 --address 1 --deny   # watch, take nothing
+  python3 examples/host_cashout.py /dev/ttyS0 --address 1
+  ```
+  Three timings shape it: the machine reissues `0x6A` every **800 ms**, gives
+  the host **8 seconds** before running its own recovery, and `0x74` resets
+  the 800 ms timer but not the deadline. So nothing slow runs between seeing
+  the exception and replying — meters are read before the watch and after the
+  transfer, never in between. **In soft mode a missed deadline is silent**:
+  the machine cashes out by its own means and nothing looks wrong, so absence
+  of a transfer is not proof the exchange worked. `--deny` sends a zero
+  transfer, which §8.7 defines as telling the machine to cash out by its own
+  means — a real answer, and the safe way to watch the exchange.
 - **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
   and says whether the link held. It buckets failures by hour and minute
   and reports the worst minute alongside the mean, because the failure mode
