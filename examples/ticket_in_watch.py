@@ -72,6 +72,44 @@ WATCH_METERS = [
 ]
 
 
+VALIDATION_STYLE = {0: "standard or none", 1: "system", 2: "secure enhanced",
+                    3: "reserved"}
+
+
+def ticket_preflight(client) -> bool:
+    """LP 0xA0 bit 7: is ticket redemption enabled at all?
+
+    Worth asking before waiting for a 0x67 that cannot arrive. Section 15.11:
+    a machine not configured for ticket redemption "will never issue exception
+    67, and will ignore long poll 70"; section 15.12 says the same of 0x71. So
+    a disabled machine is indistinguishable from a patient one -- it simply
+    never answers, and on the lab cabinet the validator took the ticket,
+    failed to recognise it, and reported 0x2B BILL rejected instead.
+    """
+    try:
+        features = client.send_enabled_features()
+    except SASError as e:
+        print(f"  LP 0xA0 did not answer ({type(e).__name__}: {e}), so whether")
+        print("  ticket redemption is enabled is unknown. Carrying on.")
+        return True
+
+    style = VALIDATION_STYLE.get(features.validation_style, "unknown")
+    print(f"  ticket redemption      {features.ticket_redemption}")
+    print(f"  validation style       {style}")
+    print(f"  validation extensions  {features.validation_extensions}")
+    if features.ticket_redemption:
+        return True
+
+    print()
+    print("  Ticket redemption is DISABLED on this machine (LP 0xA0 bit 7).")
+    print("  Section 15.11: such a machine never issues exception 67 and ignores")
+    print("  long poll 70; section 15.12 says it ignores 0x71 too. Inserting a")
+    print("  ticket will get it read as a bill and rejected (exception 0x2B),")
+    print("  which is not a fault in the ticket or the barcode.")
+    print("  Enable ticket/voucher acceptance in the operator menu first.")
+    return False
+
+
 def read_meters(client) -> dict[int, int | None]:
     codes = [c for c, _ in WATCH_METERS]
     try:
@@ -117,6 +155,9 @@ def main() -> int:
     print(f"\n{args.port}, address {args.address}")
     print("\nREAD-ONLY: nothing here authorises a ticket. If the machine is")
     print("waiting on a host, the ticket will be returned.")
+    print("\nMachine configuration (LP 0xA0):")
+    enabled = ticket_preflight(client)
+
     print("\nTicket meters before:")
     before = read_meters(client)
     for code, label in WATCH_METERS:
