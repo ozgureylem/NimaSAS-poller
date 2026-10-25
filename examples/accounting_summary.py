@@ -197,10 +197,22 @@ def main() -> int:
         print(f"    {label:<38} {money(values.get(code))}   (C-7 {code:04X})")
     for label, code in PLAYED:
         print(f"    {label:<38} {money(values.get(code))}   (C-7 {code:04X})")
+    # 007F is explicitly optional: section 7.24.1 says a machine with no
+    # jurisdictional requirement "may ... choose to not support meter 007F for
+    # that paytable". So an n/a here is the machine exercising that option, not
+    # a fault, and it is worth saying so -- the screen shows the figure either
+    # way, computed internally, and the only SAS route to it then is LP 0xB4's
+    # per-wager-category payback and coin-in, weighted by hand. That is a
+    # calculated value, so it belongs in a cross-check, not in the ledger.
     trtp = values.get(0x7F)
     print(f"    {'Weighted Average TRTP %':<38} "
           + ("       n/a" if trtp is None else f"{trtp / 100:>9,.2f}%")
           + "   (C-7 007F)")
+    if trtp is None:
+        print("      -> optional per section 7.24.1; this machine does not report it.")
+        print("         The screen's own figure is computed internally. To reach it over")
+        print("         SAS you would have to weight LP 0xB4's per-wager-category payback")
+        print("         by its coin-in yourself.")
 
     print("\nPromotional ledgers  (in = out + played)")
     for label, in_code, out_code, played_code in LEDGERS:
