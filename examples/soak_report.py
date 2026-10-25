@@ -303,19 +303,45 @@ def main() -> int:
     meter_cols = [c for c in all_cols if is_cumulative(c)]
     skipped = [c for c in all_cols if not is_cumulative(c)]
     regressions = []
+    cleared = []          # fell from non-zero straight to zero
+    populated = 0         # columns that ever held a non-zero value
     for col in meter_cols:
         rows = [r[0] for r in conn.execute(
             f'SELECT "{col}" FROM meters_history ORDER BY polled_at') if r[0] is not None]
+        if any(v > 0 for v in rows):
+            populated += 1
         for i in range(len(rows) - 1):
             if rows[i + 1] < rows[i]:
                 regressions.append((col, rows[i], rows[i + 1]))
+                if rows[i] > 0 and rows[i + 1] == 0:
+                    cleared.append(col)
                 break
     if regressions:
-        print(f"meters that decreased ({len(regressions)}):")
-        for col, before, after in regressions[:15]:
-            print(f"    {col:38} {before} -> {after}")
-        print("  => A cumulative meter must never fall. RAM clear, decode fault,")
-        print("     or the wrong machine. Resolve before trusting this data.")
+        # One cumulative meter falling is a defect to chase. Nearly all of them
+        # falling to zero together is a RAM clear, and listing it as 150
+        # separate defects buries that under its own evidence.
+        mass_clear = populated and len(cleared) >= max(5, populated * 0.8)
+        if mass_clear:
+            print(f"RAM CLEAR: {len(cleared)} of {populated} populated cumulative "
+                  "meters went to zero together.")
+            print("  => Not a fault and not a decode problem -- cumulative meters")
+            print("     cannot fall, only be cleared. Everything before that point")
+            print("     belongs to the machine's previous life and does not")
+            print("     reconcile against anything after it. Split this database at")
+            print("     the clear, or start a fresh one; a soak that straddles a RAM")
+            print("     clear measures two different machines.")
+            others = [r for r in regressions if r[0] not in cleared]
+            if others:
+                print(f"\n  {len(others)} meter(s) also fell WITHOUT reaching zero,")
+                print("  which a RAM clear does not explain:")
+                for col, was, now in others[:10]:
+                    print(f"    {col:38} {was} -> {now}")
+        else:
+            print(f"meters that decreased ({len(regressions)}):")
+            for col, before, after in regressions[:15]:
+                print(f"    {col:38} {before} -> {after}")
+            print("  => A cumulative meter must never fall. RAM clear, decode fault,")
+            print("     or the wrong machine. Resolve before trusting this data.")
     else:
         print(f"meter monotonicity  OK across {len(meter_cols)} cumulative columns")
     if skipped:

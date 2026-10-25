@@ -180,6 +180,27 @@ def main() -> int:
         print("\n!! The 'after' snapshot is OLDER than the 'before' one. Every delta"
               " below has its sign inverted; check the order of the arguments.")
 
+    # A RAM clear zeroes every meter at once. Reported as deltas that is ~160
+    # meters "going backwards", which reads as catastrophic and buries the one
+    # fact that matters. Cumulative meters never decrease otherwise, so a mass
+    # drop to zero has only one cause worth considering first.
+    dropped_to_zero = sum(
+        1 for code in set(before["meters_raw"]) & set(after["meters_raw"])
+        if (before["meters_raw"][code] or 0) > 0 and after["meters_raw"][code] == 0)
+    nonzero_before = sum(
+        1 for code in before["meters_raw"] if (before["meters_raw"][code] or 0) > 0)
+    if nonzero_before and dropped_to_zero >= max(5, nonzero_before * 0.8):
+        print("\n" + "!" * 68)
+        print(f"{dropped_to_zero} of {nonzero_before} non-zero meters are now zero.")
+        print("That is a RAM CLEAR, not a fault and not a reconciliation problem.")
+        print("Cumulative meters do not decrease; they can only be cleared. Every")
+        print("delta below is the old history being discarded, so none of it means")
+        print("what a delta normally means, and the identities are re-checked")
+        print("against a machine that has no history yet.")
+        print()
+        print("The snapshot before this one is now the only record of that history.")
+        print("!" * 68)
+
     print("\n--- meters that moved -------------------------------------------\n")
     codes = sorted(set(before["meters_raw"]) | set(after["meters_raw"]))
     moved = 0
