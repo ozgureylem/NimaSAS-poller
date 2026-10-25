@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 283 tests, all against fake serial ports; run them with
+- **`tests/`** — 286 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -143,6 +143,18 @@ step-by-step guide to structuring a local SQL layer around a poller.
   the long poll into its transmit queue") and the event is **kept**, not
   dropped. Discarding it would reintroduce the very exception loss RTE is
   being used to avoid. Collect them with `drain_rte_events()`.
+
+  **`wager_cents` is the field to reconcile against meters.** §12.5.3's
+  `credits_wagered` is in *game credits*, "independent of any denomination",
+  while the `total_coin_in` beside it is in SAS accounting units — so on a
+  multi-denom machine the two disagree by a factor that changes per game.
+  The client decodes Table C-4 and computes `wager_cents = credits_wagered ×
+  denomination`, verified on an EGT Premier across six consecutive games at
+  four denominations, where the coin-in delta equalled it every time. A host
+  using `credits_wagered` directly would under-report wager by 2×–10×
+  depending on which game was selected. Table C-4's codes are **hex**, so a
+  machine reporting decimal `23` means `0x17`, two cents — and read as a
+  decimal row number, 23 lands in the reserved range, so the error is silent.
 
   `--credits` adds the machine's credit meter to each GAME HAS ENDED line.
   Table 12.5.4 carries only the game win, so that is a separate LP `0x1A`

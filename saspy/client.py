@@ -25,6 +25,8 @@ from .constants import (
     SIMPLE_METER_WIDTH_BCD,
     LongPoll,
     PollType,
+    denomination_cents,
+    describe_denomination,
     describe_exception,
     rte_data_length,
 )
@@ -49,14 +51,28 @@ def decode_rte_event_fields(code: int, data: bytes) -> dict:
     try:
         if code == 0x7E and len(data) >= 8:  # 12.5.3 game start
             wager_type = data[6]
-            return {
-                "credits_wagered": decode_bcd(data[0:2]),
+            denom_code = wager_type & 0b00111111
+            credits = decode_bcd(data[0:2])
+            cents = denomination_cents(denom_code)
+            fields = {
+                "credits_wagered": credits,
                 "total_coin_in": decode_bcd(data[2:6]),
-                "denomination_code": wager_type & 0b00111111,
+                "denomination_code": denom_code,
+                "denomination": describe_denomination(denom_code),
                 "multi_denom": bool(wager_type & 0b01000000),
                 "max_bet_wagered": bool(wager_type & 0b10000000),
                 "progressive_group": data[7],
             }
+            # The field that actually reconciles against the meters. 12.5.3's
+            # credits wagered is in game credits, "independent of any
+            # denomination", while total coin in beside it is in accounting
+            # units -- so on a multi-denom machine the two disagree by a
+            # factor that changes per game. Computed here so a caller cannot
+            # forget: verified on an EGT Premier across six games at four
+            # denominations, where the coin-in delta equalled this every time.
+            if cents is not None:
+                fields["wager_cents"] = credits * cents
+            return fields
         if code == 0x7F and len(data) >= 4:  # 12.5.4 game end
             return {"game_win": decode_bcd(data[0:4])}
         if code == 0x4F and len(data) >= 6:  # 12.5.1 bill accepted

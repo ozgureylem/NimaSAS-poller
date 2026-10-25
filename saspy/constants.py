@@ -932,3 +932,58 @@ class AftTransferType(enum.IntEnum):
 AFT_TRANSFER_CODE_FULL_ONLY = 0x00
 AFT_TRANSFER_CODE_PARTIAL_ALLOWED = 0x01
 AFT_TRANSFER_CODE_CANCEL = 0x80
+
+
+# --- Table C-4: denomination codes ----------------------------------------
+# In cents, which the spec defines as "the minor units of the reporting
+# currency, as defined by the ISO-4217 standard" -- not literally US cents.
+#
+# This table is needed to read a game start event at all. Section 12.5.3's
+# credits wagered field is "in units of actual game credits wagered,
+# independent of any denomination", while the total coin in meter beside it
+# is in SAS accounting denom units. On a multi-denom machine the two
+# therefore disagree by a factor that changes per game, and only this table
+# reconciles them: wager in accounting units = credits wagered x denomination.
+#
+# Confirmed on an EGT Premier across six consecutive games at four
+# denominations -- the coin-in delta equalled credits_wagered x denomination
+# every time. A host that used credits_wagered directly would have
+# under-reported the wager by 2x to 10x depending on which game was selected.
+#
+# Note the codes are HEX in the spec's own table. A machine reporting
+# decimal 23 means code 0x17, two cents -- and decimal 23 read as a decimal
+# row number falls in the reserved range, so the mistake is silent.
+DENOMINATION_CENTS: dict[int, int] = {
+    0x00: 0,        # none
+    0x01: 1, 0x02: 5, 0x03: 10, 0x04: 25, 0x05: 50,
+    0x06: 100, 0x07: 500, 0x08: 1_000, 0x09: 2_000, 0x0A: 10_000,
+    0x0B: 20, 0x0C: 200, 0x0D: 250, 0x0E: 2_500, 0x0F: 5_000,
+    0x10: 20_000, 0x11: 25_000, 0x12: 50_000, 0x13: 100_000,
+    0x14: 200_000, 0x15: 250_000, 0x16: 500_000,
+    0x17: 2, 0x18: 3, 0x19: 15, 0x1A: 40,
+    # Sub-cent denominations. The spec expresses these as fractions of a
+    # cent, so they are NOT whole accounting units and cannot be represented
+    # here as integers without lying about them -- see denomination_cents().
+    # 0x1B: 1/2, 0x1C: 1/4, 0x1D: 1/5, 0x1E: 1/10, 0x1F: 1/20
+}
+
+# Kept separate because an integer cents value would be wrong for all of them.
+DENOMINATION_SUB_CENT = {0x1B: "1/2", 0x1C: "1/4", 0x1D: "1/5", 0x1E: "1/10", 0x1F: "1/20"}
+
+
+def denomination_cents(code: int) -> int | None:
+    """Accounting units per game credit for a Table C-4 code.
+
+    Returns None for a sub-cent denomination (0x1B-0x1F) or an unassigned
+    code, because returning 0 or 1 would quietly produce a wrong wager.
+    """
+    return DENOMINATION_CENTS.get(code)
+
+
+def describe_denomination(code: int) -> str:
+    cents = DENOMINATION_CENTS.get(code)
+    if cents is not None:
+        return "none" if cents == 0 else f"{cents}c"
+    if code in DENOMINATION_SUB_CENT:
+        return f"{DENOMINATION_SUB_CENT[code]} cent"
+    return f"unassigned code 0x{code:02X}"

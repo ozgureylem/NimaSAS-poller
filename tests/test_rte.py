@@ -245,3 +245,62 @@ def test_an_event_arriving_in_place_of_an_ack_is_still_caught():
 
     assert client._rte_active is False
     assert [e.code for e in client.drain_rte_events()] == [0x7F]
+
+
+def test_game_start_reports_the_wager_in_accounting_units():
+    """The finding that matters most for wager reconciliation.
+
+    Section 12.5.3's credits wagered is "in units of actual game credits
+    wagered, independent of any denomination", while the total coin in meter
+    in the same message is in SAS accounting denom units. On a multi-denom
+    machine the two disagree by a factor that changes per game.
+
+    Verified on an EGT Premier across six consecutive games at four
+    denominations: the coin-in delta equalled credits_wagered x denomination
+    every time. A host using credits_wagered directly would have
+    under-reported wager by 2x to 10x depending on the game selected.
+    """
+    from saspy.bcd import encode_bcd
+
+    # 10 credits at code 0x17 (2 cents), multi-denom, not max bet.
+    data = encode_bcd(10, 2) + encode_bcd(21391358, 4) + bytes([0b01010111, 0x00])
+    event = _client(_event(0x7E, data)).general_poll_rte()
+
+    assert event is not None
+    assert event.fields["credits_wagered"] == 10
+    assert event.fields["denomination_code"] == 0x17
+    assert event.fields["denomination"] == "2c"
+    assert event.fields["wager_cents"] == 20, "10 credits x 2 cents"
+    assert event.fields["multi_denom"] is True
+
+
+def test_a_sub_cent_denomination_reports_no_wager_rather_than_a_wrong_one():
+    """Codes 0x1B-0x1F are fractions of a cent, so an integer accounting
+    value would be wrong for all of them. Omitting wager_cents makes the gap
+    visible; returning 0 or 1 would quietly corrupt a wager figure.
+    """
+    from saspy.bcd import encode_bcd
+    from saspy.constants import denomination_cents
+
+    assert denomination_cents(0x1B) is None
+
+    data = encode_bcd(10, 2) + encode_bcd(0, 4) + bytes([0x1B, 0x00])
+    event = _client(_event(0x7E, data)).general_poll_rte()
+
+    assert event is not None
+    assert "wager_cents" not in event.fields
+    assert event.fields["denomination"] == "1/2 cent"
+
+
+def test_the_denomination_table_is_indexed_in_hex():
+    """The spec's Table C-4 lists codes in hex, so a machine reporting
+    decimal 23 means 0x17 -- two cents. Read as a decimal row number, 23
+    falls in the reserved range and the mistake is silent.
+    """
+    from saspy.constants import denomination_cents
+
+    assert denomination_cents(0x17) == 2
+    assert denomination_cents(0x01) == 1
+    assert denomination_cents(0x02) == 5
+    assert denomination_cents(0x03) == 10
+    assert denomination_cents(23) == 2, "decimal 23 IS 0x17"

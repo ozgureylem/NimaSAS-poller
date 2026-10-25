@@ -255,8 +255,17 @@ def main() -> int:
     category, description = describe_aft_transfer_status(result.transfer_status)
     print(f"\ntransfer status  0x{result.transfer_status:02X}  {category}")
     print(f"                 {description}")
-    if getattr(result, "cashable_amount", None) is not None:
-        print(f"amount reported  {result.cashable_amount / 100:,.2f}")
+    # Report whichever amount types came back, not just the cashable one: a
+    # successful $5 restricted push printed "amount reported 0.00", which
+    # reads like nothing moved.
+    reported = [
+        (label, getattr(result, attr, 0) or 0)
+        for attr, label in (("cashable_amount", "cashable"),
+                            ("restricted_amount", "restricted"),
+                            ("nonrestricted_amount", "nonrestricted"))
+    ]
+    moved = [f"{amount / 100:,.2f} {label}" for label, amount in reported if amount]
+    print(f"amount reported  {' + '.join(moved) if moved else 'nothing'}")
 
     if category == "PENDING":
         # Mandatory, not optional. Section 8.8: a transfer answered with
