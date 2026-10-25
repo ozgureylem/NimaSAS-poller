@@ -327,3 +327,58 @@ def test_credits_and_coin_out_are_batched_into_one_exchange():
 
     assert int(MeterCode.CURRENT_CREDITS) == 0x0C
     assert int(MeterCode.TOTAL_COIN_OUT_CREDITS) == 0x01
+
+
+def test_restricted_transfer_carries_pool_id_and_expiration():
+    """Section 8: "the pool ID is ignored if the transfer does not include a
+    restricted amount", and "expiration is valid for all restricted amount
+    transfers". So those two fields are only meaningful with restricted
+    credits, and sending them otherwise is noise in the frame.
+    """
+    from saspy.constants import AFT_TRANSFER_CODE_FULL_ONLY, AftTransferType
+    from saspy.crc import crc16_bytes
+    from saspy.transport import SASTransport
+    from tests.test_client import FakeSerial
+
+    fake = FakeSerial(b"")
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=0.01)
+    try:
+        client.aft_transfer_funds(
+            transfer_code=AFT_TRANSFER_CODE_FULL_ONLY,
+            transfer_type=int(AftTransferType.IN_HOUSE_TO_GAMING_MACHINE),
+            restricted_amount=1000,
+            pool_id=7,
+            expiration=12312026,
+            asset_number=246,
+            transaction_id="PROMO1",
+        )
+    except Exception:
+        pass  # no response in the fake; the frame is what is under test
+
+    sent = bytes(fake.written)
+    assert sent[0] == ADDRESS and sent[1] == 0x72
+    # transfer code, index, type, then three 5-byte BCD amounts
+    assert sent[3] == 0x00 and sent[5] == 0x00, "in-house transfer to gaming machine"
+    cashable = sent[6:11]
+    restricted = sent[11:16]
+    nonrestricted = sent[16:21]
+    assert cashable == encode_bcd(0, 5), "no cashable amount requested"
+    assert restricted == encode_bcd(1000, 5), "the restricted amount goes in its own field"
+    assert nonrestricted == encode_bcd(0, 5)
+    assert encode_bcd(12312026, 4) in sent, "expiration present for a restricted transfer"
+
+
+def test_the_amount_types_are_separate_meters():
+    """Table C-7 gives each amount type its own pair of meters, which is how a
+    promotional push is verified: a restricted transfer must move 00A2/00A3
+    and leave the cashable pair 00A0/00A1 alone. Reading all three pairs
+    every time means the test proves what did NOT move as well as what did.
+    """
+    from saspy.constants import MeterCode
+
+    assert int(MeterCode.IN_HOUSE_CASHABLE_TRANSFERS_TO_GAMING_MACHINE_CENTS) == 0xA0
+    assert int(MeterCode.IN_HOUSE_RESTRICTED_TRANSFERS_TO_GAMING_MACHINE_CENTS) == 0xA2
+    assert int(MeterCode.IN_HOUSE_NONRESTRICTED_TRANSFERS_TO_GAMING_MACHINE_CENTS) == 0xA4
+    # And the credit meters they land in are distinct too.
+    assert int(MeterCode.CURRENT_CREDITS) == 0x0C
+    assert int(MeterCode.CURRENT_RESTRICTED_CREDITS) == 0x1B

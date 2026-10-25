@@ -51,11 +51,20 @@ from saspy.exceptions import SASError
 from saspy.serial_port import open_serial_port
 from saspy.transport import SASTransport
 
-# Table C-7: the meters an in-house cashable push to the machine must move.
+# Table C-7: the meters an in-house push to the machine must move. All three
+# amount types are read every time, so a transfer of one kind proves the other
+# two did NOT move -- which is half of what the test is for.
 VERIFY_METERS = (
     (MeterCode.CURRENT_CREDITS, "current credits"),
-    (0x00A0, "in-house cashable transfers to gaming machine (cents)"),
-    (0x00A1, "in-house transfers to GM including cashable (quantity)"),
+    (MeterCode.CURRENT_RESTRICTED_CREDITS, "current RESTRICTED credits"),
+    (0x00A0, "cashable transfers to GM (cents)"),
+    (0x00A1, "cashable transfers to GM (quantity)"),
+    (0x00A2, "RESTRICTED transfers to GM (cents)"),
+    (0x00A3, "RESTRICTED transfers to GM (quantity)"),
+    (0x00A4, "NONRESTRICTED transfers to GM (cents)"),
+    (0x00A5, "NONRESTRICTED transfers to GM (quantity)"),
+    (MeterCode.TOTAL_RESTRICTED_AMOUNT_PLAYED_CREDITS, "restricted amount played"),
+    (MeterCode.TOTAL_NONRESTRICTED_AMOUNT_PLAYED_CREDITS, "nonrestricted amount played"),
 )
 
 
@@ -77,7 +86,22 @@ def main() -> int:
     ap.add_argument("--baud", type=int, default=19200)
     ap.add_argument("--timeout", type=float, default=1.0)
     ap.add_argument("--amount", type=float, default=None,
-                    help="cashable amount to transfer, in currency units (e.g. 20.00)")
+                    help="CASHABLE amount to transfer, in currency units (e.g. 20.00)")
+    ap.add_argument("--restricted", type=float, default=0.0,
+                    help="RESTRICTED promotional amount: not redeemable for cash and must be "
+                         "wagered (section 8). Needs --pool-id, and is played BEFORE any "
+                         "cashable credits already on the machine.")
+    ap.add_argument("--nonrestricted", type=float, default=0.0,
+                    help="NONRESTRICTED promotional amount: promotional, but becomes ordinary "
+                         "cashable if cashed out by a means that cannot preserve the status.")
+    ap.add_argument("--pool-id", type=int, default=1,
+                    help="restricted pool ID (default 1). Ignored unless a restricted amount is "
+                         "included. A machine already holding restricted credits from a "
+                         "DIFFERENT pool rejects the transfer with status 8F.")
+    ap.add_argument("--expiration", type=int, default=0,
+                    help="restricted expiration, MMDDYYYY or 0000NNNN days (default 0 = none). "
+                         "Per section 8 a machine must NOT refuse a transfer because the date "
+                         "has already passed -- it only governs cashing out later.")
     ap.add_argument("--transaction-id", default=None,
                     help="ASCII, 1-20 chars; defaults to a timestamp, which keeps it "
                          "unique (status 81 rejects a repeat of the last successful one)")
@@ -91,12 +115,15 @@ def main() -> int:
     if args.acknowledge_only:
         return acknowledge_only(args)
 
-    if args.amount is None:
-        print("--amount is required (or use --acknowledge-only).", file=sys.stderr)
+    cents = int(round((args.amount or 0) * 100))
+    restricted = int(round(args.restricted * 100))
+    nonrestricted = int(round(args.nonrestricted * 100))
+    if cents + restricted + nonrestricted <= 0:
+        print("Give at least one of --amount, --restricted or --nonrestricted "
+              "(or use --acknowledge-only).", file=sys.stderr)
         return 2
-    cents = int(round(args.amount * 100))
-    if cents <= 0:
-        print("Amount must be positive.", file=sys.stderr)
+    if min(cents, restricted, nonrestricted) < 0:
+        print("Amounts cannot be negative.", file=sys.stderr)
         return 2
 
     try:
@@ -144,9 +171,19 @@ def main() -> int:
         )
     if lock.asset_number == 0:
         blockers.append("asset number is zero, which returns status 93")
-    if limit and cents > limit:
-        blockers.append(f"{cents / 100:,.2f} exceeds the transfer limit "
+    total = cents + restricted + nonrestricted
+    if limit and total > limit:
+        blockers.append(f"{total / 100:,.2f} exceeds the transfer limit "
                         f"{limit / 100:,.2f}, which returns status 84")
+    if restricted and lock.current_restricted_amount and lock.restricted_pool_id != args.pool_id:
+        # Section 15: "If the gaming machine currently has restricted amounts,
+        # it may not accept restricted amounts from a different pool."
+        blockers.append(
+            f"the machine already holds {lock.current_restricted_amount / 100:,.2f} "
+            f"restricted from pool {lock.restricted_pool_id}, and this transfer names pool "
+            f"{args.pool_id}. A different pool returns status 8F -- pass "
+            f"--pool-id {lock.restricted_pool_id}, or play off the existing balance first"
+        )
 
     if blockers:
         print("\nNot sending. Resolve these first:")
@@ -159,7 +196,23 @@ def main() -> int:
         print("Transaction ID must be 1-20 ASCII characters.", file=sys.stderr)
         return 2
 
-    print(f"\nAbout to transfer {cents / 100:,.2f} cashable to address {args.address}")
+    parts = []
+    if cents:
+        parts.append(f"{cents / 100:,.2f} cashable")
+    if restricted:
+        parts.append(f"{restricted / 100:,.2f} RESTRICTED (pool {args.pool_id})")
+    if nonrestricted:
+        parts.append(f"{nonrestricted / 100:,.2f} NONRESTRICTED")
+    print(f"\nAbout to transfer {' + '.join(parts)} to address {args.address}")
+    if restricted or nonrestricted:
+        # Worth stating before the confirmation, because it decides what the
+        # meters will show next and surprises people who expect FIFO.
+        print("  Note the play order (section 8): restricted is wagered first, then")
+        print("  nonrestricted, then cashable. So promotional credits are consumed")
+        print(f"  before the {lock.current_cashable_amount / 100:,.2f} cashable already on the machine.")
+    if restricted:
+        print("  Restricted credits are NOT redeemable for cash and must be wagered;")
+        print("  they can only leave by a means that preserves that status.")
     print(f"  transfer type  0x{AftTransferType.IN_HOUSE_TO_GAMING_MACHINE:02X} "
           f"(in-house, host -> gaming machine)")
     print(f"  transfer code  0x{AFT_TRANSFER_CODE_FULL_ONLY:02X} (full transfer only)")
@@ -178,6 +231,11 @@ def main() -> int:
             transaction_index=0x00,
             transfer_type=int(AftTransferType.IN_HOUSE_TO_GAMING_MACHINE),
             cashable_amount=cents,
+            restricted_amount=restricted,
+            nonrestricted_amount=nonrestricted,
+            # Ignored unless a restricted amount is included (section 8).
+            pool_id=args.pool_id if restricted else 0,
+            expiration=args.expiration if restricted else 0,
             asset_number=lock.asset_number,
             registration_key=bytes(20),  # zero = registration not required
             transaction_id=transaction_id,

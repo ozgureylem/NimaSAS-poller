@@ -20,7 +20,7 @@ step-by-step guide to structuring a local SQL layer around a poller.
   covering general poll plus the long polls listed below, and a
   `.ini`-based gateway config (`saspy/config.py`) so connection details
   don't need to be hardcoded.
-- **`tests/`** — 280 tests, all against fake serial ports; run them with
+- **`tests/`** — 282 tests, all against fake serial ports; run them with
   no hardware attached to confirm your environment is set up right before
   you touch real wiring.
 - **`examples/connectivity_check.py`** — point this at a real port and
@@ -167,7 +167,19 @@ step-by-step guide to structuring a local SQL layer around a poller.
   byte is what the machine decided and the deltas are what happened.
   ```
   python3 examples/aft_push_credits.py /dev/ttyS0 --address 1 --amount 20.00
+  python3 examples/aft_push_credits.py /dev/ttyS0 --address 1 --restricted 5.00 --pool-id 1
   ```
+  `--restricted` and `--nonrestricted` push **promotional** credits. Three
+  things the spec makes non-obvious: restricted credits are not redeemable
+  for cash and must be wagered; they are played **before** any cashable
+  credits already on the machine (§8 fixes the order restricted →
+  nonrestricted → cashable); and a machine already holding restricted
+  credits **from a different pool** rejects the transfer with status `8F`, so
+  the tool pre-checks the pool ID reported by `0x74`. Expiration is accepted
+  but, per §8, a machine must not refuse a transfer because the date has
+  already passed — it only governs cashing out later. All three amount types'
+  meters (`00A0`–`00A5`) are read before and after every push, so a
+  promotional transfer proves what did *not* move as well as what did.
   A transfer answered with **pending** status `0x40` is not finished, and
   leaving it unacknowledged is not harmless: §8.8 requires the machine to
   issue exception `0x69` on completion and "reissue exception 69 **every 15
