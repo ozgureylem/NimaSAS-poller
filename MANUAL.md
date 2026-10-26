@@ -1531,6 +1531,30 @@ than an error (§7.21b), so an absent meter is reported as absent and the
 rest of the poll still answers. That is how the 37 codes this cabinet does
 not implement were identified.
 
+#### A denied ticket leaves no meter behind
+
+Table C-7 has no meter for a ticket the host refused. Every ticket-in meter
+counts acceptances -- `0015` credits, `0011`/`0035`/`0036`/`0037` quantities
+-- and a denial moves none of them, correctly: nothing was credited.
+
+The machine does keep it. Its Voucher In Log records each one as **"Voucher
+In Rejected", 0.00 USD**, with the validation data, so the cabinet can be
+audited at the cabinet. Observed on an EGT Premier: five consecutive denials
+logged as separate entries while every ticket-in meter stayed still.
+
+For a gateway this matters more than it looks. A CMS reconciling redemption
+attempts against redemptions **cannot** derive the denials from meters -- the
+difference between "no ticket was presented" and "a ticket was presented and
+refused" does not exist in the meter data at all. The only SAS-side record is
+the host's own: exception `0x67`, the LP `0x70` read, and the LP `0x71`
+answer, which is why `sql_poll_logger.py` writes `ticket_in_events` and
+`ticket_in_completions` rather than relying on meters.
+
+So a host that denies tickets and does not log its own decisions has
+destroyed the only evidence it will ever have. The machine's log is a useful
+cross-check, not a substitute: it is per-cabinet, finite, and cleared with a
+RAM clear.
+
 #### The one mapping that looks obvious and is wrong
 
 `0028` is "Total cashable ticket in", and the screen has a line called
