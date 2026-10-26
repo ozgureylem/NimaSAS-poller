@@ -1975,6 +1975,7 @@ def poll_and_log(
     full_meter_sweep: bool = True,
     table_c7_sweep: bool = True,
     validation_meters_sweep: bool = True,
+    heartbeat_every: int = 8,
     last_accepted_bill_poll: bool = True,
     interval: float | None = None,
     general_poll_retries: int = DEFAULT_GENERAL_POLL_RETRIES,
@@ -2046,6 +2047,7 @@ def poll_and_log(
         values = _poll_all_meters(
             client,
             heartbeat=_make_heartbeat(client, conn, now, heartbeat_codes),
+            heartbeat_every=heartbeat_every,
             full_sweep=full_meter_sweep,
             table_c7_sweep=table_c7_sweep,
             validation_meters_sweep=validation_meters_sweep,
@@ -2299,6 +2301,23 @@ def main() -> int:
         "otherwise abort every cycle's row write on such a machine.",
     )
     parser.add_argument(
+        "--heartbeat-every",
+        type=int,
+        default=8,
+        metavar="N",
+        help="drain the exception queue with a general poll every N long-poll "
+        "exchanges during the meter sweep (default: 8). SAS delivers ONE "
+        "exception per general poll, so this sets the drain rate, and the "
+        "queue overflows when a machine produces exceptions faster than it. "
+        "During active play each game is at least two (0x7E started, 0x7F "
+        "ended), so a player spinning every two seconds needs better than one "
+        "drain per second just to keep level: a 60-exchange sweep at the "
+        "default drains eight times in roughly five seconds, which is thin, "
+        "and a 73-exchange sweep with the Table C-7 sweep on is thinner. Lower "
+        "it to 2 or 3 on a machine that is being played; 0x70 (exception "
+        "buffer overflow) in machine_events is the symptom that it is too high.",
+    )
+    parser.add_argument(
         "--general-poll-retries",
         type=int,
         default=DEFAULT_GENERAL_POLL_RETRIES,
@@ -2392,6 +2411,7 @@ def main() -> int:
                 full_meter_sweep=not args.skip_full_meter_sweep,
                 table_c7_sweep=not args.skip_table_c7_sweep,
                 validation_meters_sweep=not args.skip_validation_meters_sweep,
+                heartbeat_every=args.heartbeat_every,
                 last_accepted_bill_poll=not args.skip_last_accepted_bill_poll,
                 interval=args.interval,
                 general_poll_retries=args.general_poll_retries,

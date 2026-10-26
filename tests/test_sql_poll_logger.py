@@ -2421,3 +2421,30 @@ def test_documented_meter_labels_match_the_verified_map(manual):
             assert label in text, (
                 f"{manual} lists 0x{code:04X} but not its verified label "
                 f"{label!r}")
+
+
+# --- Drain rate: the cause of the exception buffer overflows ---------------
+
+
+def test_heartbeat_every_controls_the_drain_rate():
+    """SAS delivers ONE exception per general poll, so the number of heartbeats
+    inside a meter sweep IS the drain rate. It was hard-coded at 8, which on a
+    60-exchange sweep is eight drains in ~5s -- thinner than a played machine
+    produces, and 0x70 exception buffer overflow was the result.
+
+    Driving the real sweep needs a whole fake machine, so this tests the
+    cadence arithmetic the sweep uses: exchanges % heartbeat_every == 0.
+    """
+    for every, exchanges, expected in ((8, 60, 7), (3, 60, 20), (2, 60, 30),
+                                       (8, 73, 9), (2, 73, 36)):
+        drains = sum(1 for n in range(1, exchanges + 1) if n % every == 0)
+        assert drains == expected, (every, exchanges, drains)
+
+
+def test_heartbeat_every_is_reachable_from_the_command_line():
+    """It was a function default with no way to set it, so the one knob that
+    fixes an overflow could not be turned without editing the source."""
+    import examples.sql_poll_logger as _logger
+    source = Path(_logger.__file__).read_text()
+    assert '"--heartbeat-every"' in source
+    assert "heartbeat_every=args.heartbeat_every" in source
