@@ -1714,6 +1714,72 @@ Reading the bit as "no printer available" is a much stronger claim than it
 supports, and it sent a real investigation after a printer that was
 installed, enabled and loaded with paper.
 
+### 7.4 Taking money off: three different operations
+
+"Cash out" names three things over SAS, and they fail for different reasons.
+Mixing them up costs a test session, so they are set side by side here.
+
+| | who starts it | what leaves | tool |
+|---|---|---|---|
+| **ticket out** | the player presses CASH OUT | paper, validated by the host | `ticket_redeem.py` watches it; the machine prints |
+| **player AFT cashout** | the player presses CASH OUT and the machine asks the host | an electronic transfer, within 8 seconds | `host_cashout.py` |
+| **host AFT cashout** | the host, at any time | an electronic transfer, no deadline | `aft_cashout.py` |
+
+The first two are the same player action. Which one happens is a machine
+configuration question, not a protocol one: with cashout-to-host enabled
+(Table 8.2b host cashout status bit 1) the machine issues exception `0x6A`
+and waits for the host; otherwise it uses whatever cashout device it has,
+which once `Printer Limit` is non-zero means printing a ticket.
+
+The third needs no player and no cashout-to-host configuration at all.
+Section 8.4: "the gaming machine may perform transfers from the gaming
+machine to the host at any time it would otherwise normally allow the player
+to cash out." It is a plain long poll `72` with transfer type `80`, and it is
+what a CMS does when a session ends.
+
+```bash
+python3 examples/aft_cashout.py /dev/ttyS0 --address 1                 # all of it
+python3 examples/aft_cashout.py /dev/ttyS0 --address 1 --amount 11.11  # an exact amount
+python3 examples/aft_cashout.py /dev/ttyS0 --address 1 --cashable-only # leave the promo
+```
+
+Four things about the host-initiated form are worth knowing before the first
+run, because three of them look like faults:
+
+- **Status `01`, partial transfer successful, is the success code.** Taking
+  everything is expressed as all three amounts set to `9999999999` with
+  transfer code `01` (§8.4). The machine transfers what it has, which is by
+  definition less than was asked for, so it answers `01`. A host testing for
+  `00` alone reads every cashout as a failure.
+- **A zero-amount success is correct on an empty machine.** §8.4: "if
+  possible the gaming machine should perform a successful transfer for a
+  total amount of zero", which is how a host opens or closes a cashless
+  session with no credits involved.
+- **A pending handpay blocks it.** §8.2 lists "waiting for handpay" among
+  the states in which the machine must not lock, and the same states clear
+  Table 8.2b's available-transfers **bit 1**, transfer from gaming machine
+  OK. A cabinet sitting on exception `0x51` refuses the transfer; clear the
+  handpay (`0x52`) first. `aft_cashout.py` reads that bit in pre-flight and
+  says so instead of letting `72` fail obscurely.
+- **Partial may be refused outright.** §8.4: "a gaming machine is not
+  required to allow cashouts from the credit meter of less than the full
+  available amount for each type", and Table 8.2b AFT status **bit 1** says
+  whether this one does. `--amount` is checked against that bit before
+  anything is sent.
+
+One flag is deliberately never set. Transfer flag **bit 3**, "cashout from
+gaming machine request", is §8.4's way for the host to "effectively press the
+cashout button on the gaming machine": credits above the requested amounts
+are cashed out by the machine's own means, which on a cabinet with a working
+printer means a printed ticket. It is a useful feature and the exact opposite
+of what an electronic cashout is for, so `aft_cashout.py` sends flags `00`.
+
+Restricted credits are the case where the electronic route is not merely
+tidier but the only legitimate one. Section 8 forbids restricted amounts
+leaving on a normal cashout ticket, from the hopper, or by attendant
+handpay. Returning them to the host preserves their restricted status, so
+transfer type `80` can carry them where a ticket-out never could.
+
 ## 8. Where to go next
 
 - `README.md` — repository layout and the licensing note on
