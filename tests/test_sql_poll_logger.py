@@ -2311,3 +2311,30 @@ def test_restart_against_an_unchanged_machine_still_reuses_the_epoch():
 
     assert resumed.epoch_id == first.epoch_id
     assert len(_epochs(conn)) == 1
+
+
+def test_an_announced_meter_reset_opens_an_epoch_without_waiting():
+    """0x7A is the machine saying its meters are gone. That is better evidence
+    than any number of cycles of inferring it from the meters, so it must not
+    wait for the heuristic to agree."""
+    conn, state = _epoch_conn(), _logger.PollState()
+    client = _FakeIdentityClient()
+    _logger.maintain_epoch(conn, client, state, _meters(10), "T0")
+
+    state.clear_announced_at = "T1"
+    state.last_meters = _meters(10)
+    _logger.maintain_epoch(conn, client, state, _meters(0), "T1")
+
+    rows = _epochs(conn)
+    assert len(rows) == 2
+    assert rows[1][1] == "ram_clear"
+    assert "announced by the machine" in rows[1][2]
+    assert state.clear_announced_at is None, "the announcement is consumed once"
+
+
+def test_a_bill_validator_period_reset_is_not_a_ram_clear():
+    """0x7B fires on an ordinary drop, with the lifetime meters untouched.
+    Treating it as a clear would open an epoch every time the stacker was
+    emptied."""
+    assert 0x7B not in _logger.CLEAR_ANNOUNCED_BY
+    assert 0x7A in _logger.CLEAR_ANNOUNCED_BY

@@ -820,6 +820,10 @@ class PollState:
     # again, and a check against the previous cycle would decide the meters
     # had recovered on the very next poll.
     clear_baseline: dict | None = None
+    # Set when the machine itself announces a meter reset (CLEAR_ANNOUNCED_BY).
+    # Consumed by the next maintain_epoch() call, which needs no further
+    # evidence: the machine has already said so.
+    clear_announced_at: str | None = None
 
 
 # --- Continuity: epochs -----------------------------------------------------
@@ -858,6 +862,25 @@ class PollState:
 # this exists to prevent, just in the other direction. Three cycles of the
 # same answer is cheap; the meters are not going anywhere.
 CLEAR_CONFIRM_CYCLES = 3
+
+# Exceptions by which a machine announces, in SAS's own words, that its meters
+# are gone. Captured on an EGT Premier during a technician's RAM clear:
+#
+#   0x7A  gaming machine soft (lifetime-to-date) meters reset to zero
+#   0x32  CMOS RAM error (no data recovered from EEPROM)
+#   0x3A  memory error reset (operator used self test switch)
+#
+# This beats inferring a clear from the meters. The meter heuristic reads a
+# consequence and needs three cycles to be sure; 0x7A is the machine stating
+# the fact, and one of them is worth more than any amount of the other. The
+# heuristic stays as the backstop for the case no exception can cover -- a
+# clear performed while the gateway was not running, where the queue has long
+# since been drained by someone else or the event predates this database.
+#
+# 0x7B (bill validator period totals reset) is deliberately NOT here: an
+# attendant resets those during a normal drop, with the lifetime meters
+# untouched, so treating it as a clear would open an epoch on every drop.
+CLEAR_ANNOUNCED_BY = {0x7A, 0x32, 0x3A}
 
 # A mass-zero is this fraction of the cumulative meters that previously held a
 # non-zero value. Not all of them: a machine can legitimately report a few
@@ -1061,6 +1084,30 @@ def maintain_epoch(conn, client, state, values: dict, now: str) -> None:
         return
 
     state.cycles_since_identity += 1
+
+    # The machine said it cleared its own meters. Nothing here is better
+    # evidence than that, so it is acted on at once rather than waiting for
+    # three cycles of a heuristic to agree with it.
+    if state.clear_announced_at:
+        announced = state.clear_announced_at
+        state.clear_announced_at = None
+        state.clear_candidate_cycles = 0
+        state.clear_first_seen_at = None
+        state.clear_baseline = None
+        identity = read_identity(client)
+        state.identity = identity
+        state.cycles_since_identity = 0
+        state.epoch_id = open_epoch(
+            conn, now, "ram_clear", identity,
+            f"announced by the machine at {announced} "
+            f"(exception {', '.join(f'0x{c:02X}' for c in sorted(CLEAR_ANNOUNCED_BY))} "
+            "are meter-reset announcements)")
+        state.burst_remaining = max(state.burst_remaining, CLEAR_CONFIRM_CYCLES)
+        print(f"[{now}] RAM CLEAR announced by the machine at {announced}.")
+        print(f"[{now}] epoch {state.epoch_id} opened (ram_clear). Polling "
+              "continues; nothing before this reconciles against anything after.")
+        return
+
     # While a clear is pending, every confirmation is measured against the
     # pre-clear baseline, so "still zero" keeps counting as evidence.
     baseline = state.clear_baseline if state.clear_candidate_cycles else state.last_meters
@@ -1780,7 +1827,8 @@ def _poll_all_meters(
 
 
 def _dispatch_exception(
-    client, conn: sqlite3.Connection, now: str, exception_code: int, *, source: str = "cycle"
+    client, conn: sqlite3.Connection, now: str, exception_code: int, *,
+    source: str = "cycle", state: "PollState | None" = None
 ) -> None:
     """Record one general-poll exception, then act on it if it is actionable.
 
@@ -1809,6 +1857,17 @@ def _dispatch_exception(
             (now, int(exception_code), describe_exception(int(exception_code)), source),
         )
         _safe_commit(conn, now)
+
+    # A meter-reset announcement is noted for maintain_epoch() rather than
+    # acted on here: this runs inside the general poll, before the cycle's
+    # meters have been read, and an epoch opened now would be the epoch the
+    # pre-clear readings land in.
+    if state is not None and int(exception_code) in CLEAR_ANNOUNCED_BY:
+        state.clear_announced_at = now
+        print(f"[{now}] the machine announced a meter reset "
+              f"(0x{int(exception_code):02X}); a new epoch opens with this "
+              "cycle's meters.")
+
     if exception_code == ExceptionCode.TICKET_INSERTED:
         _capture_ticket_in(client, conn, now)
     elif exception_code == ExceptionCode.TICKET_TRANSFER_COMPLETE:
@@ -1978,7 +2037,7 @@ def poll_and_log(
     else:
         if attempt > 1:
             print(f"[{now}] general poll recovered on attempt {attempt}/{general_poll_retries}")
-        _dispatch_exception(client, conn, now, exception_code)
+        _dispatch_exception(client, conn, now, exception_code, state=state)
 
     mono_now = monotonic_fn()
 
@@ -2011,7 +2070,7 @@ def poll_and_log(
     for code in heartbeat_codes:
         print(f"[{now}] exception 0x{code:02X} drained during the meter sweep: "
               f"{describe_exception(code)}")
-        _dispatch_exception(client, conn, now, code, source="heartbeat")
+        _dispatch_exception(client, conn, now, code, source="heartbeat", state=state)
 
     meter_poll_elapsed = monotonic_fn() - mono_now
     meter_poll_count = (
@@ -2031,6 +2090,15 @@ def poll_and_log(
 
     # Decide which epoch these readings belong to BEFORE writing them, so a
     # clear or a swap never lands rows in the epoch it ended.
+    #
+    # Both exception dispatchers run above this, so an announcement seen in
+    # this cycle's general poll or drained by a heartbeat mid-sweep is acted
+    # on here, with this cycle's meters. When the announcement arrives DURING
+    # the sweep those meters are a mix of before and after, which no ordering
+    # can fix -- so they go to the new epoch, because under-crediting the old
+    # history is recoverable and contaminating it is not. burst_remaining is
+    # raised at the same time, so the next, unambiguous cycle is sampled
+    # immediately rather than at the usual history interval.
     try:
         maintain_epoch(conn, client, state, values, now)
     except Exception as e:  # noqa: BLE001
