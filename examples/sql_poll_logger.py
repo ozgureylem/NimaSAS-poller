@@ -1066,6 +1066,21 @@ def maintain_epoch(conn, client, state, values: dict, now: str) -> None:
             if changed:
                 detail += f"; {changed[1]} (a RAM clear wipes the asset number)"
             state.epoch_id = open_epoch(conn, now, "ram_clear", identity, detail)
+            # The machine queues its meter-reset announcement in a NON-VOLATILE
+            # buffer (§2.2.1), so a clear performed while the gateway was
+            # stopped is still waiting to be drained when it starts. Both
+            # detectors then fire for the SAME event: the meter comparison on
+            # the first cycle, the announcement on the next, and two epochs are
+            # opened for one clear. Observed on hardware -- epochs 2 and 3,
+            # eleven seconds apart, both ram_clear, both real.
+            #
+            # The announcement is evidence FOR the clear just recorded, not a
+            # second one, so it is consumed here.
+            if state.clear_announced_at:
+                print(f"[{now}] (the machine's own meter-reset announcement from "
+                      f"{state.clear_announced_at} refers to this same clear, "
+                      "and is not a second one)")
+                state.clear_announced_at = None
             print(f"[{now}] RAM CLEAR while stopped: {detail}")
             print(f"[{now}] epoch {state.epoch_id} opened (ram_clear). Polling "
                   "continues; nothing before this reconciles against anything "

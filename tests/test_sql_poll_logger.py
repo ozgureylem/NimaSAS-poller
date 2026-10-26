@@ -2531,3 +2531,36 @@ def test_a_number_already_printed_is_not_reused():
     again = _FakeCashoutClient()
     _logger._handle_cashout_request(again, conn, "T3")
     assert again.answered[0] != printed
+
+
+def test_one_ram_clear_does_not_open_two_epochs():
+    """Observed on hardware: epochs 2 and 3, eleven seconds apart, both
+    ram_clear, both for the same clear.
+
+    The machine queues its meter-reset announcement in a non-volatile buffer
+    (section 2.2.1), so a clear performed while the gateway was STOPPED is
+    still waiting to be drained when it starts. Both detectors then fire for
+    the same event -- the meter comparison on the first cycle, the queued
+    announcement on the next. The announcement is evidence for the clear
+    already recorded, not a second one.
+    """
+    conn = _epoch_conn()
+    client = _FakeIdentityClient()
+    first = _logger.PollState()
+    _logger.maintain_epoch(conn, client, first, _meters(10), "T0")
+    _persist(conn, _meters(10))
+
+    # Gateway stopped, machine cleared, gateway restarted. The queued 0x7A is
+    # dispatched during the first cycle, before maintain_epoch runs.
+    resumed = _logger.PollState()
+    resumed.clear_announced_at = "T9"
+    _logger.maintain_epoch(conn, client, resumed, _meters(0), "T9")
+    assert resumed.clear_announced_at is None, \
+        "the announcement must be consumed by the epoch it corroborates"
+
+    # Next cycle: nothing left to act on, so no second epoch.
+    resumed.last_meters = _meters(0)
+    _logger.maintain_epoch(conn, client, resumed, _meters(0), "T10")
+
+    reasons = [r[1] for r in _epochs(conn)]
+    assert reasons == ["first_seen", "ram_clear"], reasons
