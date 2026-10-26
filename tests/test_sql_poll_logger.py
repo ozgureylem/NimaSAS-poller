@@ -2448,3 +2448,86 @@ def test_heartbeat_every_is_reachable_from_the_command_line():
     source = Path(_logger.__file__).read_text()
     assert '"--heartbeat-every"' in source
     assert "heartbeat_every=args.heartbeat_every" in source
+
+
+# --- One cashout must consume one validation number ------------------------
+
+
+class _FakeCashoutClient:
+    """A machine that reissues exception 0x57 until it is satisfied, which is
+    what section 15 requires of it."""
+
+    def __init__(self, amount_cents=14025):
+        self.amount_cents = amount_cents
+        self.answered = []
+
+    def send_pending_cashout_info(self):
+        return _types.SimpleNamespace(cashout_type=0x00,
+                                      amount_cents=self.amount_cents)
+
+    def send_validation_number(self, validation_system_id, validation_number):
+        self.answered.append(validation_number)
+        return 0x00
+
+
+def _pool_conn(count=10):
+    conn = _epoch_conn()
+    for n in range(1, count + 1):
+        conn.execute(
+            "INSERT INTO validation_pool (validation_number, validation_system_id,"
+            " status, issued_at) VALUES (?, 1, 'available', 'T0')", (n,))
+    conn.commit()
+    return conn
+
+
+def test_a_reissued_0x57_reuses_the_same_validation_number():
+    """One real ticket on the bench consumed SIX numbers: the machine reissued
+    0x57 six times and each was answered with a fresh one. Five were marked
+    assigned and never reached paper, which to a CMS reconciling issued
+    against printed is five phantom vouchers per real one.
+
+    Section 15.8 expects the same answer within the same cashout, so the
+    answer has to be idempotent."""
+    conn = _pool_conn()
+    client = _FakeCashoutClient()
+    for _ in range(6):
+        _logger._handle_cashout_request(client, conn, "T1")
+
+    assert len(set(client.answered)) == 1, client.answered
+    assigned = conn.execute(
+        "SELECT COUNT(*) FROM validation_pool WHERE status = 'assigned'").fetchone()[0]
+    assert assigned == 1, f"{assigned} numbers consumed for one cashout"
+
+
+def test_a_different_cashout_amount_takes_a_fresh_number():
+    """Idempotence is per cashout, not forever. A different amount is a
+    different cashout and must not be given the previous ticket's number."""
+    conn = _pool_conn()
+    first = _FakeCashoutClient(amount_cents=14025)
+    _logger._handle_cashout_request(first, conn, "T1")
+    second = _FakeCashoutClient(amount_cents=5000)
+    _logger._handle_cashout_request(second, conn, "T2")
+
+    assert first.answered[0] != second.answered[0]
+    assigned = conn.execute(
+        "SELECT COUNT(*) FROM validation_pool WHERE status = 'assigned'").fetchone()[0]
+    assert assigned == 2
+
+
+def test_a_number_already_printed_is_not_reused():
+    """Once the ticket-out record is drained the number is on paper and spent.
+    A later cashout for the same amount must take a fresh one."""
+    conn = _pool_conn()
+    client = _FakeCashoutClient()
+    _logger._handle_cashout_request(client, conn, "T1")
+    printed = client.answered[0]
+    conn.execute(
+        "INSERT INTO ticket_out_history (captured_at, buffer_index, "
+        "validation_type, ticket_date, ticket_time, validation_number, "
+        "amount_cents, ticket_number, validation_system_id, expiration, pool_id)"
+        " VALUES ('T2', 1, 0, 10262026, 131312, ?, 14025, 1, 1, 0, 0)", (printed,))
+    conn.commit()
+
+    again = _FakeCashoutClient()
+    _logger._handle_cashout_request(again, conn, "T3")
+    assert again.answered[0] != printed

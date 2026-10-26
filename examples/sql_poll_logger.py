@@ -1402,6 +1402,41 @@ def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
     if info.cashout_type == 0x80:
         return  # "not waiting for system validation" (Table 15.7b) — the exception fired, but the race is over
 
+    # A machine reissues exception 57 until the host answers in a way it
+    # accepts, so one cashout produces several. Answering each with a FRESH
+    # number burns the pool and, worse, marks numbers 'assigned' that never
+    # reach paper: one real ticket on the bench consumed six numbers, five of
+    # them phantom issues that a CMS reconciling issued-against-printed would
+    # have to explain. Section 15.8 expects the same answer within the same
+    # cashout -- "a long poll 58 that specifies a valid validation number must
+    # be preceded by a valid long poll 57 within the same cashout" -- so the
+    # correct behaviour is idempotent, not sequential.
+    #
+    # An 'assigned' number that has not yet appeared in ticket_out_history is
+    # one still in flight. During the reissue burst that is exactly the state,
+    # because the ticket-out record is only drained after the ticket prints.
+    in_flight = conn.execute(
+        "SELECT validation_number, validation_system_id, assigned_amount_cents "
+        "FROM validation_pool WHERE status = 'assigned' AND validation_number "
+        "NOT IN (SELECT validation_number FROM ticket_out_history) "
+        "ORDER BY assigned_at DESC LIMIT 1"
+    ).fetchone()
+    if in_flight is not None and in_flight[2] == info.amount_cents:
+        try:
+            status = client.send_validation_number(
+                validation_system_id=in_flight[1], validation_number=in_flight[0])
+        except SASError as e:
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, "
+                "message) VALUES (?, ?, ?, ?)",
+                (now, "send_validation_number", type(e).__name__, str(e)))
+            _safe_commit(conn, now)
+            return
+        print(f"[{now}] cashout re-answered with the SAME number "
+              f"{in_flight[0]} (reissued 0x57 for the same "
+              f"{info.amount_cents} cashout; no new number consumed)")
+        return
+
     row = conn.execute(
         "SELECT validation_number, validation_system_id FROM validation_pool "
         "WHERE status = 'available' ORDER BY validation_number LIMIT 1"
