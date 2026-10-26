@@ -269,15 +269,29 @@ def main() -> int:
 
     # What "its own means" actually is decides whether --deny is the gentle
     # option or the disruptive one, so work it out rather than assume.
-    printer = bool(lock.available_transfers & 0x04)
-    if args.deny and not printer:
-        print("\n  WARNING: this machine reports no printer available (0x74 available")
-        print("  transfers bit 2 is clear), so there is no ticket to fall back on. With")
-        print("  the host declining, its only remaining cashout device is a HANDPAY: it")
-        print("  will lock up with \"Call Attendant\" and need somebody with a reset key.")
-        print("  On a machine like this --deny is the MORE disruptive choice, not the")
-        print("  less -- taking the money to the host is the clean path.")
-        print("  Drop --deny unless a handpay lockup is what you are testing.")
+    # Table 8.2b bit 2 is "Transfer to printer OK", and it is an AFT statement:
+    # whether the HOST may transfer funds onto a printed ticket (the transfers
+    # metered by 00A8/00AA/00AC). It is NOT a statement about whether the
+    # machine can print its own cashout voucher when a player presses CASH OUT
+    # -- that is the Voucher out setting and the system-validation path,
+    # exception 0x57 and long polls 57/58, which this bit says nothing about.
+    #
+    # Reading it as "no printer" sent a real investigation after a printer
+    # that was installed, enabled and loaded with paper. Two different
+    # features, and only one of them is on this bit.
+    aft_to_printer = bool(lock.available_transfers & 0x04)
+    if args.deny and not aft_to_printer:
+        print("\n  NOTE: AFT transfer to printer is not currently available (0x74")
+        print("  available transfers bit 2 is clear). That is about the HOST pushing")
+        print("  funds onto a ticket, not about the machine printing its own cashout")
+        print("  voucher -- those are separate features and this bit does not report")
+        print("  the second one.")
+        print("  So --deny may still produce a ticket, if Voucher out is enabled and")
+        print("  system validation is answered (exception 0x57, then long polls 57 and")
+        print("  58 -- sql_poll_logger does that, this tool does not). If neither is")
+        print("  available the fallback is a HANDPAY, which locks the machine with")
+        print("  \"Call Attendant\" until somebody resets it. Watch which one you get")
+        print("  rather than assuming.")
 
     before = read_meters(client)
 
