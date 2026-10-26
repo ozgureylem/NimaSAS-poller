@@ -123,7 +123,8 @@ def _assert_wakeup_bit_capable(port_obj) -> None:
     on the wire needs a second listener or a scope. So a clean open means
     "the driver did not refuse", not "the 9th bit is reaching the
     machine": if every poll still times out, the adapter is not cleared
-    of suspicion. See MANUAL.md and POLL_TEST_TOOL_MANUAL.md section 8.
+    of suspicion. See MANUAL.md and POLL_TEST_TOOL_MANUAL.md's
+    Troubleshooting section.
     """
     import serial
 

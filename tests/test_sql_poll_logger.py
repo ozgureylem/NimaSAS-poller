@@ -2367,3 +2367,57 @@ def test_screen_labels_are_non_empty_where_they_exist():
     map would be indistinguishable from an absent one and defeat that."""
     for code, label in _snapshot.SCREEN_VERIFIED.items():
         assert label.strip(), f"0x{code:04X} has a blank label"
+
+
+# --- The manuals' meter table must stay true to the wire -------------------
+
+import re as _re
+
+
+def _documented_frames(path):
+    """Every `01 6F ...` frame in a manual's meter table, as bytes."""
+    text = Path(path).read_text()
+    out = {}
+    for line in text.splitlines():
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) < 4 or not cells[1].startswith("`"):
+            continue
+        code_cell, frame_cell = cells[1].strip("`"), cells[3].strip("`")
+        if not _re.fullmatch(r"[0-9A-F]{4}", code_cell):
+            continue
+        out[int(code_cell, 16)] = bytes.fromhex(frame_cell.replace(" ", ""))
+    return out
+
+
+@pytest.mark.parametrize("manual", ["MANUAL.md", "POLL_TEST_TOOL_MANUAL.md"])
+def test_documented_meter_frames_match_what_the_client_sends(manual):
+    """A hex frame printed in a manual is something a person will paste into a
+    machine. If it drifts from what the client builds -- a changed CRC, a
+    changed body layout -- the manual becomes a source of wrong frames, and
+    nothing would otherwise notice."""
+    from saspy.bcd import encode_bcd
+    from saspy.binary import encode_binary_le
+    from saspy.framing import build_command
+
+    frames = _documented_frames(Path(__file__).resolve().parent.parent / manual)
+    assert frames, f"no meter frames found in {manual}"
+    for code, documented in frames.items():
+        body = encode_bcd(0, 2) + encode_binary_le(code, 2)
+        expected = build_command(1, bytes([0x6F, len(body)]) + body,
+                                 crc_required=True)
+        assert documented == expected, (
+            f"{manual} documents 0x{code:04X} as {documented.hex(' ')}, "
+            f"the client builds {expected.hex(' ')}")
+
+
+@pytest.mark.parametrize("manual", ["MANUAL.md", "POLL_TEST_TOOL_MANUAL.md"])
+def test_documented_meter_labels_match_the_verified_map(manual):
+    """The table's labels and meter_snapshot's SCREEN_VERIFIED are the same
+    claim written twice. They must not disagree about what this machine
+    proved."""
+    text = (Path(__file__).resolve().parent.parent / manual).read_text()
+    for code, label in _snapshot.SCREEN_VERIFIED.items():
+        if f"`{code:04X}`" in text:
+            assert label in text, (
+                f"{manual} lists 0x{code:04X} but not its verified label "
+                f"{label!r}")

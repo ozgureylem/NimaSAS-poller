@@ -41,7 +41,7 @@ complete programs built on top of it:
 - **`poll_test_tool.py`** — ⚠ **lab gateways only.** A bench tool for
   sending long polls to a machine by hand — the ones this client
   implements, and codes of unknown provenance found elsewhere — and
-  reading the raw response. See §8, and **do not run it before reading
+  reading the raw response. See §9, and **do not run it before reading
   [POLL_TEST_TOOL_WARNING.md](POLL_TEST_TOOL_WARNING.md) and
   [POLL_TEST_TOOL_MANUAL.md](POLL_TEST_TOOL_MANUAL.md)**.
 
@@ -1445,7 +1445,111 @@ see.
 
 ---
 
-## 7. Where to go next
+## 7. Reading meters directly
+
+### 7.1 Reading one meter by hand
+
+Every meter in Table C-7 is reachable through one long poll, `6F`, which
+takes up to twelve meter codes and returns each with its own size byte. So
+a single table covers all of them, and nothing here needs a dedicated
+command.
+
+From Python the call is `client.send_extended_meters([0x0024])`, which
+returns `{0x24: <value>}`. The raw frames below are the same exchange on
+the wire, for pasting into `poll_test_tool.py`'s hex box when you want to
+read a meter without writing any code.
+
+The frames below are for **address 1**. The CRC is the last two bytes and
+depends on everything before it, so changing the address means recomputing
+it — paste the frame with the address byte changed and the hex box will
+compute the new CRC for you before you send.
+
+#### Meters this machine has been proved to report
+
+Each label below was confirmed by reading a non-zero value off the
+machine's own Machine Accounting screen and matching it, to the unit,
+against what the gateway reported. Labels are the machine's own wording,
+not the spec's.
+
+| | **Total Bet / Total Won** | |
+| `0000` | Total Bet (Coin In) | `01 6F 04 00 00 00 00 FD 08` |
+| `0001` | Winnings from Paytable (Coin Out) | `01 6F 04 00 00 01 00 25 11` |
+| `0022` | Total Won | `01 6F 04 00 00 22 00 7E 18` |
+| `001F` | Attendant Paid Paytable Winnings | `01 6F 04 00 00 1F 00 A4 1E` |
+| `0019` | Total Non-cashable Played | `01 6F 04 00 00 19 00 74 4A` |
+| `001A` | Total Promotional Played | `01 6F 04 00 00 1A 00 1C 60` |
+| | **Total In** | |
+| `0024` | Total In | `01 6F 04 00 00 24 00 AE 4C` |
+| `000B` | Bill In | `01 6F 04 00 00 0B 00 55 EC` |
+| `0017` | Cashless In | `01 6F 04 00 00 17 00 64 D0` |
+| `002E` | Cashable Electronic In | `01 6F 04 00 00 2E 00 DE B1` |
+| `0030` | Promotional Electronic In | `01 6F 04 00 00 30 00 5F BE` |
+| `002F` | Non-cashable Electronic In | `01 6F 04 00 00 2F 00 06 A8` |
+| | **Total Out** | |
+| `0004` | Total Cancelled Credits | `01 6F 04 00 00 04 00 9D 6F` |
+| `0003` | Cancelled Credits Paid by Attendant | `01 6F 04 00 00 03 00 95 22` |
+| `0018` | Cashless Out | `01 6F 04 00 00 18 00 AC 53` |
+| `0032` | Cashable Electronic Out | `01 6F 04 00 00 32 00 EF 8D` |
+| `0034` | Promotional Electronic Out | `01 6F 04 00 00 34 00 3F D9` |
+| `0033` | Non-cashable Electronic Out | `01 6F 04 00 00 33 00 37 94` |
+| | **Games played / won / lost** | |
+| `0005` | Total Games Played | `01 6F 04 00 00 05 00 45 76` |
+| `0006` | Total Games Won | `01 6F 04 00 00 06 00 2D 5C` |
+| `0007` | Total Games Lost | `01 6F 04 00 00 07 00 F5 45` |
+| | **On the machine now** | |
+| `000C` | credit display -- total credits | `01 6F 04 00 00 0C 00 5D A1` |
+| `001B` | credit display -- non-cashable portion | `01 6F 04 00 00 1B 00 C4 79` |
+
+#### Reading several at once
+
+`6F` takes up to twelve codes in one exchange, which is both faster and
+atomic — all twelve come from the same instant rather than from twelve
+separate moments. The body is the game number (`00 00` for the machine as
+a whole) followed by each code as two bytes, low byte first:
+
+```
+01 6F 06 00 00 0C 00 1B 00 8E 91      <- 000C and 001B together
+   |  |  |  |  |     |     |
+   |  |  |  |  |     |     CRC
+   |  |  |  |  |     second code, 001B, low byte first
+   |  |  |  |  first code, 000C, low byte first
+   |  |  |  game number 0000 = the gaming machine
+   |  |  body length, 2 + 2 per code
+   |  send extended meters
+   address
+```
+
+A code the machine does not implement comes back with **size 0** rather
+than an error (§7.21b), so an absent meter is reported as absent and the
+rest of the poll still answers. That is how the 37 codes this cabinet does
+not implement were identified.
+
+#### What is NOT in the table
+
+Labels are only claimed where there is a photograph behind them. Three
+kinds of near-evidence were refused, and the gaps are deliberate:
+
+- **A zero matching a zero.** `0020` and `0021` have read 0.00 on every
+  capture against screen lines also reading 0.00. Any zero matches any
+  zero.
+- **Arithmetic agreement with no screen line.** `0023` satisfies the
+  spec's own definition (`0003 + 0002`) exactly, every time, but no screen
+  line carrying it was ever seen.
+- **Agreement with another SAS response.** `00A0` matched `002E` exactly,
+  which is what established that one credit is one cent here — but both
+  come from SAS, so neither names the other.
+
+`0002` is the sharpest case: it has equalled `001F` in eight consecutive
+readings and moved with it, so they are certainly the same money — but no
+screen line naming a jackpot was ever photographed, and knowing what a
+meter *equals* is not knowing what the machine *calls* it.
+
+`saspy/constants.py` names all 162 codes from the spec. That is what each
+code *should* be. This table is the narrower claim of what this machine
+*demonstrated*, and it grows as tests confirm more.
+
+
+## 8. Where to go next
 
 - `README.md` — repository layout and the licensing note on
   `docs/spec/` and `docs/sastest/` (private repo only — not present in
@@ -1458,7 +1562,7 @@ see.
 
 ---
 
-## 8. `poll_test_tool.py` — lab gateways only
+## 9. `poll_test_tool.py` — lab gateways only
 
 > ⚠ **Do not run this before reading
 > [POLL_TEST_TOOL_WARNING.md](POLL_TEST_TOOL_WARNING.md) and
