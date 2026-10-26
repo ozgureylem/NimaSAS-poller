@@ -1555,6 +1555,24 @@ destroyed the only evidence it will ever have. The machine's log is a useful
 cross-check, not a substitute: it is per-cabinet, finite, and cleared with a
 RAM clear.
 
+There is one retrospective read, and it is one cycle deep. Section 15.12 says
+the LP `0x71` response carries "the current status of the most recent ticket
+redemption cycle", and §15.12b lets the host ask for it at any time by sending
+transfer code `FF` with the amount, parsing code and validation data omitted.
+So after a refusal, `0x71`/`FF` still reports that refusal's status byte,
+amount and validation data -- the reason included, which the meters could
+never give (`8A` redemption disabled reads differently from `8B` validator
+failure).
+
+    python3 examples/ticket_history.py /dev/ttyS0 --address 1
+
+reads it at the end of its run. Two limits are worth being blunt about: it
+holds exactly one cycle, so the next ticket presented overwrites it, and a
+machine that has had a RAM clear or has never been in a redemption cycle
+answers `FF`, "no validation information available" -- which is not a
+refusal and must not be logged as one. It closes the gap for the last ticket
+and for no other, which is why a gateway still logs its own decisions.
+
 #### The one mapping that looks obvious and is wrong
 
 `0028` is "Total cashable ticket in", and the screen has a line called
@@ -1599,6 +1617,39 @@ meter *equals* is not knowing what the machine *calls* it.
 `saspy/constants.py` names all 162 codes from the spec. That is what each
 code *should* be. This table is the narrower claim of what this machine
 *demonstrated*, and it grows as tests confirm more.
+
+#### Making the next labels possible: distinct amounts
+
+The table grows by matching a meter against a screen line, and the commonest
+reason a match cannot be claimed is that two meters hold the same number.
+Three meters reading 25.00 against a screen line reading 25.00 name nothing:
+any of the three could be that line.
+
+    python3 examples/meter_fingerprint.py /dev/ttyS0 --address 1
+
+reads every C-7 code and reports the groups: every set of meters currently
+indistinguishable from each other, the meters sitting at zero (which no
+number of further readings can label), and a set of amounts to put through
+next that collides with nothing.
+
+That last part is less trivial than it sounds, because every total meter is a
+**sum** of component meters. Push 25.00 down two paths and the total reads
+50.00, which is itself a thoroughly ordinary meter value. The tidy-looking
+repunit set fails the same way: 111.11 + 222.22 is exactly 333.33, so the
+total collides with the third component. The amounts the tool prints are
+checked against the machine's current values *and* against each other's sums,
+which is why they look arbitrary -- 11.11, 33.33, 55.55, 77.77, 99.99,
+122.21. Afterwards every meter and every screen line carries a number
+belonging to exactly one path.
+
+Bills are the exception and cannot be fingerprinted this way: the
+denominations are fixed, so the separation has to come from distinct *counts*
+of distinct denominations -- one 10, two 20s, three 50s -- which leaves each
+quantity meter unique even though the amounts are round.
+
+The honest caveat: this makes a match *unambiguous*, not *proven*. It removes
+the competing candidates; the evidence is still the photograph of the screen
+line beside the reading.
 
 
 ### 7.2 Machine settings SAS cannot see, and that look like gateway faults

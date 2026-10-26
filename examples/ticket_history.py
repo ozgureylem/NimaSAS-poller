@@ -60,6 +60,40 @@ DIRECTION.update({t: "handpay" for t in HANDPAY})
 
 BUFFER_INDICES = range(0x01, 0x20)   # 1-31, per §15.10
 
+# Table 15.12c, the LP 0x71 machine status byte. Same tables as
+# ticket_redeem.py and ticket_in_watch.py carry: one byte, one vocabulary,
+# so a refusal reads the same whichever tool reports it. The top three bits
+# give the category and the whole byte gives the reason.
+REDEEM_STATUS = {
+    0x00: "cashable ticket redeemed",
+    0x01: "restricted promotional ticket redeemed",
+    0x02: "nonrestricted promotional ticket redeemed",
+    0x20: "waiting for long poll 71",
+    0x40: "ticket redemption PENDING (not complete)",
+    0x80: "ticket rejected by host, or unknown",
+    0x81: "validation number does not match",
+    0x82: "not a valid transfer function",
+    0x83: "not a valid transfer amount (non-BCD)",
+    0x84: "transfer amount exceeded the gaming machine credit limit",
+    0x85: "transfer amount not an even multiple of the machine denomination",
+    0x86: "transfer amount does not match ticket amount",
+    0x87: "gaming machine unable to accept transfer at this time",
+    0x88: "ticket rejected due to timeout",
+    0x89: "ticket rejected due to comm link down",
+    0x8A: "ticket redemption disabled",
+    0x8B: "ticket rejected due to validator failure",
+    0xC0: "not compatible with the current redemption cycle (ignored)",
+    0xFF: "no validation information available",
+}
+REDEEM_CATEGORY = {0b000: "SUCCESS", 0b001: "waiting", 0b010: "pending",
+                   0b100: "FAILED", 0b110: "incompatible",
+                   0b111: "no information"}
+
+
+def describe_redeem(status: int) -> str:
+    text = REDEEM_STATUS.get(status, "unassigned code")
+    return f"{REDEEM_CATEGORY.get(status >> 5, 'unknown category')}: {text}"
+
 
 def type_name(value: int) -> str:
     try:
@@ -182,6 +216,52 @@ def main() -> int:
                       f"{r['ticket_number']:>6}  {printed}")
                 print(f"         {r['type_name']}")
             print()
+
+    # The most recent redemption cycle, which is the ONLY place a refused
+    # ticket survives. Section 15.12: "All fields in the response will be set
+    # to the current status of the most recent ticket redemption cycle" -- so
+    # LP 0x71 with transfer code FF reports a rejection's status, amount and
+    # validation data, where the 0x4D buffer records only validated ones and
+    # no meter counts a denial at all.
+    #
+    # It is exactly one cycle deep and is replaced by the next ticket's LP
+    # 0x70, so it answers "what happened to the last ticket" and never "what
+    # happened to the one before it".
+    print("Most recent redemption cycle (LP 0x71, transfer code FF).")
+    print("The only long poll that retains a REJECTED ticket -- and only the")
+    print("most recent one; the next ticket's cycle replaces it.\n")
+    try:
+        last = client.redeem_ticket_status()
+    except SASError as e:
+        print(f"  no answer ({type(e).__name__}: {e})\n")
+    else:
+        status = last.machine_status
+        category = REDEEM_CATEGORY.get(status >> 5)
+        print(f"  machine status   0x{status:02X}  {describe_redeem(status)}")
+        if status == 0xFF:
+            print("  -> no redemption cycle to report. Either none has happened")
+            print("     since the last RAM clear, or the machine has already")
+            print("     been asked and has nothing further to say.")
+        else:
+            print(f"  amount           {last.amount_cents:,}"
+                  f"  ({last.amount_cents / 100:,.2f})")
+            print(f"  parsing code     0x{last.parsing_code:02X}")
+            # BCD, so the hex digits ARE the decimal digits -- a 9-byte
+            # field is the 18-digit printed number (§15.12b). Shown as digits
+            # rather than as a hex blob so it can be read off a paper ticket,
+            # and left as raw hex if it is not the expected length.
+            raw = last.validation_data.hex()
+            shown = raw if len(raw) != 18 else f"{raw}  (18 digits, as printed)"
+            print(f"  validation data  {shown or '(none returned)'}")
+            if category == "FAILED":
+                print()
+                print("  -> this ticket was REJECTED, and this is the only place")
+                print("     that survives. No meter counts a refusal, and the 0x4D")
+                print("     buffer above records only tickets that were accepted,")
+                print("     so one cycle of this poll is the whole of the SAS-side")
+                print("     evidence. The machine's own event log keeps its own")
+                print("     record ('Voucher In Rejected'), which is not SAS.")
+        print()
 
     meters: list[dict] = []
     if not args.skip_meters:

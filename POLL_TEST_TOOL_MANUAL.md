@@ -289,6 +289,23 @@ meter *equals* is not knowing what the machine *calls* it.
 code *should* be. This table is the narrower claim of what this machine
 *demonstrated*, and it grows as tests confirm more.
 
+### Which meters this machine cannot currently tell apart
+
+Before spending a session photographing screens, ask the machine which
+matches are even available to be made:
+
+```bash
+python3 examples/meter_fingerprint.py /dev/ttyUSB0 --address 1
+```
+
+It reports every group of meters holding the same value (mutually
+unmatchable), the meters at zero (unmatchable from any number of readings),
+and a set of amounts to push through next that collides with nothing already
+on the machine and with no sum of each other. MANUAL.md §7.1 explains why
+that last constraint is not optional — every total meter is a sum of
+components, so 111.11 and 222.22 down two paths makes the total read exactly
+333.33 and collide with the third.
+
 ## 7. Lab mode
 
 ```bash
