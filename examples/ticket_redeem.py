@@ -49,6 +49,14 @@ from saspy.exceptions import SASError
 from saspy.serial_port import open_serial_port
 from saspy.transport import SASTransport
 
+# A ticket that the validator never recognises AS a ticket comes back as this,
+# not as a ticket rejection. Exception 0x2B is "bill rejected": the paper went
+# in, was processed down the BANKNOTE path, failed banknote validation, and
+# was returned. Section 15.11 only issues 0x67 for a ticket "in an acceptable
+# condition with a machine readable validation number", so a 0x2B with no 0x67
+# means the barcode was never read at all -- the host is not involved and no
+# amount of host-side configuration changes it.
+BILL_REJECTED = 0x2B
 TICKET_INSERTED = 0x67
 TICKET_TRANSFER_COMPLETE = 0x68
 
@@ -141,6 +149,27 @@ def ticket_preflight(client) -> bool:
     print("  which is not a fault in the ticket or the barcode.")
     print("  Enable ticket/voucher acceptance in the operator menu first.")
     return False
+
+
+def explain_bill_rejected(count: int) -> None:
+    """Said once, on the first 0x2B, so a repeated insert does not repeat the
+    essay."""
+    if count != 1:
+        return
+    print("    -> This is the BANKNOTE path, not the ticket path. The validator")
+    print("       took the paper, tried to read it as a note, and returned it;")
+    print("       section 15.11 would have issued 0x67 instead if it had read a")
+    print("       machine-readable validation number. Nothing host-side can")
+    print("       change that. Worth checking, in order:")
+    print("         1. Does a real BANKNOTE get accepted? That separates a")
+    print("            validator that is not working from one that is working")
+    print("            but not reading barcodes.")
+    print("         2. Is barcode/ticket reading enabled in the VALIDATOR's own")
+    print("            configuration? It is separate from the machine's SAS")
+    print("            Voucher in setting, which LP 0xA0 already reports as on.")
+    print("         3. Do these tickets match the validator's expected ticket")
+    print("            length and width? A dimension mismatch is rejected before")
+    print("            anything is read.")
 
 
 def read_meters(client) -> dict[int, int | None]:
@@ -253,6 +282,7 @@ def main() -> int:
     print("(10s from insertion to LP 0x70, 30s to LP 0x71, per section 15.12.)\n")
 
     pending = False
+    rejected = 0
     try:
         while True:
             try:
@@ -269,6 +299,12 @@ def main() -> int:
             stamp = time.strftime("%H:%M:%S")
             name = GENERAL_POLL_EXCEPTIONS.get(exception, "unknown exception")
             print(f"[{stamp}] 0x{exception:02X} {name}")
+
+            if exception == BILL_REJECTED:
+                rejected += 1
+                explain_bill_rejected(rejected)
+                time.sleep(args.interval)
+                continue
 
             if exception == TICKET_INSERTED:
                 started = time.monotonic()
