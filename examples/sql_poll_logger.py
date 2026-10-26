@@ -2009,7 +2009,7 @@ def poll_and_log(
     or above it — a sign this cycle's own meter sweep doesn't leave any
     slack for the general poll or the configured sleep, and
     --skip-full-meter-sweep, --skip-table-c7-sweep,
-    --skip-validation-meters-sweep, or a larger --interval is worth
+    --skip-validation-meters-sweep is worth
     considering. ``interval=None`` (the default) skips that comparison.
     """
     now = now_fn()
@@ -2085,7 +2085,9 @@ def poll_and_log(
             f"[{now}] WARNING: meter poll took {meter_poll_elapsed:.3f}s across {meter_poll_count} long-poll "
             f"exchanges — at or above --interval {interval}s. This cycle's meter sweep alone doesn't leave "
             "room for the general poll or the configured sleep. Consider --skip-full-meter-sweep, "
-            "--skip-table-c7-sweep, --skip-validation-meters-sweep, or a larger --interval."
+            "--skip-table-c7-sweep, or --skip-validation-meters-sweep. A larger "
+            f"--interval is NOT the remedy: {SAS_MAX_POLL_INTERVAL_S}s is the ceiling "
+            "(§2.3.3) and the sweep is already over it, so the fix is a shorter sweep."
         )
 
     # Decide which epoch these readings belong to BEFORE writing them, so a
