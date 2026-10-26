@@ -365,6 +365,24 @@ step-by-step guide to structuring a local SQL layer around a poller.
   is reported as such rather than as a supported category sitting at zero.
   Those two are indistinguishable without the size byte, which the client
   previously parsed and discarded.
+- **`examples/ticket_history.py`** — read-only, and non-destructively so.
+  The machine's own record of every ticket it printed and every ticket it took.
+  ```
+  python3 examples/ticket_history.py /dev/ttyS0 --address 1
+  ```
+  Long poll `0x4D` is walked by buffer **index** (`01`–`1F`), which §15.10
+  leaves the read/unread pointer alone — function code `00` returns the next
+  unread record and marks it read, which is how a gateway drains the buffer and
+  exactly what must not happen when the point is to look. A poller can be
+  stopped, this run, and the poller restarted having lost nothing.
+
+  Two independent views. The 31 buffer records carry a validation type that
+  distinguishes direction (Table 15.13c: `00`–`04` printed, `80`–`82`
+  redeemed, `10`–`60` handpay receipts), so "ticket history" is shown as the
+  two opposite things it actually means. LP `0x50`'s per-type meters carry
+  everything since the last RAM clear. The two agreeing cross-checks a ring
+  buffer against counters the machine keeps separately; the two differing is
+  how a wrapped buffer announces itself, and the tool says so.
 - **`examples/meter_snapshot.py`** — read-only. Writes one machine's whole
   readable state — identity, every Table C-7 meter this client knows, and
   `0x74`'s three balances — to a single committable JSON file, values raw in

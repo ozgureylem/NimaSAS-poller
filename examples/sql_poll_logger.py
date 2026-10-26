@@ -1384,6 +1384,26 @@ def seed_validation_pool(
     return added
 
 
+# How long an 'assigned' validation number may still be considered in flight.
+# Section 15.12's own clocks are in seconds -- ten from insertion to long poll
+# 70, thirty to long poll 71 -- and a cashout that has not produced a ticket
+# in two minutes is not going to.
+IN_FLIGHT_WINDOW_S = 120
+
+
+def _iso_seconds_ago(now: str, seconds: int) -> str:
+    """``now`` minus ``seconds``, as the same ISO text the rows are stored
+    with, so the comparison is a plain string comparison on a sortable format.
+    A malformed timestamp returns something that matches nothing rather than
+    raising: a bad clock must not take the poll loop down.
+    """
+    try:
+        parsed = datetime.datetime.fromisoformat(now)
+    except ValueError:
+        return "9999-12-31T23:59:59+00:00"
+    return (parsed - datetime.timedelta(seconds=seconds)).isoformat()
+
+
 def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
     """Called on exception 0x57 (system validation request): read the
     pending cashout amount (LP 57), take the next available number from
@@ -1415,11 +1435,21 @@ def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
     # An 'assigned' number that has not yet appeared in ticket_out_history is
     # one still in flight. During the reissue burst that is exactly the state,
     # because the ticket-out record is only drained after the ticket prints.
+    # Bounded in time, because "assigned but not yet printed" is only a
+    # reliable in-flight signal for the seconds a cashout actually takes. Any
+    # number that never reached paper -- a cashout the player abandoned, a
+    # ticket the machine refused, or the five phantoms the pre-fix handler
+    # burned on a single cashout -- stays 'assigned' and absent from
+    # ticket_out_history for good. Without a window, the next cashout for a
+    # matching amount would be answered with one of those stale numbers, which
+    # is the old defect wearing the fix's clothes.
     in_flight = conn.execute(
         "SELECT validation_number, validation_system_id, assigned_amount_cents "
         "FROM validation_pool WHERE status = 'assigned' AND validation_number "
         "NOT IN (SELECT validation_number FROM ticket_out_history) "
-        "ORDER BY assigned_at DESC LIMIT 1"
+        "AND assigned_at >= ? "
+        "ORDER BY assigned_at DESC LIMIT 1",
+        (_iso_seconds_ago(now, IN_FLIGHT_WINDOW_S),)
     ).fetchone()
     if in_flight is not None and in_flight[2] == info.amount_cents:
         try:
