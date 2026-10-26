@@ -1492,6 +1492,10 @@ not the spec's.
 | `0032` | Cashable Electronic Out | `01 6F 04 00 00 32 00 EF 8D` |
 | `0034` | Promotional Electronic Out | `01 6F 04 00 00 34 00 3F D9` |
 | `0033` | Non-cashable Electronic Out | `01 6F 04 00 00 33 00 37 94` |
+| | **Voucher In** | |
+| `0015` | Voucher In | `01 6F 04 00 00 15 00 D4 E3` |
+| `002B` | Promotional Voucher In | `01 6F 04 00 00 2B 00 66 CF` |
+| `002A` | Non-cashable Voucher In | `01 6F 04 00 00 2A 00 BE D6` |
 | | **Voucher Out** | |
 | `0016` | Voucher Out | `01 6F 04 00 00 16 00 BC C9` |
 | `002C` | Cashable Voucher Out | `01 6F 04 00 00 2C 00 6E 82` |
@@ -1526,6 +1530,27 @@ A code the machine does not implement comes back with **size 0** rather
 than an error (§7.21b), so an absent meter is reported as absent and the
 rest of the poll still answers. That is how the 37 codes this cabinet does
 not implement were identified.
+
+#### The one mapping that looks obvious and is wrong
+
+`0028` is "Total cashable ticket in", and the screen has a line called
+**Cashable Voucher In**. They are not the same figure.
+
+Table C-7 defines `0028` as cashable **including nonrestricted promotional
+tickets**. After redeeming 25.00 as cashable and 10.00 as nonrestricted, it
+read 35.00 against a screen line showing 25.00. The screen's line is `0029`,
+regular cashable ticket in; `0028` has no screen line of its own.
+
+This is worth knowing because the wrong mapping fails silently. It agrees
+exactly whenever no nonrestricted ticket has ever been redeemed, which is
+most machines most of the time, and then diverges the first time one is --
+by precisely the amount nobody is looking for.
+
+The same shape of trap applies on the electronic side, where the screen's
+"Promotional" is SAS NONRESTRICTED and its "Non-cashable" is SAS RESTRICTED.
+The ticket side uses the same words with the same inversion: `002B`
+nonrestricted is the screen's Promotional Voucher In, `002A` restricted is
+its Non-cashable Voucher In.
 
 #### What is NOT in the table
 

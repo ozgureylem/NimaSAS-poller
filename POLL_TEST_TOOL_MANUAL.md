@@ -226,6 +226,10 @@ not the spec's.
 | `0032` | Cashable Electronic Out | `01 6F 04 00 00 32 00 EF 8D` |
 | `0034` | Promotional Electronic Out | `01 6F 04 00 00 34 00 3F D9` |
 | `0033` | Non-cashable Electronic Out | `01 6F 04 00 00 33 00 37 94` |
+| | **Voucher In** | |
+| `0015` | Voucher In | `01 6F 04 00 00 15 00 D4 E3` |
+| `002B` | Promotional Voucher In | `01 6F 04 00 00 2B 00 66 CF` |
+| `002A` | Non-cashable Voucher In | `01 6F 04 00 00 2A 00 BE D6` |
 | | **Voucher Out** | |
 | `0016` | Voucher Out | `01 6F 04 00 00 16 00 BC C9` |
 | `002C` | Cashable Voucher Out | `01 6F 04 00 00 2C 00 6E 82` |

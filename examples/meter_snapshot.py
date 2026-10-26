@@ -97,6 +97,20 @@ SCREEN_VERIFIED = {
     0x0032: "Cashable Electronic Out",
     0x0034: "Promotional Electronic Out",
     0x0033: "Non-cashable Electronic Out",
+    # Machine Accounting -- Voucher In. Zero until the first redemptions, so
+    # unclaimable before: confirmed at 40.00 / 10.00 / 5.00 against the screen,
+    # and against the machine's own Voucher In Log, whose two entries name the
+    # types the gateway asked for and the validation numbers it honoured.
+    #
+    # 0028 is DELIBERATELY ABSENT and is the trap here. "Total cashable ticket
+    # in" looks like the screen's "Cashable Voucher In", and is not: C-7
+    # defines 0028 as cashable INCLUDING nonrestricted promotional tickets, so
+    # after a 25.00 cashable and a 10.00 promotional redemption it read 35.00
+    # against a screen line showing 25.00. The screen's line is 0029, regular
+    # cashable ticket in. 0028 has no screen line at all.
+    0x0015: "Voucher In",
+    0x002B: "Promotional Voucher In",
+    0x002A: "Non-cashable Voucher In",
     # Machine Accounting -- Voucher Out. Zero on every comparison until the
     # first ticket printed, so these could not be claimed before: a zero
     # matching a zero proves nothing. Confirmed at 140.25 against the screen,
