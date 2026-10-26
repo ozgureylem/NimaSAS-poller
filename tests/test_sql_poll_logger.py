@@ -2338,3 +2338,32 @@ def test_a_bill_validator_period_reset_is_not_a_ram_clear():
     emptied."""
     assert 0x7B not in _logger.CLEAR_ANNOUNCED_BY
     assert 0x7A in _logger.CLEAR_ANNOUNCED_BY
+
+
+# --- Screen labels: claims that must stay backed by evidence ---------------
+
+import examples.meter_snapshot as _snapshot
+
+
+def test_screen_labels_exclude_meters_that_were_always_zero():
+    """A zero matching a zero on screen is not a correspondence. 0020 and 0021
+    read 0.00 on every capture against screen lines also reading 0.00, so
+    neither may claim a label."""
+    for code in (0x0020, 0x0021):
+        assert code not in _snapshot.SCREEN_VERIFIED
+
+
+def test_screen_labels_exclude_arithmetic_only_agreement():
+    """0023 satisfies the spec's own definition (0003 + 0002) exactly, but no
+    screen line carrying it was ever observed, so what the machine calls it is
+    unknown. 00A0 matched 002E, but both are SAS -- that establishes the
+    accounting unit, not a screen name."""
+    assert 0x0023 not in _snapshot.SCREEN_VERIFIED
+    assert 0x00A0 not in _snapshot.SCREEN_VERIFIED
+
+
+def test_screen_labels_are_non_empty_where_they_exist():
+    """An empty label is the signal for 'no evidence'. A blank entry in the
+    map would be indistinguishable from an absent one and defeat that."""
+    for code, label in _snapshot.SCREEN_VERIFIED.items():
+        assert label.strip(), f"0x{code:04X} has a blank label"

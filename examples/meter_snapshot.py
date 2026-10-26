@@ -47,6 +47,69 @@ from saspy.transport import SASTransport
 
 CHUNK = 12  # LP 0x6F's own per-request limit (§7.21)
 
+# --- What each raw code is, where we have PROOF --------------------------
+#
+# Every entry below was confirmed by reading a non-zero value off this
+# machine's own screen and matching it, to the unit, against the code the
+# gateway reported. Twenty-three screen lines were checked line by line on two
+# separate occasions (25 Oct, before and after a three-credit-type test), and
+# again after a clean cashless run.
+#
+# The bar is deliberately high, and three kinds of near-evidence are
+# DELIBERATELY EXCLUDED as empty:
+#
+#   Zero matching zero. 0020 and 0021 (attendant paid progressives, external
+#   bonuses) have read 0.00 on every capture, against screen lines also
+#   reading 0.00. Any zero matches any zero; that is not a correspondence.
+#
+#   Arithmetic agreement without a screen line. 0023 satisfies the spec's own
+#   definition (0003 + 0002) exactly, but no screen line was ever seen
+#   carrying it, so what the machine CALLS it is unknown.
+#
+#   Agreement with another SAS response. 00A0 matched 002E exactly, which
+#   established that one credit is one cent -- but both come from SAS, so it
+#   says nothing about what the machine's screen calls either of them.
+#
+# An empty string means "we do not have hard evidence", NOT "no such meter".
+# saspy/constants.py carries the spec's name for every code; that is what the
+# spec says it should be, while this is what this machine demonstrated.
+# Where the two ever disagree, this file is the one with a photograph behind
+# it. Add an entry only after seeing a non-zero match with your own eyes.
+SCREEN_VERIFIED = {
+    # Machine Accounting -- Total Bet / Total Won
+    0x0000: "Total Bet (Coin In)",
+    0x0001: "Winnings from Paytable (Coin Out)",
+    0x0019: "Total Non-cashable Played",
+    0x001A: "Total Promotional Played",
+    0x0022: "Total Won",
+    0x001F: "Attendant Paid Paytable Winnings",
+    # Machine Accounting -- Total In
+    0x0024: "Total In",
+    0x000B: "Bill In",
+    0x0017: "Cashless In",
+    0x002E: "Cashable Electronic In",
+    0x0030: "Promotional Electronic In",
+    0x002F: "Non-cashable Electronic In",
+    # Machine Accounting -- Total Out
+    0x0004: "Total Cancelled Credits",
+    0x0003: "Cancelled Credits Paid by Attendant",
+    0x0018: "Cashless Out",
+    0x0032: "Cashable Electronic Out",
+    0x0034: "Promotional Electronic Out",
+    0x0033: "Non-cashable Electronic Out",
+    # Machine Accounting -- games
+    0x0005: "Total Games Played",
+    0x0006: "Total Games Won",
+    0x0007: "Total Games Lost",
+    # The machine's live credit display, not the accounting screens: observed
+    # reading 57.00 as 50.00 cashable + 7.00 non-cashable while these two read
+    # 5700 and 700.
+    0x000C: "credit display -- total credits",
+    0x001B: "credit display -- non-cashable portion",
+}
+
+
+
 README = """# captures/
 
 Machine state snapshots written by `examples/meter_snapshot.py`.
@@ -226,6 +289,13 @@ def main() -> int:
             "nonrestricted": lock.current_non_restricted_amount,
         },
         "meters_raw": meters,
+        # One entry per code in meters_raw. A label is this machine's own
+        # screen wording where that has been confirmed against a non-zero
+        # reading; an EMPTY STRING means no such proof exists yet, which is a
+        # statement about our evidence and not about the meter.
+        "meter_screen_labels": {
+            code: SCREEN_VERIFIED.get(int(code, 16), "") for code in meters
+        },
         "unsupported_meter_codes": unsupported,
     }
 
@@ -244,6 +314,10 @@ def main() -> int:
     print(f"\nwrote {path}")
     print(f"  {sum(1 for v in meters.values() if v is not None)} of {len(meters)}"
           f" meters answered; {len(unsupported)} not implemented")
+    labelled = sum(1 for c in meters if int(c, 16) in SCREEN_VERIFIED)
+    print(f"  {labelled} of {len(meters)} carry a screen label confirmed against"
+          " this machine;")
+    print("  the rest are empty, meaning no hard evidence rather than no meter")
     if lock is not None:
         total = (lock.current_cashable_amount + lock.current_restricted_amount
                  + lock.current_non_restricted_amount)
