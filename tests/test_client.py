@@ -848,3 +848,36 @@ def test_wager_category_information_unsupported_category_is_distinguishable():
     assert result.coin_in_meter == 0
     assert result.coin_in_meter_size == 0
     assert result.payback_percentage == "\x00\x00\x00\x00"
+
+
+# -- Remote handpay reset (0x94, Table 7.9a/7.9b) ---------------------------
+
+
+def test_reset_handpay_sends_type_s_command_with_crc():
+    """Section 7.9 calls 0x94 "a type S long poll", so the command carries a
+    CRC. Sending it as type R (bare address+command) would be rejected.
+    """
+    body = bytes([ADDRESS, 0x94, 0x00])
+    fake = FakeSerial(body + crc16_bytes(body))
+    client = SASClient(SASTransport(fake, wake_byte=None), ADDRESS, timeout=1.0)
+    client.reset_handpay()
+    request = bytes([ADDRESS, 0x94])
+    assert bytes(fake.written) == request + crc16_bytes(request)
+
+
+@pytest.mark.parametrize("code", [0x00, 0x01, 0x02])
+def test_reset_handpay_returns_table_7_9b_reset_code(code):
+    result = make_client(bytes([ADDRESS, 0x94, code])).reset_handpay()
+    assert result == code
+
+
+def test_reset_handpay_unconfigured_machine_times_out_rather_than_lying():
+    """Section 7.9: a machine "not configured for remote handpay reset ...
+    must ignore long poll 94". Ignoring is silence, so the honest outcome is
+    a timeout -- never a reset code, which would report a definite answer the
+    machine never gave.
+    """
+    transport = SASTransport(FakeSerial(b""), wake_byte=None)
+    client = SASClient(transport, ADDRESS, timeout=0.01)
+    with pytest.raises(SASError):
+        client.reset_handpay()

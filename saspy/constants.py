@@ -157,6 +157,8 @@ class LongPoll(enum.IntEnum):
     AFT_REGISTER_GAMING_MACHINE = 0x73  # Table 8.1a/8.1b
     AFT_GAME_LOCK_AND_STATUS = 0x74  # Table 8.2a/8.2b
 
+    RESET_HANDPAY = 0x94  # Table 7.9a/7.9b
+
     SEND_ENABLED_FEATURES = 0xA0  # Table 7.14a/7.14b
 
 
@@ -669,6 +671,7 @@ LONG_POLL_TYPES: dict[LongPoll, PollType] = {
     LongPoll.AFT_TRANSFER_FUNDS: PollType.S,
     LongPoll.AFT_REGISTER_GAMING_MACHINE: PollType.S,
     LongPoll.AFT_GAME_LOCK_AND_STATUS: PollType.S,
+    LongPoll.RESET_HANDPAY: PollType.S,  # "type S long poll with a 94 command code" per §7.9
     LongPoll.SEND_ENABLED_FEATURES: PollType.M,
 }
 
@@ -900,6 +903,15 @@ AFT_STATUS_CATEGORIES = {
     0b100: "FAILED",
     0b110: "UNSUPPORTED POLL",
     0b111: "NO INFORMATION",
+}
+
+
+# Table 7.9b: the reset code long poll 0x94 answers with. Three outcomes,
+# and only the first one changed anything.
+HANDPAY_RESET_CODES = {
+    0x00: "handpay was reset",
+    0x01: "unable to reset the handpay",
+    0x02: "not currently in a handpay condition",
 }
 
 

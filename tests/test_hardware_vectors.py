@@ -467,16 +467,31 @@ def test_a_denied_cashout_falls_back_to_whatever_device_exists():
     Section 8.7's zero transfer instructs the machine to "perform the cashout
     by whatever other means are available". On an EGT Premier with no printer
     there is no other device, so a denied $37.47 cashout became a HANDPAY:
-    exception 0x51, "Call Attendant" on screen, locked until a 0x52 reset two
+    exception 0x51, "Call Attendant" on screen, locked until it was reset two
     minutes later.
 
-    So on a machine without a printer, declining is the MORE disruptive
-    option -- it needs a person with a reset key -- while taking the money to
-    the host completes cleanly. Table 8.2b bit 2 of available transfers is
-    what distinguishes the two cases, and it is worth checking before
-    advising anybody that declining is the safe choice.
+    So on a machine with no usable cashout device, declining is the MORE
+    disruptive option -- it needs a person with a reset key -- while taking
+    the money to the host completes cleanly.
+
+    CORRECTION to what this test used to assert. It read Table 8.2b's
+    available-transfers bit 2 as the discriminator, on the basis that a clear
+    bit 2 meant "no printer, so no ticket fallback". That is wrong, and
+    wrong in the direction that wastes a day: bit 2 is "Transfer to printer
+    OK", an AFT statement about whether the HOST may transfer funds onto a
+    ticket. It says nothing about whether the machine prints its own voucher
+    when a player presses CASH OUT. The same cabinet later printed cashout
+    tickets perfectly with bit 2 unchanged, once its Printer Limit was moved
+    off 0.00 -- a setting SAS cannot read at all (MANUAL.md section 7.2).
+
+    So there is no bit to check here. SAS does not report whether a cashout
+    will reach paper, which is precisely why --deny is the dangerous option:
+    the gateway cannot know in advance which fallback it is choosing. What
+    remains assertable is the exception sequence, and that long poll 0x94 --
+    not a long poll 0x52, which is Send game N meters -- is the remote way
+    out of the lockup.
     """
-    from saspy.constants import describe_exception
+    from saspy.constants import HANDPAY_RESET_CODES, LongPoll, describe_exception
 
     assert describe_exception(0x51) == (
         "handpay is pending (progressive, non-progressive or cancelled credits)"
@@ -484,8 +499,10 @@ def test_a_denied_cashout_falls_back_to_whatever_device_exists():
     assert describe_exception(0x52) == "handpay was reset (jackpot reset switch activated)"
     assert describe_exception(0x66) == "cash out button pressed"
 
-    no_printer = 0x00  # available transfers with bit 2 clear
-    assert not no_printer & 0x04, "no transfer-to-printer means no ticket fallback"
+    # Exception 0x52 reports a reset; long poll 0x94 performs one.
+    assert int(LongPoll.RESET_HANDPAY) == 0x94
+    assert int(LongPoll.SEND_GAME_N_METERS) == 0x52
+    assert HANDPAY_RESET_CODES[0x00] == "handpay was reset"
 
 
 def test_priority_exceptions_are_delivered_before_queued_ones():

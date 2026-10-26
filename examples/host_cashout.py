@@ -41,7 +41,10 @@ On a cashless machine with no printer there is no other device, so the
 cashout becomes a HANDPAY: the machine locks up with "Call Attendant" and
 needs somebody with a reset key. Observed exactly that on an EGT Premier --
 a denied $37.47 cashout produced exception 0x51, handpay pending, and sat
-locked until a 0x52 reset two minutes later.
+locked for two minutes until it was reset, reported as exception 0x52,
+handpay reset. (Exception 0x52, not long poll 0x52, which is Send game N
+meters -- the reset itself is long poll 0x94, and examples/handpay_clear.py
+sends it.)
 
 So on a machine without a printer, --deny is the MORE disruptive choice,
 not the less. Taking the money to the host is the clean path; denying
@@ -292,6 +295,9 @@ def main() -> int:
         print("  available the fallback is a HANDPAY, which locks the machine with")
         print("  \"Call Attendant\" until somebody resets it. Watch which one you get")
         print("  rather than assuming.")
+        print("  If it does lock up, examples/handpay_clear.py sends long poll 0x94")
+        print("  and may clear it without a reset key -- on a cabinet configured for")
+        print("  remote handpay reset, which not all are.")
 
     before = read_meters(client)
 

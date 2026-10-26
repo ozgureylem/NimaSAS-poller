@@ -1780,6 +1780,56 @@ leaving on a normal cashout ticket, from the hopper, or by attendant
 handpay. Returning them to the host preserves their restricted status, so
 transfer type `80` can carry them where a ticket-out never could.
 
+### 7.5 A pending handpay blocks everything, and may clear without a key
+
+A handpay locks the cabinet, and the lock is wider than it looks. §8.2 lists
+"waiting for handpay" among the states in which the machine must never enter
+the AFT lock state, and the same states clear Table 8.2b's
+available-transfers bits. So one stuck handpay makes an AFT cashout, an AFT
+push and a ticket-out all refuse — each with its own status code naming its
+own symptom rather than the cause. A cabinet that appears to have six
+unrelated faults usually has this one.
+
+Two long polls, answering different questions:
+
+```bash
+python3 examples/handpay_clear.py /dev/ttyS0 --address 1          # what is pending
+python3 examples/handpay_clear.py /dev/ttyS0 --address 1 --reset   # clear it
+```
+
+`0x1B` (§7.8, Table 7.8) says **what** is pending and is read-only. Its
+useful fields are the Level — `80` is cancelled credits, which is what a
+cashout that fell back to a handpay looks like — and the **Reset ID**, which
+says whether this machine offers a reset to the credit meter as well as the
+standard reset.
+
+`0x94` (§7.9, Table 7.9a/7.9b) **clears** it, and answers with a reset code:
+`00` reset, `01` unable to reset, `02` not in a handpay condition.
+
+Three things to get right about `0x94`:
+
+- **Exception `0x52` is not long poll `0x52`.** Exception `0x52` reports that
+  a handpay *was* reset; long poll `0x52` is Send game N meters. The reset
+  itself is long poll `0x94`. An earlier note in this repo said "a `0x52`
+  reset", which was loose enough to send somebody firing the wrong poll.
+- **Silence is a documented answer.** §7.9: a machine "not configured for
+  remote handpay reset ... must ignore long poll 94". So an unconfigured
+  cabinet times out, and a timeout means the feature is off at the machine —
+  not that the reset failed. Reset code `01` is the other thing: the feature
+  is on and the machine declined.
+- **The reset code does not say where the money went.** §7.9's note: where
+  the W2-G Reset To Credit Meter function has been enabled by long poll
+  `0xA8`, `0x94` "will reset the handpay to the credit meter" — the money
+  comes back as credits instead of being paid out. Code `00` is returned
+  either way, so `handpay_clear.py` reads the Reset ID first and the meters
+  either side, and reports which outcome actually occurred from the credit
+  delta rather than from the code.
+
+Amount units are a trap in Table 7.8 and not a bug in the tool: the amount is
+in cents only if some part of the handpay came from a progressive, and in SAS
+accounting denom units otherwise. The machine does not say which, so the tool
+states the unit and declines to convert when it cannot know.
+
 ## 8. Where to go next
 
 - `README.md` — repository layout and the licensing note on

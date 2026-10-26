@@ -1155,6 +1155,40 @@ class SASClient:
         """Type R commands carry no CRC; S/M/G do (spec 2.2.2)."""
         return LONG_POLL_TYPES[poll] != PollType.R
 
+    # -- Remote handpay reset (0x94, Table 7.9a/7.9b) -----------------------
+
+    def reset_handpay(self) -> int:
+        """LP 0x94 (Table 7.9a/7.9b) — clear a pending handpay remotely.
+
+        Returns the Table 7.9b reset code: 0x00 handpay was reset, 0x01
+        unable to reset the handpay, 0x02 not currently in a handpay
+        condition. Only 0x00 changed anything; see HANDPAY_RESET_CODES.
+
+        Two cautions, both from §7.9.
+
+        A machine that is not configured for remote handpay reset "must
+        ignore long poll 94". Ignoring means no response at all, so the
+        honest outcome there is a timeout — raised as SASError, not
+        reported as a failed reset. The two are worth telling apart: a
+        timeout says the feature is off, 0x01 says the feature is on and
+        the machine declined.
+
+        Where the W2-G Reset To Credit Meter function has been enabled with
+        long poll 0xA8, §7.9's note says 0x94 "will reset the handpay to
+        the credit meter" — the money goes back onto the machine as
+        credits rather than being paid out. That is a different financial
+        outcome from a plain reset, decided by a long poll this client does
+        not send, so a caller that cares must read the machine's
+        configuration rather than infer it from the reset code, which is
+        0x00 either way.
+        """
+        poll = LongPoll.RESET_HANDPAY
+        frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
+        # address + command + reset code + CRC
+        raw = self._exchange_fixed(frame, response_length=5, timeout=self.timeout)
+        payload = self._strip(raw)
+        return payload[1]
+
     def _strip(self, raw: bytes) -> bytes:
         """Validate address+CRC and return the command-onward payload."""
         return parse_response(raw, self.address).payload
