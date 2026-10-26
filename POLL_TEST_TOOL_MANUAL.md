@@ -226,6 +226,9 @@ not the spec's.
 | `0032` | Cashable Electronic Out | `01 6F 04 00 00 32 00 EF 8D` |
 | `0034` | Promotional Electronic Out | `01 6F 04 00 00 34 00 3F D9` |
 | `0033` | Non-cashable Electronic Out | `01 6F 04 00 00 33 00 37 94` |
+| | **Voucher Out** | |
+| `0016` | Voucher Out | `01 6F 04 00 00 16 00 BC C9` |
+| `002C` | Cashable Voucher Out | `01 6F 04 00 00 2C 00 6E 82` |
 | | **Games played / won / lost** | |
 | `0005` | Total Games Played | `01 6F 04 00 00 05 00 45 76` |
 | `0006` | Total Games Won | `01 6F 04 00 00 06 00 2D 5C` |

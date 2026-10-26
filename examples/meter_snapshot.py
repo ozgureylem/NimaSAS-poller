@@ -97,6 +97,12 @@ SCREEN_VERIFIED = {
     0x0032: "Cashable Electronic Out",
     0x0034: "Promotional Electronic Out",
     0x0033: "Non-cashable Electronic Out",
+    # Machine Accounting -- Voucher Out. Zero on every comparison until the
+    # first ticket printed, so these could not be claimed before: a zero
+    # matching a zero proves nothing. Confirmed at 140.25 against the screen,
+    # and against the machine's own Voucher Out Log entry for the same ticket.
+    0x0016: "Voucher Out",
+    0x002C: "Cashable Voucher Out",
     # Machine Accounting -- games
     0x0005: "Total Games Played",
     0x0006: "Total Games Won",
