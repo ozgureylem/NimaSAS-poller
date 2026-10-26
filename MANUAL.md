@@ -1549,6 +1549,68 @@ code *should* be. This table is the narrower claim of what this machine
 *demonstrated*, and it grows as tests confirm more.
 
 
+### 7.2 Machine settings SAS cannot see, and that look like gateway faults
+
+Two days of ticket testing on an EGT Premier were spent on the gateway when
+the cause was in the machine both times. Neither setting is readable over
+SAS, so the gateway can only ever report the symptom. Both are recorded here
+because each one cost a day.
+
+**Ticket out: `Printer Limit`, the ticket-out ceiling.** At `0.00` no cashout
+can ever print. Every CASH OUT becomes a handpay, the machine never issues
+exception `0x57`, and so the host is never asked for a validation number --
+there is nothing in the SAS traffic that says "the ticket path is closed",
+only an absence where `0x57` would be. The symptom is `0x66` then `0x51`
+handpay pending with no `0x57` in between.
+
+This was chased through three wrong explanations first: the printer being
+absent (it was installed), out of paper (it had paper), and the AFT
+available-transfers bit 2 (which reports whether the HOST may transfer funds
+onto a ticket, and says nothing about the machine printing its own voucher --
+see §7.3). The limit menu answered it in one line.
+
+**Ticket in: the validator's own `Tickets` channel.** A bill validator
+enumerates its denominations as channels, and ticket/barcode reading is one
+more channel alongside them. With `Tickets: Disabled` the validator reads
+inserted paper down the BANKNOTE path, fails banknote validation, and returns
+it as exception `0x2B` bill rejected. Section 15.11 only issues `0x67` for a
+ticket "in an acceptable condition with a machine readable validation
+number", so a `0x2B` with no `0x67` means the barcode was never read at all.
+
+This is separate from the machine's SAS `Voucher in` setting, and from LP
+`0xA0` bit 7. Both of those can read enabled -- and did -- while the
+validator quietly declines to look for a barcode.
+
+**What to check before blaming the gateway**, in the order that would have
+saved the time:
+
+| symptom | look at |
+|---|---|
+| `0x2B` and never `0x67` | the VALIDATOR's channel list: is `Tickets` enabled? |
+| `0x66`/`0x6A` then `0x51`, never `0x57` | `Printer Limit` -- `0.00` closes the ticket path outright |
+| `0x51` on amounts above a threshold only | `Jackpot Limit`, `Attendant Limit` |
+| ticket in rejected above a value | `Tickets In Limit` |
+
+On EGT, changing most of these requires a RAM clear, which zeroes every
+meter. `examples/meter_snapshot.py` before the clear is the only record of
+what the machine held; `capture_diff.py` and `soak_report.py` both recognise
+a clear rather than reporting it as 160 broken meters, and
+`sql_poll_logger.py` opens a new epoch so the history either side of it is
+never silently reconciled across the boundary.
+
+### 7.3 `0x74` bit 2 is not "the machine has a printer"
+
+Table 8.2b's available-transfers bit 2 is "Transfer to printer OK", and it is
+an AFT statement: whether the host may transfer funds onto a printed ticket,
+the transfers metered by `00A8`/`00AA`/`00AC`. It reports nothing about
+whether the machine prints its own cashout voucher when a player presses CASH
+OUT -- that is `Voucher out` plus the system-validation path, exception
+`0x57` with long polls `57` and `58`.
+
+Reading the bit as "no printer available" is a much stronger claim than it
+supports, and it sent a real investigation after a printer that was
+installed, enabled and loaded with paper.
+
 ## 8. Where to go next
 
 - `README.md` — repository layout and the licensing note on

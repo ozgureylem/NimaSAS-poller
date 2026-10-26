@@ -345,8 +345,10 @@ def main() -> int:
                 # the amount and the available reset method are the two
                 # things anyone standing at the machine needs.
                 print(f"[{time.strftime('%H:%M:%S')}] 0x{code:02X} {describe_exception(code)}")
+                hp_level_is_cashout = False
                 try:
                     hp = client.send_handpay_information()
+                    hp_level_is_cashout = hp.level == 0x80
                     print(f"  amount {hp.amount / 100:,.2f}   partial pay {hp.partial_pay / 100:,.2f}")
                     print(f"  level 0x{hp.level:02X} "
                           f"({'cancelled credits' if hp.level == 0x80 else 'progressive/other'})"
@@ -354,6 +356,25 @@ def main() -> int:
                     print(f"  reset: {'to the credit meter is available' if hp.reset_id == 0x01 else 'standard handpay reset only'}")
                 except SASError as e:
                     print(f"  could not read handpay info (0x1B): {type(e).__name__}: {e}")
+                if hp_level_is_cashout:
+                    # Hard-won on an EGT Premier: a cashout that becomes a
+                    # handpay instead of a ticket is a LIMIT decision made
+                    # inside the machine, and SAS has no long poll that
+                    # reports those limits. The gateway cannot see why, so it
+                    # can at least say where to look.
+                    print("\n  This was a CASHOUT routed to a handpay, not a win. The machine")
+                    print("  chose handpay over printing a ticket, and that choice is made")
+                    print("  from limits SAS cannot read. On an EGT Premier, in the machine's")
+                    print("  own limits menu:")
+                    print("    Printer Limit  -- the ticket-out ceiling. At 0.00 NO cashout")
+                    print("                      can ever print, every one becomes a handpay,")
+                    print("                      and nothing over SAS says so: there is no")
+                    print("                      0x57, so the gateway is never consulted.")
+                    print("    Attendant Limit, Jackpot Limit -- the thresholds above which")
+                    print("                      an attendant must pay.")
+                    print("  A missing 0x57 after 0x66/0x6A means the ticket path was never")
+                    print("  entered, which is a machine configuration answer, not a gateway")
+                    print("  one. Printer Limit 0.00 was the cause the first time.")
             elif code != 0x00:
                 print(f"[{time.strftime('%H:%M:%S')}] 0x{code:02X} {describe_exception(code)}")
 
