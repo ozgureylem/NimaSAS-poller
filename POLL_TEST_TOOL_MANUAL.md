@@ -220,7 +220,6 @@ not the spec's.
 | `0030` | Promotional Electronic In | `01 6F 04 00 00 30 00 5F BE` |
 | `002F` | Non-cashable Electronic In | `01 6F 04 00 00 2F 00 06 A8` |
 | | **Total Out** | |
-| `0004` | Total Cancelled Credits | `01 6F 04 00 00 04 00 9D 6F` |
 | `0003` | Cancelled Credits Paid by Attendant | `01 6F 04 00 00 03 00 95 22` |
 | `0018` | Cashless Out | `01 6F 04 00 00 18 00 AC 53` |
 | `0032` | Cashable Electronic Out | `01 6F 04 00 00 32 00 EF 8D` |
@@ -228,11 +227,13 @@ not the spec's.
 | `0033` | Non-cashable Electronic Out | `01 6F 04 00 00 33 00 37 94` |
 | | **Voucher In** | |
 | `0015` | Voucher In | `01 6F 04 00 00 15 00 D4 E3` |
+| `0029` | Cashable Voucher In | `01 6F 04 00 00 29 00 D6 FC` |
 | `002B` | Promotional Voucher In | `01 6F 04 00 00 2B 00 66 CF` |
 | `002A` | Non-cashable Voucher In | `01 6F 04 00 00 2A 00 BE D6` |
 | | **Voucher Out** | |
 | `0016` | Voucher Out | `01 6F 04 00 00 16 00 BC C9` |
 | `002C` | Cashable Voucher Out | `01 6F 04 00 00 2C 00 6E 82` |
+| `002D` | Non-cashable Voucher Out | `01 6F 04 00 00 2D 00 B6 9B` |
 | | **Games played / won / lost** | |
 | `0005` | Total Games Played | `01 6F 04 00 00 05 00 45 76` |
 | `0006` | Total Games Won | `01 6F 04 00 00 06 00 2D 5C` |
@@ -264,6 +265,10 @@ A code the machine does not implement comes back with **size 0** rather
 than an error (§7.21b), so an absent meter is reported as absent and the
 rest of the poll still answers. That is how the 37 codes this cabinet does
 not implement were identified.
+
+`0004` was in this table and has been withdrawn: SAS `0004` excludes
+electronic transfers to the host, while the screen line of that name includes
+them (518.80 against `0004`'s 365.10). MANUAL.md §7.1 has the arithmetic.
 
 ### What is NOT in the table
 

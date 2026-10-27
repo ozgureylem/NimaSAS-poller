@@ -1486,7 +1486,6 @@ not the spec's.
 | `0030` | Promotional Electronic In | `01 6F 04 00 00 30 00 5F BE` |
 | `002F` | Non-cashable Electronic In | `01 6F 04 00 00 2F 00 06 A8` |
 | | **Total Out** | |
-| `0004` | Total Cancelled Credits | `01 6F 04 00 00 04 00 9D 6F` |
 | `0003` | Cancelled Credits Paid by Attendant | `01 6F 04 00 00 03 00 95 22` |
 | `0018` | Cashless Out | `01 6F 04 00 00 18 00 AC 53` |
 | `0032` | Cashable Electronic Out | `01 6F 04 00 00 32 00 EF 8D` |
@@ -1494,11 +1493,13 @@ not the spec's.
 | `0033` | Non-cashable Electronic Out | `01 6F 04 00 00 33 00 37 94` |
 | | **Voucher In** | |
 | `0015` | Voucher In | `01 6F 04 00 00 15 00 D4 E3` |
+| `0029` | Cashable Voucher In | `01 6F 04 00 00 29 00 D6 FC` |
 | `002B` | Promotional Voucher In | `01 6F 04 00 00 2B 00 66 CF` |
 | `002A` | Non-cashable Voucher In | `01 6F 04 00 00 2A 00 BE D6` |
 | | **Voucher Out** | |
 | `0016` | Voucher Out | `01 6F 04 00 00 16 00 BC C9` |
 | `002C` | Cashable Voucher Out | `01 6F 04 00 00 2C 00 6E 82` |
+| `002D` | Non-cashable Voucher Out | `01 6F 04 00 00 2D 00 B6 9B` |
 | | **Games played / won / lost** | |
 | `0005` | Total Games Played | `01 6F 04 00 00 05 00 45 76` |
 | `0006` | Total Games Won | `01 6F 04 00 00 06 00 2D 5C` |
@@ -1572,6 +1573,34 @@ machine that has had a RAM clear or has never been in a redemption cycle
 answers `FF`, "no validation information available" -- which is not a
 refusal and must not be logged as one. It closes the gap for the last ticket
 and for no other, which is why a gateway still logs its own decisions.
+
+#### A label withdrawn: `0004` is not the screen's "Total Cancelled Credits"
+
+`0004` was in the table above and has been taken out, because the machine's
+own figures contradict it.
+
+SAS `0004` has been observed to **exclude** electronic transfers to the host.
+It read 365.10 at a moment when `0003` + `000E` + `0010` came to exactly
+151.00 + 185.00 + 29.10 = 365.10, and when 33.33 had already left by AFT. So
+AFT-to-host is not in it. Appendix A's note that "tickets must always be
+included in total drop and total cancelled credits" covers tickets and says
+nothing about AFT, which matches.
+
+The screen's line called **Total Cancelled Credits** read 518.80 on the same
+machine, equal to its Total Out, electronic out included:
+
+```
+151.00 attendant + 185.00 cashable voucher + 29.10 non-cashable voucher
+      + 87.04 + 22.22 + 44.44 electronic out  =  518.80
+```
+
+Two different figures under one name. The label was claimed on the strength
+of the name agreeing and the value agreeing on an early capture, before any
+AFT cashout existed to separate them -- which is the same mistake as `0028`
+below, caught the same way: by a capture where the two could finally differ.
+
+The next snapshot settles it. `0004` reading `36510` against a screen showing
+518.80 confirms they are not the same meter.
 
 #### The one mapping that looks obvious and is wrong
 

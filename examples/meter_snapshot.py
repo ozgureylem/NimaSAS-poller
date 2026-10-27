@@ -78,12 +78,23 @@ CHUNK = 12  # LP 0x6F's own per-request limit (§7.21)
 SCREEN_VERIFIED = {
     # Machine Accounting -- Total Bet / Total Won
     0x0000: "Total Bet (Coin In)",
+    # 0001 and 0022 currently hold the SAME number (16.16), because C-7
+    # defines 0022 as "sum of total coin out and total jackpot" and this
+    # machine's jackpot meter is zero. Both are kept because the screen
+    # names both lines and the names match the spec's own wording -- but
+    # neither value distinguishes them, so an attendant-paid or progressive
+    # win is what will finally separate the pair.
     0x0001: "Winnings from Paytable (Coin Out)",
     0x0019: "Total Non-cashable Played",
     0x001A: "Total Promotional Played",
     0x0022: "Total Won",
     0x001F: "Attendant Paid Paytable Winnings",
     # Machine Accounting -- Total In
+    #
+    # 0024 is held on the same suspicion as 0004 below: C-7 calls it "total
+    # drop", the screen line is called "Total In", and whether they are the
+    # same figure has not been checked against a capture where they could
+    # differ. Kept, but re-verify it before a CMS reconciles on it.
     0x0024: "Total In",
     0x000B: "Bill In",
     0x0017: "Cashless In",
@@ -91,11 +102,29 @@ SCREEN_VERIFIED = {
     0x0030: "Promotional Electronic In",
     0x002F: "Non-cashable Electronic In",
     # Machine Accounting -- Total Out
-    0x0004: "Total Cancelled Credits",
+    #
+    # 0004 IS DELIBERATELY ABSENT, having previously been claimed here and
+    # then contradicted by the machine's own figures. The screen's "Total
+    # Cancelled Credits" line read 518.80 on a capture where SAS 0004 should
+    # still read 365.10, because 0004 had already been observed to EXCLUDE
+    # electronic transfers to the host: it equalled 0003 + 000E + 0010
+    # (151.00 + 185.00 + 29.10) exactly, at a moment when 33.33 had already
+    # gone out by AFT. Appendix A's note that "tickets must always be
+    # included in total drop and total cancelled credits" says nothing about
+    # AFT, and the arithmetic says AFT is out.
+    #
+    # The screen's line is therefore a broader figure of EGT's own: it equals
+    # Total Out, electronic out included. Two different numbers under one
+    # name. The next snapshot settles it -- 0004 reading 36510 against a
+    # screen showing 518.80 confirms they are not the same meter.
     0x0003: "Cancelled Credits Paid by Attendant",
     0x0018: "Cashless Out",
     0x0032: "Cashable Electronic Out",
     0x0034: "Promotional Electronic Out",
+    # 0033 was claimed here while it read 0.00, which the rest of this table's
+    # own standard forbids. Earned properly on 2026-10-26: a 44.44 restricted
+    # AFT push followed by a host-initiated cashout put 44.44 down this path
+    # for the first time, and the screen line reads 44.44.
     0x0033: "Non-cashable Electronic Out",
     # Machine Accounting -- Voucher In. Zero until the first redemptions, so
     # unclaimable before: confirmed at 40.00 / 10.00 / 5.00 against the screen,
@@ -109,6 +138,7 @@ SCREEN_VERIFIED = {
     # against a screen line showing 25.00. The screen's line is 0029, regular
     # cashable ticket in. 0028 has no screen line at all.
     0x0015: "Voucher In",
+    0x0029: "Cashable Voucher In",
     0x002B: "Promotional Voucher In",
     0x002A: "Non-cashable Voucher In",
     # Machine Accounting -- Voucher Out. Zero on every comparison until the
@@ -117,6 +147,7 @@ SCREEN_VERIFIED = {
     # and against the machine's own Voucher Out Log entry for the same ticket.
     0x0016: "Voucher Out",
     0x002C: "Cashable Voucher Out",
+    0x002D: "Non-cashable Voucher Out",
     # Machine Accounting -- games
     0x0005: "Total Games Played",
     0x0006: "Total Games Won",
