@@ -20,12 +20,20 @@ Two independent views, which is the value of it:
   THE METERS -- long poll 0x50 per validation type, giving the cumulative
   cents and count for each. The buffer holds 31 records; the meters hold
   everything since the last RAM clear. When the buffer has wrapped, the
-  meters are the only complete account, and the difference between the two
-  is how you know it wrapped.
+  meters are the only complete account.
 
-The two should agree where the buffer has not yet wrapped, and that
-agreement is worth checking: the records come from a ring buffer the machine
-maintains and the meters from counters it maintains separately.
+The two agree on what the machine PRINTED, and that agreement is worth
+checking: the records come from a ring buffer the machine maintains and the
+meters from counters it maintains separately. Measured on an EGT Premier,
+265.19 against 265.19.
+
+They do NOT agree on what it redeemed, and that is expected rather than a
+fault. Section 15.10's buffer holds validations the MACHINE issued -- it
+prints a ticket, so it files the record. A redeemed ticket's validation
+number came from the host, so the machine has nothing of its own to file and
+writes no buffer entry, while the 0x50 meters count both directions. On the
+same cabinet: buffer 0.00 against meters 80.00, with six redemptions the
+meters counted and the buffer never saw.
 
     python3 examples/ticket_history.py /dev/ttyS0 --address 1
     python3 examples/ticket_history.py /dev/ttyS0 --address 1 --json records.json
@@ -290,6 +298,15 @@ def main() -> int:
         print()
 
         # Cross-check the two views against each other, per direction.
+        #
+        # A disagreement has two possible causes and they are not
+        # interchangeable, so the buffer's OCCUPANCY decides which one is
+        # reported. An earlier version of this blamed wrapping for every
+        # mismatch, and said so on a machine holding six records in a
+        # thirty-one slot buffer -- where wrapping is arithmetically
+        # impossible and the real cause was the other one.
+        used = len(records)
+        nearly_full = used >= len(BUFFER_INDICES) - 1
         for direction, label in (("printed", "printed"), ("redeemed", "redeemed")):
             from_records = sum(r["amount_cents"] for r in records
                                if r["direction"] == direction)
@@ -297,11 +314,34 @@ def main() -> int:
                               if m["direction"] == direction)
             if not from_records and not from_meters:
                 continue
-            agree = from_records == from_meters
+            if from_records == from_meters:
+                print(f"  {label}: buffer {from_records / 100:,.2f} vs meters "
+                      f"{from_meters / 100:,.2f}  agree")
+                continue
             print(f"  {label}: buffer {from_records / 100:,.2f} vs meters "
-                  f"{from_meters / 100:,.2f}"
-                  + ("  agree" if agree else "  DIFFER -- the buffer has very"
-                     " likely wrapped, and the meters are the complete account"))
+                  f"{from_meters / 100:,.2f}  DIFFER")
+            if from_records == 0 and direction == "redeemed":
+                # The structural case, and the usual one. Section 15.10's
+                # buffer holds validations the MACHINE issued: it prints a
+                # ticket, so it creates the record. A redeemed ticket's
+                # validation number came from the host, so the machine has
+                # nothing of its own to file and writes no buffer record --
+                # while the LP 0x50 meters count both directions regardless.
+                print("     -> not a wrap. This buffer holds validations the")
+                print("        MACHINE issued, and a redeemed ticket's number came")
+                print("        from the host, so there is no record for it to file.")
+                print("        The 0x50 meters count both directions; the buffer")
+                print("        counts one. Expected on this cabinet, not a fault.")
+            elif nearly_full:
+                print(f"     -> {used} of {len(BUFFER_INDICES)} slots are in use, so"
+                      " the buffer has")
+                print("        very likely wrapped. The meters are the complete account.")
+            else:
+                print(f"     -> {used} of {len(BUFFER_INDICES)} slots are in use, so this"
+                      " is NOT a wrap.")
+                print("        Something else accounts for the difference and it is worth")
+                print("        chasing: a record this walk could not read, or a meter")
+                print("        counting a type the buffer files differently.")
 
     if args.json:
         Path(args.json).write_text(json.dumps(

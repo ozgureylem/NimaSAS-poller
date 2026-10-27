@@ -766,3 +766,42 @@ def test_nonrestricted_leaves_on_the_cashable_ticket():
     """
     assert 3010 + 180 == 3190
     assert 18500 + 3190 == 21690
+
+
+def test_the_validation_buffer_holds_only_what_the_machine_issued():
+    """Observed on 2026-10-27, and it corrected a false diagnosis.
+
+    ticket_history.py reported "the buffer has very likely wrapped" on a
+    machine holding SIX records in a thirty-one slot buffer, where wrapping
+    is arithmetically impossible. The real cause is structural: §15.10's
+    buffer holds validations the MACHINE issued -- it prints a ticket, so it
+    files the record -- while a redeemed ticket's validation number came from
+    the host, leaving the machine nothing of its own to file. The LP 0x50
+    meters count both directions.
+
+    Printed agreed exactly (buffer 265.19 vs meters 265.19); redeemed was
+    buffer 0.00 against meters 80.00, across six redemptions the buffer never
+    saw. Both are correct behaviour.
+    """
+    printed = [15000, 2500, 3500, 410, 3190, 1919]
+    assert sum(printed) == 26519
+    # Cashable 150.00 + 35.00 + 31.90 and restricted 25.00 + 4.10 + 19.19,
+    # matching the screen's Cashable/Non-cashable Voucher Out to the cent.
+    assert 15000 + 3500 + 3190 == 21690
+    assert 2500 + 410 + 1919 == 4829
+    assert 21690 + 4829 == 26519
+    # Six redemptions, 80.00, none of them in the buffer.
+    assert 5000 + 1000 + 2000 == 8000
+
+
+def test_the_whole_machine_balances_on_the_2026_10_27_screens():
+    """Total In - Total Out == Total Bet - Total Won, with an empty credit
+    meter: 605.73 - 569.89 == 56.10 - 20.26 == 35.84, and 35.84/56.10 is
+    63.89%, the hold percentage the machine printed on its own screen.
+    """
+    assert 60573 - 56989 == 5610 - 2026 == 3584
+    assert round(3584 / 5610 * 100, 2) == 63.89
+    # Play order, demonstrated: the 13.20 wagered this round took restricted
+    # first (5.00, exhausting it), then nonrestricted (8.20), and never
+    # touched cashable -- which is why cashable played held at 17.00.
+    assert 1700 + 820 + 3090 == 5610
