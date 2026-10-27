@@ -908,6 +908,156 @@ AFT_STATUS_CATEGORIES = {
 }
 
 
+# Table C-7's relationships between meters, which is how a meter gets a name
+# when it has no screen line of its own.
+#
+# Two kinds, and conflating them would be the whole mistake:
+#
+#   declared=True  -- C-7 states it in the meter's own description, as
+#       "[same as meter ...]" or "sum of ...". Holds unconditionally, on
+#       every machine, forever. 0010 IS 0088.
+#
+#   declared=False -- it holds only because SAS is the machine's only source
+#       for that amount. The note under C-7's validation block: "Meter codes
+#       0080 through 0093 and 00A0 through 00BD include only amounts
+#       accumulated using the SAS protocol. They do not include amounts from
+#       any other process or protocol." Their counterparts in 0015-0039 count
+#       every source, so the two agree exactly while a gateway is the only
+#       electronic route in or out -- which is every machine this project has
+#       seen, and is not guaranteed.
+#
+# Each entry is (total, components, declared). A single component means the
+# two meters are interchangeable; several mean the total is their sum, and it
+# equals any one of them only while the others are zero.
+METER_RELATIONS: tuple[tuple[int, tuple[int, ...], bool], ...] = (
+    # Declared outright in C-7's own text.
+    (0x000D, (0x0080, 0x0084), True),
+    (0x000E, (0x0086, 0x008A), True),
+    (0x000F, (0x0082,),        True),
+    (0x0010, (0x0088,),        True),
+    (0x0011, (0x0081, 0x0085), True),
+    (0x0012, (0x0087, 0x008B), True),
+    (0x0013, (0x0083,),        True),
+    (0x0014, (0x0089,),        True),
+    (0x0022, (0x0001, 0x0002), True),
+    (0x0023, (0x0003, 0x0002), True),
+    # True only while SAS is the sole source. Ticket side.
+    (0x0029, (0x0080,),        False),
+    (0x002A, (0x0082,),        False),
+    (0x002B, (0x0084,),        False),
+    (0x002C, (0x0086, 0x008A), False),
+    (0x002D, (0x0088,),        False),
+    (0x0035, (0x0081,),        False),
+    (0x0036, (0x0083,),        False),
+    (0x0037, (0x0085,),        False),
+    (0x0038, (0x0087, 0x008B), False),
+    (0x0039, (0x0089,),        False),
+    # Electronic transfer side, likewise.
+    (0x002E, (0x00A0,),        False),
+    (0x002F, (0x00A2,),        False),
+    (0x0030, (0x00A4,),        False),
+    (0x0031, (0x00A6,),        False),
+    (0x0032, (0x00B8,),        False),
+    (0x0033, (0x00BA,),        False),
+    (0x0034, (0x00BC,),        False),
+)
+
+
+def sas_only_meter(code: int) -> bool:
+    """Whether this meter counts only amounts that arrived through SAS.
+
+    C-7's note on the validation block: codes 0080-0093 and 00A0-00BD
+    "include only amounts accumulated using the SAS protocol. They do not
+    include amounts from any other process or protocol."
+    """
+    return 0x0080 <= code <= 0x0093 or 0x00A0 <= code <= 0x00BD
+
+
+def derive_meter_labels(known: dict[int, str], values: dict[int, int | None]
+                        ) -> dict[int, tuple[str, str]]:
+    """Give a name to meters that have no screen line, from the ones that do.
+
+    ``known`` maps meter code to a label somebody verified against the
+    machine's own display. ``values`` is the current reading per code.
+    Returns {code: (label, provenance)} for codes NOT already in ``known``.
+
+    Two rules decide what may be derived, and both come from mistakes:
+
+    A meter reading ZERO never takes a label. A zero equals every other
+    zero, so inheriting a name through one proves nothing -- the same rule
+    the screen-verified table already applies to itself. An earlier version
+    of this ignored that and labelled 0002, total jackpot, as "Total Won",
+    because 0022 = 0001 + 0002 and 0002 happened to be zero. The label was
+    wrong and the reasoning would have been wrong even if it had been right.
+
+    A multi-component relation is CONDITIONAL and says so. 0086 equals 002C
+    only while 008A is zero, so the provenance names 008A rather than
+    presenting the two as interchangeable. A single-component declared
+    identity has no such caveat: 0010 IS 0088.
+
+    Derivation chains, and the provenance records the whole chain. The
+    screen names 002D; 0088 takes it as a SAS-only twin; 0010 takes it from
+    0088 as a declared identity. Stopping after one hop left most of the
+    ticket block nameless for no reason.
+    """
+    derived: dict[int, tuple[str, str]] = {}
+
+    def label_of(code: int) -> str | None:
+        if code in known:
+            return known[code]
+        return derived[code][0] if code in derived else None
+
+    def chain_of(code: int) -> str:
+        if code in known:
+            return f"{code:04X}"
+        return derived[code][1] if code in derived else f"{code:04X}"
+
+    def claim(code: int, source: int, declared: bool, siblings: tuple[int, ...]) -> bool:
+        if code in known or code in derived:
+            return False
+        if not values.get(code):          # zero, None or absent
+            return False
+        text = label_of(source)
+        if text is None:
+            return False
+        basis = "C-7 identity" if declared else "SAS-only twin"
+        inherited = chain_of(source)
+        # Collect the caveats of the whole chain, not just this hop, and say
+        # each one once: an earlier version appended per hop and produced
+        # "while 008A is zero while 008A is zero".
+        zeros = {f"{c:04X}" for c in siblings if c != code and not values.get(c)}
+        head, _, tail = inherited.partition(" while ")
+        if tail:
+            zeros.update(part.strip() for part in
+                         tail.removesuffix(" is zero").split(","))
+        provenance = f"{basis} with {head}"
+        if zeros:
+            provenance += " while " + ", ".join(sorted(zeros)) + " is zero"
+        derived[code] = (text, provenance)
+        return True
+
+    # Iterate to a fixed point so labels travel along chains.
+    for _ in range(len(METER_RELATIONS) + 1):
+        changed = False
+        for total, components, declared in METER_RELATIONS:
+            # Exactly one live component is the condition for the total and
+            # that component to be the same figure, and it governs BOTH
+            # directions. With two live components the total is a genuine sum
+            # and equals neither part -- 000D at 3,500 is 0080's 2,500 plus
+            # 0084's 1,000 and is not a name for either of them. An earlier
+            # version guarded only the upward direction and duly lent 000D's
+            # label to both components; the test for it is in
+            # test_meter_support.py.
+            live = [c for c in components if values.get(c)]
+            if len(live) != 1:
+                continue
+            changed |= claim(live[0], total, declared, components)
+            changed |= claim(total, live[0], declared, components)
+        if not changed:
+            break
+    return derived
+
+
 # Table 7.9b: the reset code long poll 0x94 answers with. Three outcomes,
 # and only the first one changed anything.
 HANDPAY_RESET_CODES = {

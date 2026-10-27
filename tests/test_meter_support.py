@@ -111,3 +111,85 @@ def test_the_module_level_ledger_exists_for_the_running_poller():
     """The poller keeps one ledger for the life of the process, so a meter
     only has to prove itself once."""
     assert isinstance(METER_SUPPORT, _MeterSupport)
+
+
+# -- Derived meter labels (Table C-7 relationships) -------------------------
+
+
+def test_a_zero_meter_never_takes_a_derived_label():
+    """The rule the screen-verified table already applies to itself: a zero
+    equals every other zero, so inheriting a name through one proves nothing.
+
+    An earlier version of derive_meter_labels() broke this and labelled 0002,
+    total jackpot, as "Total Won" -- because 0022 = 0001 + 0002 and 0002 was
+    zero. Pinned here because the label was plausible-looking and wrong.
+    """
+    from saspy.constants import derive_meter_labels
+
+    known = {0x0001: "Winnings from Paytable (Coin Out)", 0x0022: "Total Won"}
+    values = {0x0001: 1616, 0x0022: 1616, 0x0002: 0}
+    derived = derive_meter_labels(known, values)
+    assert 0x0002 not in derived, derived.get(0x0002)
+    assert all(values.get(code) for code in derived)
+
+
+def test_a_declared_identity_is_inherited_unconditionally():
+    """C-7 annotates 0010 as "[same as meter 0088]". One component, declared,
+    so there is no caveat to attach.
+    """
+    from saspy.constants import derive_meter_labels
+
+    derived = derive_meter_labels({0x0010: "Non-cashable Voucher Out"},
+                                  {0x0010: 2910, 0x0088: 2910})
+    label, basis = derived[0x0088]
+    assert label == "Non-cashable Voucher Out"
+    assert "C-7 identity" in basis
+    assert "while" not in basis
+
+
+def test_a_multi_component_relation_says_what_it_depends_on():
+    """0086 equals 002C only while 008A -- debit tickets out -- is zero. The
+    provenance must name 008A rather than presenting them as the same meter.
+    """
+    from saspy.constants import derive_meter_labels
+
+    derived = derive_meter_labels({0x002C: "Cashable Voucher Out"},
+                                  {0x002C: 18500, 0x0086: 18500, 0x008A: 0})
+    _label, basis = derived[0x0086]
+    assert "while 008A is zero" in basis
+
+
+def test_a_real_sum_lends_its_name_to_no_component():
+    """With two live components the total is a genuine sum, and equal to
+    neither part. Nothing may be derived in either direction.
+    """
+    from saspy.constants import derive_meter_labels
+
+    derived = derive_meter_labels({0x000D: "would-be label"},
+                                  {0x000D: 3500, 0x0080: 2500, 0x0084: 1000})
+    assert 0x0080 not in derived and 0x0084 not in derived
+
+
+def test_labels_travel_along_a_chain_and_the_caveat_is_said_once():
+    """The screen names 002D; 0088 takes it as a SAS-only twin; 0010 takes it
+    from 0088 as a declared identity. And a caveat picked up mid-chain is
+    stated once -- an earlier version produced "while 008A is zero while 008A
+    is zero".
+    """
+    from saspy.constants import derive_meter_labels
+
+    derived = derive_meter_labels(
+        {0x002D: "Non-cashable Voucher Out", 0x002C: "Cashable Voucher Out"},
+        {0x002D: 2910, 0x0088: 2910, 0x0010: 2910,
+         0x002C: 18500, 0x0086: 18500, 0x000E: 18500, 0x008A: 0})
+    assert derived[0x0010][0] == "Non-cashable Voucher Out"
+    assert "0088" in derived[0x0010][1] or "002D" in derived[0x0010][1]
+    assert derived[0x000E][1].count("while") == 1, derived[0x000E][1]
+
+
+def test_derivation_never_overwrites_a_screen_verified_label():
+    from saspy.constants import derive_meter_labels
+
+    known = {0x002D: "Non-cashable Voucher Out", 0x0088: "something measured"}
+    derived = derive_meter_labels(known, {0x002D: 2910, 0x0088: 2910})
+    assert 0x0088 not in derived

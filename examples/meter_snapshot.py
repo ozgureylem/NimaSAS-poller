@@ -40,7 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from saspy.client import SASClient
-from saspy.constants import LongPoll, MeterCode
+from saspy.constants import LongPoll, MeterCode, derive_meter_labels
 from saspy.exceptions import SASError
 from saspy.serial_port import open_serial_port
 from saspy.transport import SASTransport
@@ -317,6 +317,8 @@ def main() -> int:
             })
 
     meters, unsupported = read_meters(client)
+    derived_labels = derive_meter_labels(
+        SCREEN_VERIFIED, {int(c, 16): v for c, v in meters.items()})
 
     asset = lock.asset_number if lock is not None else None
     snapshot = {
@@ -356,6 +358,16 @@ def main() -> int:
         # screen wording where that has been confirmed against a non-zero
         # reading; an EMPTY STRING means no such proof exists yet, which is a
         # statement about our evidence and not about the meter.
+        # Labels inherited from the screen-verified ones through Table C-7's
+        # own relationships, each carrying where it came from. Kept in a
+        # SEPARATE field from meter_screen_labels on purpose: a screen match
+        # is a photograph and a derived label is an argument, and a consumer
+        # that cannot tell them apart will eventually quote the argument as
+        # the photograph -- this project's recurring failure mode.
+        "meter_derived_labels": {
+            f"{code:04X}": {"label": label, "basis": basis}
+            for code, (label, basis) in sorted(derived_labels.items())
+        },
         "meter_screen_labels": {
             code: SCREEN_VERIFIED.get(int(code, 16), "") for code in meters
         },
