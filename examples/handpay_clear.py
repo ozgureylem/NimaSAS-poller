@@ -1,6 +1,15 @@
 """What the pending handpay is, and clearing it without a reset key.
 
-A handpay locks the machine. While it is locked nothing else works: Table
+A handpay USUALLY locks the machine, and exception 0x51 is not proof that
+this one has. Section 7.8.1 gives the machine a handpay queue and makes 0x51
+a report of an unreported ENTRY in it, reissued every fifteen seconds until
+a 0x1B read acknowledges it. An entry outlives the lockup: a handpay reset
+at the cabinet leaves its record in the queue, so a machine that is unlocked
+and happily taking bets can still be shouting 0x51. Observed exactly that on
+an EGT Premier -- 0x51 every fifteen seconds through a run of normal play.
+Read 0x1B before concluding anything from the exception alone.
+
+When a handpay IS live, it locks the machine, and nothing else works: Table
 8.2b's "transfer from gaming machine OK" bit goes clear, §8.2 forbids the
 machine from entering the AFT lock state at all ("waiting for handpay" is on
 its list), and so an AFT cashout, a push, and a ticket-out all refuse. The
@@ -12,7 +21,17 @@ Two long polls, and they answer different questions.
   LP 0x1B (§7.8, Table 7.8) says WHAT is pending: the amount, whether a
   progressive contributed, and -- the useful field -- the Reset ID, which
   says whether this machine offers a reset to the credit meter as well as a
-  standard reset. Read-only, so it is safe to run at any time.
+  standard reset. It moves no money, so it is safe to run at any time.
+
+  It is not, however, without effect, and §7.8.1 is the reason. 0x51
+  announces an entry in a handpay QUEUE, not necessarily a live lockup, and
+  "when the gaming machine's response is acknowledged, this entry is marked
+  as reported or removed from the queue". So reading 0x1B is itself the
+  acknowledgement: it is what stops the machine reissuing 0x51 every fifteen
+  seconds, and a second read of the same entry answers all zeros rather than
+  repeating it. Two consecutive runs of this tool showing 15,000 and then 0
+  are not a machine changing its mind -- they are the queue draining,
+  correctly, because the first run read it.
 
   LP 0x94 (§7.9, Table 7.9a/7.9b) CLEARS it. That is a money-moving
   operation, so it only happens with --reset.

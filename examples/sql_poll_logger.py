@@ -614,6 +614,18 @@ CREATE TABLE IF NOT EXISTS ticket_in_completions (
     synced_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS handpay_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    progressive_group INTEGER,
+    level INTEGER,
+    amount INTEGER,
+    partial_pay INTEGER,
+    reset_id INTEGER,
+    all_zeros INTEGER NOT NULL,
+    synced_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS validation_pool (
     validation_number INTEGER PRIMARY KEY,
     validation_system_id INTEGER NOT NULL,
@@ -1629,6 +1641,74 @@ def _capture_ticket_in_completion(client, conn: sqlite3.Connection, now: str) ->
     print(f"[{now}] ticket-in completion captured: machine_status=0x{result.machine_status:02X} amount_cents={result.amount_cents}")
 
 
+def _capture_handpay(client, conn: sqlite3.Connection, now: str) -> None:
+    """Called on exception 0x51. Issues the long poll 0x1B that §7.8.1
+    REQUIRES, and without which the machine never stops shouting.
+
+    Section 7.8.1 is explicit, and it is about a queue rather than a lock:
+    "When a handpay occurs, the gaming machine stores all pertinent data
+    required for the 1B long poll in the handpay queue and sends exception
+    51 ... When long poll 1B is received, the oldest unreported entry in the
+    queue is sent to the host. When the gaming machine's response is
+    acknowledged, this entry is marked as reported or removed from the
+    queue."
+
+    And the consequence of not reading it: "If the 1B long poll is not
+    received from the host within fifteen seconds after exception 51 has
+    been sent and acknowledged, the gaming machine will re-issue exception
+    51 every fifteen seconds as long as the entry is in the queue."
+
+    This poller used to log 0x51 and read nothing, which produced exactly
+    that on an EGT Premier: 0x51 every fifteen seconds for minutes on end,
+    on a machine that was NOT locked and was being played normally
+    throughout. The exception was reporting an unreported QUEUE ENTRY, not a
+    live handpay condition -- a distinction the exception's own text
+    ("handpay is pending") actively hides.
+
+    The stakes are higher than noise. The queue holds a minimum of five
+    entries and §7.8.1 says "if the handpay queue is already full, the
+    oldest handpay record will be lost". A host that never reads 1B
+    therefore loses handpay records -- money events -- once the sixth one
+    arrives. Reading is not optional politeness; it is how the queue drains.
+
+    All zeros is a normal answer, not a failure: §7.8.1 says "long poll 1B
+    returns all zeros if a handpay record has been reported and
+    acknowledged, and a subsequent exception 51 has not been issued and
+    acknowledged". So a second read of the same entry reads zero, and that
+    is recorded as such rather than as a handpay of 0.00.
+
+    This reads and records. It does NOT reset the handpay -- that is long
+    poll 0x94, it moves money, and it belongs to a human running
+    examples/handpay_clear.py, not to a logger.
+    """
+    try:
+        info = client.send_handpay_information()
+    except SASError as e:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+            (now, "send_handpay_information", type(e).__name__, str(e)),
+        )
+        _safe_commit(conn, now)
+        return
+    all_zeros = not (info.amount or info.partial_pay or info.level
+                     or info.progressive_group)
+    conn.execute(
+        "INSERT INTO handpay_queue (captured_at, progressive_group, level, amount, "
+        "partial_pay, reset_id, all_zeros) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (now, info.progressive_group, info.level, info.amount, info.partial_pay,
+         info.reset_id, int(all_zeros)),
+    )
+    _safe_commit(conn, now)
+    if all_zeros:
+        print(f"[{now}] handpay queue read (0x1B): all zeros -- the entry was "
+              f"already reported and acknowledged (§7.8.1)")
+    else:
+        print(f"[{now}] handpay queue entry read (0x1B): level=0x{info.level:02X} "
+              f"amount={info.amount} partial_pay={info.partial_pay} "
+              f"reset_id=0x{info.reset_id:02X}; the queue entry is now reported, "
+              f"so the 15-second 0x51 reissue should stop")
+
+
 class _MeterSupport:
     """Which optional meter polls this machine has ever answered.
 
@@ -1956,6 +2036,8 @@ def _dispatch_exception(
         _drain_ticket_out_history(client, conn, now)
     elif exception_code == ExceptionCode.SYSTEM_VALIDATION_REQUEST:
         _handle_cashout_request(client, conn, now)
+    elif exception_code == ExceptionCode.HANDPAY_PENDING:
+        _capture_handpay(client, conn, now)
 
 
 def _make_heartbeat(client, conn: sqlite3.Connection, now: str, seen: list):

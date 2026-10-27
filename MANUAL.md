@@ -1826,7 +1826,30 @@ The distinction is the ticket's type, not paper versus wire.
 
 ### 7.5 A pending handpay blocks everything, and may clear without a key
 
-A handpay locks the cabinet, and the lock is wider than it looks. §8.2 lists
+**Exception `0x51` is not proof of a lockup.** §7.8.1 gives the machine a
+handpay *queue*, minimum five entries, and `0x51` reports an **unreported
+entry in it** — reissued "every fifteen seconds as long as the entry is in
+the queue", until a long poll `0x1B` read acknowledges it. An entry outlives
+the lockup it came from: a handpay reset at the cabinet leaves its record
+behind, so an unlocked machine taking bets normally can still be reporting
+`0x51`. Observed exactly that on the EGT Premier — `0x51` every fifteen
+seconds straight through a run of play, on a machine the operator confirmed
+was not locked.
+
+The fix is to read `0x1B`, which is also the acknowledgement: §7.8.1 says
+"when the gaming machine's response is acknowledged, this entry is marked as
+reported or removed from the queue". `sql_poll_logger.py` now does that
+automatically on `0x51`; `handpay_clear.py` does it on demand. A second read
+of the same entry answers all zeros, which §7.8.1 defines as normal, so two
+runs showing an amount and then zero are the queue draining, not the machine
+changing its mind.
+
+Not reading it is worse than noisy. §7.8.1: "if the handpay queue is already
+full, the oldest handpay record will be lost" — so a host that never issues
+`0x1B` starts **losing handpay records** once the sixth one arrives. Money
+events, silently dropped.
+
+When a handpay IS live, it locks the cabinet, and the lock is wider than it looks. §8.2 lists
 "waiting for handpay" among the states in which the machine must never enter
 the AFT lock state, and the same states clear Table 8.2b's
 available-transfers bits. So one stuck handpay makes an AFT cashout, an AFT

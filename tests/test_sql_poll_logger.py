@@ -37,6 +37,7 @@ from saspy.models import (
     EnhancedValidationInfo,
     ExtendedMeters,
     GamesSincePowerUpAndDoorClosure,
+    HandpayInformation,
     HopperStatus,
     LastAcceptedBillInfo,
     Meters11Through15,
@@ -173,6 +174,7 @@ class ScriptedClient:
         table_c7_values=None,
         last_accepted_bill_info=None,
         validation_meters_values=None,
+        handpay_information=None,
     ):
         self._meters_script = list(meters_script)
         self._exception_script = list(exception_script) if exception_script is not None else None
@@ -197,6 +199,7 @@ class ScriptedClient:
         self._table_c7_values = dict(table_c7_values) if table_c7_values else {}
         self._last_accepted_bill_info = last_accepted_bill_info
         self._validation_meters_values = dict(validation_meters_values) if validation_meters_values else {}
+        self._handpay_information = handpay_information
         self.validation_number_calls = []
         self.extended_meter_commands = []
 
@@ -270,6 +273,13 @@ class ScriptedClient:
 
     def send_total_hand_paid_cancelled_credits(self, game_number=0):
         return self._fixed_or_raise(self._hand_paid_cancelled_credits, 0)
+
+    def send_handpay_information(self):
+        return self._fixed_or_raise(
+            self._handpay_information,
+            HandpayInformation(progressive_group=0, level=0, amount=0,
+                               partial_pay=0, reset_id=0),
+        )
 
     def send_current_hopper_status(self):
         return self._fixed_or_raise(self._hopper_status, HopperStatus(status=0, percent_full=0, level=0))
@@ -2423,6 +2433,76 @@ def test_documented_meter_labels_match_the_verified_map(manual):
                 f"{label!r}")
 
 
+# --- The lab ticket authority must not outlive the bench -------------------
+
+_LAB_AUTHORITY = Path(__file__).resolve().parent.parent / "examples" / "ticket_lab_authority.py"
+
+
+def test_the_lab_ticket_authority_has_not_outlived_its_expiry():
+    """This is the reminder, and it is deliberately a failing test rather than
+    a comment.
+
+    examples/ticket_lab_authority.py lets the gateway decide what a ticket is
+    worth -- correct on a bench wired to nothing, a cash-dispensing defect
+    anywhere else. It was always meant to be deleted when the bench work
+    finished, and things that are meant to be deleted are not.
+
+    So the suite notices. When this fails there are exactly two honest
+    responses: delete the tool and this test with it, or move
+    LAB_AUTHORITY_EXPIRES as a deliberate act. Both are fine; forgetting is
+    not, and that is the option this removes.
+    """
+    import datetime as _dt
+    if not _LAB_AUTHORITY.exists():
+        return  # deleted, as intended -- nothing left to guard
+    import examples.ticket_lab_authority as _lab
+    assert _dt.date.today() <= _lab.LAB_AUTHORITY_EXPIRES, (
+        f"ticket_lab_authority.py expired on {_lab.LAB_AUTHORITY_EXPIRES}. "
+        "Delete examples/ticket_lab_authority.py and the ticket file, or move "
+        "LAB_AUTHORITY_EXPIRES deliberately if the bench work is genuinely "
+        "still running.")
+
+
+def test_the_lab_ticket_authority_refuses_unparseable_validation_numbers():
+    """An 18-digit number is Table 15.11b parsing code 00. A typo in the
+    ticket file must fail at load, not silently never match."""
+    if not _LAB_AUTHORITY.exists():
+        return
+    import json as _json
+    import tempfile
+    import examples.ticket_lab_authority as _lab
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        _json.dump({"tickets": {"01-2259-6416": {"as": "cashable",
+                                                 "amount": 1.0}}}, fh)
+        bad = fh.name
+    with pytest.raises(ValueError, match="18-digit"):
+        _lab.load_tickets(Path(bad))
+
+
+def test_the_lab_ticket_authority_normalises_printed_dashes():
+    """The number is copied off a ticket, where it is printed with dashes, and
+    arrives from the machine as 18 BCD digits. Those must meet."""
+    if not _LAB_AUTHORITY.exists():
+        return
+    import examples.ticket_lab_authority as _lab
+    assert _lab.normalise("01-2259-6416-1772-0146") == "012259641617720146"
+    assert len(_lab.normalise("01-2259-6416-1772-0146")) == 18
+
+
+def test_an_unedited_example_file_says_so_rather_than_implying_a_swap():
+    """Copying the example and forgetting to edit it is the likeliest mistake,
+    and it happened on the first real run. The generic 'if the bench machine
+    really changed' message sent the reader looking for a problem that was not
+    there, so the placeholder case is detected and named."""
+    if not _LAB_AUTHORITY.exists():
+        return
+    import examples.ticket_lab_authority as _lab
+    # The placeholder carries no digits; a real serial is all digits.
+    assert _lab.normalise("PUT-THE-BENCH-MACHINE-SERIAL-HERE") == ""
+    assert _lab.normalise("000106719") == "000106719"
+
+
 # --- Drain rate: the cause of the exception buffer overflows ---------------
 
 
@@ -2445,9 +2525,14 @@ def test_heartbeat_every_is_reachable_from_the_command_line():
     """It was a function default with no way to set it, so the one knob that
     fixes an overflow could not be turned without editing the source."""
     import examples.sql_poll_logger as _logger
-    source = Path(_logger.__file__).read_text()
-    assert '"--heartbeat-every"' in source
-    assert "heartbeat_every=args.heartbeat_every" in source
+    parser = _logger.build_parser() if hasattr(_logger, "build_parser") else None
+    if parser is None:
+        source = Path(_logger.__file__).read_text()
+        assert '"--heartbeat-every"' in source
+        assert "heartbeat_every=args.heartbeat_every" in source
+    else:
+        args = parser.parse_args(["cfg", "--heartbeat-every", "3"])
+        assert args.heartbeat_every == 3
 
 
 # --- One cashout must consume one validation number ------------------------
@@ -2564,3 +2649,74 @@ def test_one_ram_clear_does_not_open_two_epochs():
 
     reasons = [r[1] for r in _epochs(conn)]
     assert reasons == ["first_seen", "ram_clear"], reasons
+
+
+# -- Exception 0x51 and the handpay queue (§7.8.1) --------------------------
+
+
+def test_handpay_pending_reads_the_1b_long_poll():
+    """Section 7.8.1 requires the host to read LP 0x1B after exception 0x51.
+    Not reading it leaves the queue entry unreported, and the machine then
+    "re-issue[s] exception 51 every fifteen seconds as long as the entry is
+    in the queue" -- observed on an EGT Premier as a 0x51 every 15s for
+    minutes, on a machine that was unlocked and being played throughout.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.HANDPAY_PENDING],
+        handpay_information=HandpayInformation(
+            progressive_group=0, level=0x80, amount=15000, partial_pay=0, reset_id=0),
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    rows = conn.execute(
+        "SELECT level, amount, reset_id, all_zeros FROM handpay_queue").fetchall()
+    assert rows == [(0x80, 15000, 0, 0)]
+
+
+def test_handpay_all_zeros_is_recorded_as_such_not_as_a_zero_handpay():
+    """Section 7.8.1: "long poll 1B returns all zeros if a handpay record has
+    been reported and acknowledged, and a subsequent exception 51 has not
+    been issued and acknowledged." That is the normal answer on a re-read,
+    and it must not be stored as a handpay of 0.00 -- which is how a second
+    read of the same entry would otherwise look.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.HANDPAY_PENDING],
+    )  # the fake's default 0x1B answer is all zeros
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    rows = conn.execute("SELECT amount, all_zeros FROM handpay_queue").fetchall()
+    assert rows == [(0, 1)]
+
+
+def test_handpay_read_failure_is_logged_not_fatal():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient(
+        [make_meters()],
+        exception_script=[ExceptionCode.HANDPAY_PENDING],
+        handpay_information=SASTimeoutError("no response"),
+    )
+    poll_and_log(client, conn, state, history, monotonic_fn=clock)
+    assert conn.execute("SELECT COUNT(*) FROM handpay_queue").fetchone()[0] == 0
+    rows = conn.execute("SELECT poll_name FROM poll_errors").fetchall()
+    assert ("send_handpay_information",) in rows
+
+
+def test_the_poller_never_resets_a_handpay_itself():
+    """0x94 moves money and belongs to a human. The logger reads and records;
+    it must not clear the lockup on its own initiative.
+    """
+    import inspect
+    import examples.sql_poll_logger as mod
+    assert "reset_handpay" not in inspect.getsource(mod)

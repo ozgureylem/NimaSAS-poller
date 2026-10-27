@@ -185,6 +185,8 @@ class ExceptionCode(enum.IntEnum):
     NONE = 0x00
     CASH_OUT_TICKET_PRINTED = 0x3D  # §15.10 — read via LP 4D (Send Enhanced Validation Information)
     HANDPAY_VALIDATED = 0x3E  # §15.10 — same read as above (spec: "functionally equivalent" to 3D)
+    HANDPAY_PENDING = 0x51  # §7.8.1 — a handpay QUEUE entry, reissued every 15s until LP 0x1B reads it
+    HANDPAY_RESET = 0x52  # §7.8.1 — sent only after the 1B read AND the handpay itself being reset
     SYSTEM_VALIDATION_REQUEST = 0x57  # §15.7 — read via LP 57 (Send Pending Cashout Information), answered via LP 58
     TICKET_INSERTED = 0x67  # §15.11 — read via LP 70 (Send Ticket Validation Data)
     TICKET_TRANSFER_COMPLETE = 0x68  # §15.12 — read via LP 71/FF (redeem_ticket_status())
