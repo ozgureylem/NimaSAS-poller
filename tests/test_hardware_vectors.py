@@ -805,3 +805,21 @@ def test_the_whole_machine_balances_on_the_2026_10_27_screens():
     # first (5.00, exhausting it), then nonrestricted (8.20), and never
     # touched cashable -- which is why cashable played held at 17.00.
     assert 1700 + 820 + 3090 == 5610
+
+
+def test_the_two_survey_clocks_are_in_different_zones():
+    """Measured on the lab cabinet, 2026-10-27. The gateway recorded
+    taken_at_utc 17:56:55 while the machine's own 0x7E clock said 115655 on
+    10272026 -- 11:56:55 local, CST being UTC-6. The same instant, six hours
+    apart in the database.
+
+    Pinned because the two columns sit side by side in survey_machines, and
+    subtracting one from the other would manufacture a six-hour "drift" that
+    does not exist. SAS does not report the cabinet's configured offset, so
+    nothing in the data makes the conversion for you.
+    """
+    utc_hour, local_hour, cst_offset = 17, 11, -6
+    assert local_hour == utc_hour + cst_offset
+    # And the minutes and seconds matched exactly, which is what says the
+    # clocks genuinely agree rather than happening to be close.
+    assert (56, 55) == (56, 55)

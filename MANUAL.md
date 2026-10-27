@@ -1990,6 +1990,14 @@ and then every file's `taken_at_utc` is wrong together while looking
 perfectly fine. The EGM keeps its own time, so the survey records both and
 their disagreement tells you later which clock to distrust.
 
+**The two are in different time zones**, which is worth knowing before anyone
+subtracts one from the other. `taken_at_utc` is UTC; the machine reports its
+own *local* time. Measured on the lab cabinet: `taken_at_utc` 17:56:55
+against `machine_time` 115655, i.e. 11:56:55 CST — the same instant, six
+hours apart on the page. SAS does not report the cabinet's configured offset,
+so the conversion is something you have to know rather than something the
+data carries.
+
 #### The part that needs care, and it is not technical
 
 **Never plug into a SAS port that a live host is already driving.** Two
