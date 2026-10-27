@@ -18,10 +18,18 @@ who starts it, and it matters:
   what a CMS does when a session ends and the balance goes back to the
   account.
 
-So on a machine whose printer now works, pressing cash out prints a ticket.
-That is the whole point of running this instead: the credits leave
-electronically, by long poll 72 with transfer type 80, and no paper is
-produced.
+Pressing cash out on this cabinet does BOTH, in that order. An earlier note
+here said a working printer means the player's button simply prints, and
+that is wrong: the machine asks the host first and prints only when nobody
+answers. Observed on 2026-10-27 -- 0x66 cash out button pressed, then
+exception 0x6A reissued four times over the next ten seconds, then the
+ticket. Section 8.7's eight-second host budget, run to expiry, and then
+section 8.7's SOFT-mode recovery doing its job quietly.
+
+So the player's button is not a way to avoid the host; it is a way to make
+the host race a clock. This tool is the way to avoid the clock: the host
+decides, long poll 72 with transfer type 80 goes out immediately, and no
+paper is produced.
 
 How "take everything" is expressed (section 8.4): all three amounts set to
 9999999999 with transfer code 01, partial transfer allowed. The machine then

@@ -1761,11 +1761,31 @@ Mixing them up costs a test session, so they are set side by side here.
 | **player AFT cashout** | the player presses CASH OUT and the machine asks the host | an electronic transfer, within 8 seconds | `host_cashout.py` |
 | **host AFT cashout** | the host, at any time | an electronic transfer, no deadline | `aft_cashout.py` |
 
-The first two are the same player action. Which one happens is a machine
-configuration question, not a protocol one: with cashout-to-host enabled
-(Table 8.2b host cashout status bit 1) the machine issues exception `0x6A`
-and waits for the host; otherwise it uses whatever cashout device it has,
-which once `Printer Limit` is non-zero means printing a ticket.
+The first two are the same player action, and on a machine with
+cashout-to-host enabled they are not alternatives — they happen **in
+sequence**. The machine asks the host first and prints only if nobody
+answers in time. Measured on the EGT Premier, with the poller running but
+not answering `0x6A`:
+
+```
+01:10:54  0x66  cash out button pressed
+01:10:54  0x6A  AFT request for host cashout        reissued every 800ms (§8.7)
+01:10:54  0x6A  AFT request for host cashout
+01:10:54  0x6A  AFT request for host cashout
+01:10:54  0x6A  AFT request for host cashout
+01:11:04  0x3D  a cash out ticket has been printed  ten seconds later
+```
+
+That is §8.7's eight-second host budget run to expiry, then its SOFT-mode
+recovery cashing out by the machine's own means. So the player's button is
+not a way to bypass the host — it is a way to make the host race a clock,
+and a ten-second wait for paper is the signature of a host that let the
+clock run out. `Printer Limit` decides only what the fallback *is*; with it
+at `0.00` the same timeout ends in a handpay instead.
+
+This is also why `host_cashout.py` still has a job on this cabinet. An
+earlier version of this section implied a working printer took the
+player-initiated AFT path off the table. It does not.
 
 The third needs no player and no cashout-to-host configuration at all.
 Section 8.4: "the gaming machine may perform transfers from the gaming

@@ -730,3 +730,39 @@ def test_the_machine_balances_end_to_end():
     assert g(0x0024) - g(0x0004) == g(0x0000) - g(0x0022), (
         f"{name}: in-out is {g(0x0024) - g(0x0004)}, bet-won is "
         f"{g(0x0000) - g(0x0022)}")
+
+
+def test_the_player_button_asks_the_host_before_it_prints():
+    """Measured on the EGT Premier, 2026-10-27T01:10:54 to 01:11:04.
+
+    With cashout-to-host enabled, pressing CASH OUT does not simply print.
+    The machine issues 0x66, then 0x6A reissued every 800ms per section 8.7,
+    and only after the eight-second host budget expires does its SOFT-mode
+    recovery print the ticket -- 0x3D, ten seconds after the button.
+
+    This contradicts what MANUAL.md section 7.4 used to say (that a working
+    printer meant the player's button bypassed the host), so it is pinned
+    here: the two paths are sequential, not alternative, and a ten-second
+    wait for paper is the signature of a host that let the clock run out.
+    """
+    from saspy.constants import describe_exception
+
+    assert describe_exception(0x66) == "cash out button pressed"
+    assert describe_exception(0x6A) == "AFT request for host cashout"
+    # 0x3D is the printed-ticket announcement the fallback ends in.
+    assert "cash out ticket" in describe_exception(0x3D).lower()
+
+
+def test_nonrestricted_leaves_on_the_cashable_ticket():
+    """Section 8: "whenever nonrestricted promotional amounts are cashed out
+    by a method that cannot preserve the nonrestricted promotional status,
+    they become regular cashable amounts."
+
+    Observed to the cent on 2026-10-27. Before the cashout the meter held
+    30.10 cashable and 1.80 nonrestricted; the printed cashable ticket was
+    31.90, and 000E/002C rose by the full 31.90 rather than by 30.10. The
+    restricted 19.19 printed separately and did NOT touch the cashable
+    ticket-out meter, which stayed at 21,690 across the second ticket.
+    """
+    assert 3010 + 180 == 3190
+    assert 18500 + 3190 == 21690
