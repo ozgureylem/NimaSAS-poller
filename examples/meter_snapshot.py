@@ -381,9 +381,27 @@ def main() -> int:
         readme.write_text(README)
         print(f"wrote {readme}", file=sys.stderr)
 
+    # NEVER overwrite an existing snapshot. The name is built from this
+    # host's clock and the machine's asset number, and on a gateway carried
+    # round a floor BOTH can repeat: no network and a flat RTC battery can
+    # hand every boot the same time, and asset numbers are entered by hand so
+    # two cabinets can share one. Either alone is survivable; together they
+    # produce the identical filename, and a plain write would then destroy the
+    # previous machine's survey without a word. A suffix is the whole fix.
     stamp = taken_at.strftime("%Y-%m-%dT%H-%M-%SZ")
-    name = f"{stamp}-asset{asset}.json" if asset is not None else f"{stamp}.json"
-    path = out_dir / name
+    name = f"{stamp}-asset{asset}" if asset is not None else stamp
+    path = out_dir / f"{name}.json"
+    suffix = 1
+    while path.exists():
+        suffix += 1
+        path = out_dir / f"{name}-{suffix}.json"
+    if suffix > 1:
+        print(f"note: {name}.json already existed, so this is {path.name}.",
+              file=sys.stderr)
+        print("      Two snapshots wanting one name means a repeated clock, a",
+              file=sys.stderr)
+        print("      repeated asset number, or both. Nothing was overwritten.",
+              file=sys.stderr)
     path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
 
     print(f"\nwrote {path}")
