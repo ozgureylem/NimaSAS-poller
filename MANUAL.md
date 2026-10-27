@@ -1917,6 +1917,36 @@ in cents only if some part of the handpay came from a progressive, and in SAS
 accounting denom units otherwise. The machine does not say which, so the tool
 states the unit and declines to convert when it cannot know.
 
+### 7.6 Which tools take a config file, and which take a port
+
+One tool reads a `gateway.ini`. Every other tool that talks to a machine
+takes the device path and `--address` directly. That asymmetry has cost time
+in **both** directions on this project — a poller invoked without the config
+it needs, and a snapshot invoked with a config it does not accept — so it is
+written down rather than left to be rediscovered.
+
+| first argument | tools |
+|---|---|
+| `gateway.ini` (a config file) | `sql_poll_logger.py` — **the only one** |
+| the device path, with `--address` | everything else that talks to a machine: `meter_snapshot.py`, `meter_fingerprint.py`, `meter_crosscheck.py`, `accounting_summary.py`, `ticket_history.py`, `ticket_redeem.py`, `ticket_in_watch.py`, `ticket_lab_authority.py`, `handpay_clear.py`, `host_cashout.py`, `aft_cashout.py`, `aft_push_credits.py`, `aft_status.py`, `exception_monitor.py`, `connectivity_check.py`, `wager_categories.py`, `poll_test_tool.py`, and the probes |
+| something else entirely | `capture_diff.py` takes two snapshot files, `soak_report.py` takes the database, `commission_gateway.py` takes flags only |
+
+```bash
+python3 examples/sql_poll_logger.py gateway.ini          # config
+python3 examples/meter_snapshot.py /dev/ttyS0 --address 1  # port
+```
+
+Passing a `.ini` to a port-taking tool now says so, rather than reporting
+pyserial's "could not open port gateway.ini: No such file or directory",
+which names neither the mistake nor the fix.
+
+Why the asymmetry exists at all: the poller is the one tool meant to run
+unattended from a service unit, where connection details belong in a file
+rather than a command line (MANUAL §4.6). The rest are things somebody runs
+by hand at a cabinet, where typing the port is less friction than keeping a
+file in step with it. That is a defensible split, not an accident — but it
+is still a split, and it is the kind that only bites people who use both.
+
 ## 8. Where to go next
 
 - `README.md` — repository layout and the licensing note on

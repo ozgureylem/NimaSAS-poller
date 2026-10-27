@@ -40,6 +40,24 @@ def open_serial_port(
     try:
         port_obj = _open(serial, port, baudrate, serial.PARITY_SPACE)
     except Exception as e:
+        # A gateway .ini passed where a device path belongs. Worth catching by
+        # name rather than leaving to pyserial, because the resulting "could
+        # not open port gateway.ini: No such file or directory" says nothing
+        # about the actual mistake, and the mistake is easy to make: of the
+        # tools in examples/, sql_poll_logger.py is the ONLY one that reads a
+        # config file. Every other tool that talks to a machine takes the
+        # device path and --address directly. Both directions of that
+        # confusion have cost real time on this project.
+        if port.endswith((".ini", ".cfg", ".conf", ".toml", ".yaml", ".yml")):
+            raise SASPortCapabilityError(
+                f"{port} looks like a config file, and this tool wants the "
+                f"serial device itself -- for example /dev/ttyS0, with "
+                f"--address." + "\n\n" +
+                "Only examples/sql_poll_logger.py reads a gateway .ini. Every "
+                "other tool here takes the port and --address directly, so a "
+                "config file is never the first argument to them." + "\n\n" +
+                f"Original error: {e}"
+            ) from e
         # TIOCEXCL refused: another process already owns this port. pyserial
         # reports it as "Could not exclusively lock port ... Resource
         # temporarily unavailable", which is accurate and tells nobody what to

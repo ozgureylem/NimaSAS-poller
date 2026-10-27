@@ -217,3 +217,33 @@ def test_a_port_held_by_another_process_says_what_to_do(monkeypatch):
     assert "already held by another process" in message
     assert "pgrep" in message, "it must name the command that finds the holder"
     assert "soak.pid" in message, "and the one that stops the usual culprit"
+
+
+def test_a_config_file_where_a_port_belongs_says_so():
+    """Of the tools in examples/, sql_poll_logger.py is the only one that
+    reads a gateway .ini; the rest take the device path and --address. Both
+    directions of that confusion cost time on this project, and pyserial's
+    own "could not open port gateway.ini: No such file or directory" names
+    neither the mistake nor the fix.
+    """
+    from saspy.exceptions import SASPortCapabilityError
+    from saspy.serial_port import open_serial_port
+
+    for name in ("gateway.ini", "/etc/nimasas/gateway.ini", "lab.yaml"):
+        with pytest.raises(SASPortCapabilityError) as excinfo:
+            open_serial_port(name)
+        message = str(excinfo.value)
+        assert "looks like a config file" in message
+        assert "sql_poll_logger.py" in message
+        assert "--address" in message
+
+
+def test_a_real_device_path_is_not_mistaken_for_a_config():
+    """The hint keys on the suffix, so an ordinary missing device must still
+    fail as a missing device -- not with advice about config files.
+    """
+    from saspy.serial_port import open_serial_port
+
+    with pytest.raises(Exception) as excinfo:
+        open_serial_port("/dev/ttyS-does-not-exist")
+    assert "looks like a config file" not in str(excinfo.value)
