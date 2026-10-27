@@ -91,10 +91,13 @@ SCREEN_VERIFIED = {
     0x001F: "Attendant Paid Paytable Winnings",
     # Machine Accounting -- Total In
     #
-    # 0024 is held on the same suspicion as 0004 below: C-7 calls it "total
-    # drop", the screen line is called "Total In", and whether they are the
-    # same figure has not been checked against a capture where they could
-    # differ. Kept, but re-verify it before a CMS reconciles on it.
+    # 0024 was doubted alongside 0004 and is likewise fine. C-7 calls it
+    # "total drop ... including but not limited to coins to drop, bills to
+    # drop, tickets to drop, and electronic in", and across the captures it
+    # equals 0017 + 0015 exactly in this epoch, 54,554 against the screen's
+    # 545.54. The pre-clear captures add a constant 69,400 on top, which is
+    # the bill activity of that epoch -- the same formula with a term this
+    # epoch has not used.
     0x0024: "Total In",
     0x000B: "Bill In",
     0x0017: "Cashless In",
@@ -103,20 +106,16 @@ SCREEN_VERIFIED = {
     0x002F: "Non-cashable Electronic In",
     # Machine Accounting -- Total Out
     #
-    # 0004 IS DELIBERATELY ABSENT, having previously been claimed here and
-    # then contradicted by the machine's own figures. The screen's "Total
-    # Cancelled Credits" line read 518.80 on a capture where SAS 0004 should
-    # still read 365.10, because 0004 had already been observed to EXCLUDE
-    # electronic transfers to the host: it equalled 0003 + 000E + 0010
-    # (151.00 + 185.00 + 29.10) exactly, at a moment when 33.33 had already
-    # gone out by AFT. Appendix A's note that "tickets must always be
-    # included in total drop and total cancelled credits" says nothing about
-    # AFT, and the arithmetic says AFT is out.
-    #
-    # The screen's line is therefore a broader figure of EGT's own: it equals
-    # Total Out, electronic out included. Two different numbers under one
-    # name. The next snapshot settles it -- 0004 reading 36510 against a
-    # screen showing 518.80 confirms they are not the same meter.
+    # 0004 was briefly withdrawn from this table on the claim that it
+    # excluded AFT transfers to the host, and that was WRONG. The claim
+    # rested on a figure of 365.10 that was never read from the machine: it
+    # was computed as 0003 + 000E + 0010 and then written up as an
+    # observation. Every one of the 20 committed captures says otherwise --
+    # 0004 equals 0003 + 000E + 0010 + 0032 + 0033 + 0034 in all of them,
+    # electronic out included, matching the screen's 518.80 to the cent.
+    # test_hardware_vectors.py now asserts that identity over the captures,
+    # which is the check that would have stopped the withdrawal.
+    0x0004: "Total Cancelled Credits",
     0x0003: "Cancelled Credits Paid by Attendant",
     0x0018: "Cashless Out",
     0x0032: "Cashable Electronic Out",

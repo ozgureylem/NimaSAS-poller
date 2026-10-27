@@ -643,3 +643,90 @@ def test_a_subtotal_names_the_meter_that_did_not_answer():
 
     total, missing = mod.subtotal({0x2E: 100, 0x30: None, 0x2F: 400}, (0x2E, 0x30, 0x2F))
     assert total is None and missing == [0x30]
+
+
+# -- Accounting identities, checked against the committed captures ----------
+#
+# These exist because a claim about 0004 was made from arithmetic that was
+# never read off the machine, used to withdraw a correct label, and committed.
+# The captures were sitting in the repository the whole time. Asserting the
+# identities over them turns "I computed this" into "the machine reported
+# this", which is the distinction that failed.
+
+def _captures():
+    import json
+    from pathlib import Path
+    d = Path(__file__).resolve().parent.parent / "captures"
+    if not d.is_dir():  # code-only mirror carries no captures
+        return []
+    out = []
+    for f in sorted(d.glob("*.json")):
+        meters = json.loads(f.read_text()).get("meters_raw") or {}
+        if meters:
+            out.append((f.name, meters))
+    return out
+
+
+def test_total_cancelled_credits_includes_electronic_out():
+    """0004 = attendant handpay + both ticket-out types + all three
+    electronic-out types, in every capture.
+
+    This is what disproves the withdrawal: 0004 does NOT exclude AFT
+    transfers to the host. On the 2026-10-27 capture it reads 51,880, which
+    is 15,100 + 18,500 + 2,910 + 8,704 + 4,444 + 2,222 -- and the screen line
+    of the same name reads 518.80.
+    """
+    captures = _captures()
+    if not captures:
+        import pytest
+        pytest.skip("no captures/ directory in this checkout")
+    checked = 0
+    for name, m in captures:
+        g = lambda c: m.get(f"{c:04X}")
+        if g(0x0004) is None:
+            continue
+        parts = [g(c) for c in (0x0003, 0x000E, 0x0010, 0x0032, 0x0033, 0x0034)]
+        if any(p is None for p in parts):
+            continue
+        # Pre-clear captures carry bill-era activity this formula omits; they
+        # are recognised by having no ticket-out meters at all.
+        total = sum(parts)
+        assert g(0x0004) == total, (
+            f"{name}: 0004 is {g(0x0004)}, components sum to {total}")
+        checked += 1
+    assert checked >= 15, f"only {checked} captures carried all the meters"
+
+
+def test_total_drop_is_electronic_in_plus_ticket_in():
+    """0024 = 0017 + 0015 in the current epoch, 54,554 against a screen
+    reading 545.54. C-7 defines it as total drop "including but not limited
+    to ... tickets to drop, and electronic in", so a capture with bill
+    activity adds a term; this checks the epoch that has none.
+    """
+    captures = _captures()
+    if not captures:
+        import pytest
+        pytest.skip("no captures/ directory in this checkout")
+    latest = captures[-1][1]
+    g = lambda c: latest.get(f"{c:04X}")
+    assert g(0x0024) == (g(0x0017) or 0) + (g(0x0015) or 0)
+
+
+def test_the_machine_balances_end_to_end():
+    """Total in minus total out equals total bet minus total won, whenever
+    the credit meter is empty. The strongest single check available: it ties
+    four independent meters together and would catch a misread on any of
+    them.
+    """
+    captures = _captures()
+    if not captures:
+        import pytest
+        pytest.skip("no captures/ directory in this checkout")
+    name, m = captures[-1]
+    g = lambda c: m.get(f"{c:04X}")
+    if g(0x000C):
+        import pytest
+        pytest.skip(f"{name} has credits on the machine; the identity needs an empty meter")
+    assert g(0x0024) - g(0x0004) == g(0x0000) - g(0x0022), (
+        f"{name}: in-out is {g(0x0024) - g(0x0004)}, bet-won is "
+        f"{g(0x0000) - g(0x0022)}")

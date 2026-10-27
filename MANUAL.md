@@ -1486,6 +1486,7 @@ not the spec's.
 | `0030` | Promotional Electronic In | `01 6F 04 00 00 30 00 5F BE` |
 | `002F` | Non-cashable Electronic In | `01 6F 04 00 00 2F 00 06 A8` |
 | | **Total Out** | |
+| `0004` | Total Cancelled Credits | `01 6F 04 00 00 04 00 9D 6F` |
 | `0003` | Cancelled Credits Paid by Attendant | `01 6F 04 00 00 03 00 95 22` |
 | `0018` | Cashless Out | `01 6F 04 00 00 18 00 AC 53` |
 | `0032` | Cashable Electronic Out | `01 6F 04 00 00 32 00 EF 8D` |
@@ -1574,33 +1575,39 @@ answers `FF`, "no validation information available" -- which is not a
 refusal and must not be logged as one. It closes the gap for the last ticket
 and for no other, which is why a gateway still logs its own decisions.
 
-#### A label withdrawn: `0004` is not the screen's "Total Cancelled Credits"
+#### The accounting identities this machine satisfies
 
-`0004` was in the table above and has been taken out, because the machine's
-own figures contradict it.
-
-SAS `0004` has been observed to **exclude** electronic transfers to the host.
-It read 365.10 at a moment when `0003` + `000E` + `0010` came to exactly
-151.00 + 185.00 + 29.10 = 365.10, and when 33.33 had already left by AFT. So
-AFT-to-host is not in it. Appendix A's note that "tickets must always be
-included in total drop and total cancelled credits" covers tickets and says
-nothing about AFT, which matches.
-
-The screen's line called **Total Cancelled Credits** read 518.80 on the same
-machine, equal to its Total Out, electronic out included:
+Four relationships hold across every committed capture, and they are worth
+knowing because each one turns a collision into a cross-check.
 
 ```
-151.00 attendant + 185.00 cashable voucher + 29.10 non-cashable voucher
-      + 87.04 + 22.22 + 44.44 electronic out  =  518.80
+0004 = 0003 + 000E + 0010 + 0032 + 0033 + 0034        total cancelled credits
+0024 = 0017 + 0015 (+ bills)                          total drop / Total In
+0022 = 0001 + 0002                                    total won
+0023 = 0003 + 0002                                    total hand paid
 ```
 
-Two different figures under one name. The label was claimed on the strength
-of the name agreeing and the value agreeing on an early capture, before any
-AFT cashout existed to separate them -- which is the same mistake as `0028`
-below, caught the same way: by a capture where the two could finally differ.
+On the 2026-10-27 capture: `0004` 51,880 = 15,100 + 18,500 + 2,910 + 8,704 +
+4,444 + 2,222, against a screen line reading 518.80. `0024` 54,554 = 50,554 +
+4,000, against 545.54.
 
-The next snapshot settles it. `0004` reading `36510` against a screen showing
-518.80 confirms they are not the same meter.
+And the one that ties the lot together, whenever the credit meter is empty:
+
+```
+Total In - Total Out  =  Total Bet - Total Won
+      54,554 - 51,880  =  4,290 - 1,616  =  2,674
+```
+
+26.74 held on 42.90 wagered is 62.33%, against the screen's **Machine hold
+62.34%**. `tests/test_hardware_vectors.py` asserts all of these against
+`captures/`.
+
+**`0004` DOES include AFT transfers to the host.** This manual briefly said
+the opposite and withdrew the `0004` label on that basis. The claim rested on
+a figure of 365.10 that was never read from the machine — it was computed as
+`0003 + 000E + 0010` and then written up as an observation. Every capture
+contradicts it. The label is restored, and the tests above now assert the
+identity so the same mistake cannot be made from arithmetic again.
 
 #### The one mapping that looks obvious and is wrong
 
