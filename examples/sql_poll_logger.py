@@ -614,6 +614,30 @@ CREATE TABLE IF NOT EXISTS ticket_in_completions (
     synced_at TEXT
 );
 
+-- The most recent reading that actually ran the Table C-7 sweep.
+--
+-- With --table-c7-interval the c7_* columns are populated on some cycles and
+-- NULL on the rest, NULL meaning "not read this cycle" exactly as it does for
+-- an unsupported meter. That is the honest representation and an awkward one
+-- to query, so this view hides the awkwardness without hiding the fact: it
+-- returns the newest row where the sweep genuinely ran, carrying its own
+-- polled_at, so a consumer can see how old the reading is instead of assuming
+-- it is current.
+--
+-- c7_total_coin_in_credits is the probe column because code 0000 is the first
+-- meter in Table C-7 and every machine implements it: a machine that answered
+-- the sweep at all answered that one. Both tables are searched because
+-- meters_current holds one row and ring mode writes history at its own
+-- cadence, so either may hold the newest sweep.
+CREATE VIEW IF NOT EXISTS latest_c7_meters AS
+    SELECT * FROM (
+        SELECT * FROM meters_current WHERE c7_total_coin_in_credits IS NOT NULL
+        UNION ALL
+        SELECT * FROM meters_history WHERE c7_total_coin_in_credits IS NOT NULL
+    )
+    ORDER BY polled_at DESC, id DESC
+    LIMIT 1;
+
 CREATE TABLE IF NOT EXISTS handpay_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     captured_at TEXT NOT NULL,
@@ -783,6 +807,22 @@ CREATE VIEW ticket_in_history AS
 # and issued_at is this lab stand-in's equivalent for locally-seeded
 # numbers — see _pool_age_hours() and --pool-age-alert-hours.
 
+# How often the Table C-7 sweep runs, in seconds. 0 means every cycle.
+#
+# Every cycle is what this used to do, and on an EGT Premier it costs 13 extra
+# chunked exchanges -- enough to push a 5-second cycle over its own interval
+# ceiling (§2.3.3 caps the poll interval at 5.0s, so a longer interval is not
+# available as a remedy). The practical consequence was that the only way to
+# stay inside the budget was --skip-table-c7-sweep, which left all ~154 c7_*
+# columns NULL forever: the meters were never logged at all.
+#
+# A cadence is the fix. C-7's extended meters are cumulative lifetime
+# counters; nothing in them needs sub-minute resolution, while the core
+# meters that DO move fast are still read every cycle. The default is
+# therefore a minute rather than every cycle -- strictly more data than
+# skipping and strictly less traffic than before.
+DEFAULT_TABLE_C7_INTERVAL = 60.0
+
 DEFAULT_HISTORY_CAP = 200
 DEFAULT_HISTORY_INTERVAL = 60.0
 DEFAULT_BURST_COUNT = 10
@@ -818,6 +858,9 @@ class PollState:
 
     last_meters: dict | None = None
     last_history_write: float | None = None  # None: never written yet, forces a write on the first cycle
+    # Same shape, for the Table C-7 sweep: None forces one on the first
+    # cycle, so a run always captures C-7 at least once however long it lives.
+    last_c7_sweep: float | None = None
     burst_remaining: int = 0
     # Continuity. epoch_id is the epoch every meter row written this cycle
     # belongs to; see "Continuity: epochs" above.
@@ -2136,6 +2179,7 @@ def poll_and_log(
     db_size_fn=_db_file_size_bytes,
     full_meter_sweep: bool = True,
     table_c7_sweep: bool = True,
+    table_c7_interval: float = DEFAULT_TABLE_C7_INTERVAL,
     validation_meters_sweep: bool = True,
     heartbeat_every: int = 8,
     last_accepted_bill_poll: bool = True,
@@ -2204,6 +2248,24 @@ def poll_and_log(
 
     mono_now = monotonic_fn()
 
+    # Is the Table C-7 sweep due this cycle? None means it has never run in
+    # this process, which forces one -- a run that polls for an hour and
+    # never captures C-7 because its first cycle was not "due" would be a
+    # silly way to lose the data this cadence exists to collect.
+    #
+    # A skipped sweep leaves the c7_* columns NULL rather than carrying the
+    # previous reading forward. NULL already means "not read this cycle"
+    # everywhere else in this schema (§4.4 makes unsupported and unanswered
+    # indistinguishable), and copying a stale value into a fresh row would
+    # make a ten-minute-old meter indistinguishable from one read a second
+    # ago. The latest_c7_meters view below is how you ask for the last real
+    # sweep without caring which rows those were.
+    c7_due = table_c7_sweep and (
+        table_c7_interval <= 0
+        or state.last_c7_sweep is None
+        or (mono_now - state.last_c7_sweep) >= table_c7_interval
+    )
+
     try:
         heartbeat_codes: list = []
         values = _poll_all_meters(
@@ -2211,7 +2273,7 @@ def poll_and_log(
             heartbeat=_make_heartbeat(client, conn, now, heartbeat_codes),
             heartbeat_every=heartbeat_every,
             full_sweep=full_meter_sweep,
-            table_c7_sweep=table_c7_sweep,
+            table_c7_sweep=c7_due,
             validation_meters_sweep=validation_meters_sweep,
             last_accepted_bill_poll=last_accepted_bill_poll,
         )
@@ -2228,6 +2290,13 @@ def poll_and_log(
             f"{type(failure.original).__name__}: {failure.original}"
         )
         return
+
+    # Only a cycle that actually completed its sweep consumes the cadence. A
+    # failed poll must not: on a flapping link the next cycle would then be
+    # "not due", and C-7 could go unread indefinitely while the log filled
+    # with failures that each looked individually harmless.
+    if c7_due:
+        state.last_c7_sweep = mono_now
 
     # Anything the heartbeats drained is handled now -- see _make_heartbeat()
     # for why it is deferred rather than acted on inside the sweep.
@@ -2445,6 +2514,16 @@ def main() -> int:
         "even where that one isn't affordable.",
     )
     parser.add_argument(
+        "--table-c7-interval",
+        type=float,
+        default=DEFAULT_TABLE_C7_INTERVAL,
+        metavar="SECONDS",
+        help=f"how often to run the Table C-7 sweep (default {DEFAULT_TABLE_C7_INTERVAL:.0f}s; "
+        "0 = every cycle). C-7's extended meters are cumulative lifetime counters, so a "
+        "cadence costs nothing in resolution and keeps the cycle inside its interval. "
+        "Ignored when --skip-table-c7-sweep is given",
+    )
+    parser.add_argument(
         "--skip-validation-meters-sweep",
         action="store_true",
         help=f"skip the {len(VALIDATION_METER_TYPES)} LP 0x50 exchanges, one per validation type "
@@ -2543,7 +2622,7 @@ def main() -> int:
     print(
         f"  meters: {len(ALL_METER_FIELDS)} columns per row "
         f"(single-meter sweep {'enabled' if not args.skip_full_meter_sweep else 'skipped'}, "
-        f"Table C-7 sweep {'enabled' if not args.skip_table_c7_sweep else 'skipped'}, "
+        f"Table C-7 sweep {'skipped' if args.skip_table_c7_sweep else ('every cycle' if args.table_c7_interval <= 0 else f'every {args.table_c7_interval:.0f}s')}, "
         f"validation meters sweep {'enabled' if not args.skip_validation_meters_sweep else 'skipped'}, "
         f"last-accepted-bill poll {'enabled' if not args.skip_last_accepted_bill_poll else 'skipped'})."
     )
@@ -2572,6 +2651,7 @@ def main() -> int:
                 db_size_warning_mb=args.db_size_warning_mb,
                 full_meter_sweep=not args.skip_full_meter_sweep,
                 table_c7_sweep=not args.skip_table_c7_sweep,
+            table_c7_interval=args.table_c7_interval,
                 validation_meters_sweep=not args.skip_validation_meters_sweep,
                 heartbeat_every=args.heartbeat_every,
                 last_accepted_bill_poll=not args.skip_last_accepted_bill_poll,

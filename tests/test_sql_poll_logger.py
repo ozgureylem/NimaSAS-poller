@@ -2720,3 +2720,100 @@ def test_the_poller_never_resets_a_handpay_itself():
     import inspect
     import examples.sql_poll_logger as mod
     assert "reset_handpay" not in inspect.getsource(mod)
+
+
+# -- Table C-7 sweep cadence ------------------------------------------------
+
+
+def test_the_c7_sweep_runs_on_the_first_cycle_whatever_the_interval():
+    """A run that polls for an hour and never captures C-7 because its first
+    cycle was not yet "due" would lose exactly the data the cadence exists to
+    collect. last_c7_sweep starts None and None means due.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    client = ScriptedClient([make_meters()], table_c7_values={0x0000: 4290})
+    poll_and_log(client, conn, state, HistoryConfig(mode="ring"),
+                 monotonic_fn=clock, table_c7_interval=3600)
+    row = conn.execute(
+        "SELECT c7_total_coin_in_credits FROM meters_current").fetchone()
+    assert row[0] == 4290
+    assert state.last_c7_sweep is not None
+
+
+def test_a_cycle_inside_the_interval_leaves_the_c7_columns_null():
+    """NULL means "not read this cycle", which is what actually happened.
+    Carrying the previous reading forward would make a ten-minute-old meter
+    indistinguishable from one read a second ago.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="append")
+    client = ScriptedClient([make_meters(), make_meters()],
+                            table_c7_values={0x0000: 4290})
+    poll_and_log(client, conn, state, history, monotonic_fn=clock,
+                 table_c7_interval=3600)
+    poll_and_log(client, conn, state, history, monotonic_fn=clock,
+                 table_c7_interval=3600)
+    rows = [r[0] for r in conn.execute(
+        "SELECT c7_total_coin_in_credits FROM meters_history ORDER BY id")]
+    assert rows == [4290, None], rows
+
+
+def test_interval_zero_still_sweeps_every_cycle():
+    """The old behaviour has to remain reachable."""
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="append")
+    client = ScriptedClient([make_meters(), make_meters()],
+                            table_c7_values={0x0000: 4290})
+    for _ in range(2):
+        poll_and_log(client, conn, state, history, monotonic_fn=clock,
+                     table_c7_interval=0)
+    rows = [r[0] for r in conn.execute(
+        "SELECT c7_total_coin_in_credits FROM meters_history ORDER BY id")]
+    assert rows == [4290, 4290], rows
+
+
+def test_skipping_the_sweep_still_skips_it_entirely():
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    client = ScriptedClient([make_meters()], table_c7_values={0x0000: 4290})
+    poll_and_log(client, conn, state, HistoryConfig(mode="ring"),
+                 monotonic_fn=clock, table_c7_sweep=False, table_c7_interval=0)
+    row = conn.execute(
+        "SELECT c7_total_coin_in_credits FROM meters_current").fetchone()
+    assert row[0] is None
+    assert state.last_c7_sweep is None
+
+
+def test_a_failed_cycle_does_not_consume_the_cadence():
+    """On a flapping link, letting a failure mark the sweep as done would
+    make the next cycle "not due" and could starve C-7 indefinitely while
+    every individual failure looked harmless.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    client = ScriptedClient([SASTimeoutError("no response")],
+                            table_c7_values={0x0000: 4290})
+    poll_and_log(client, conn, state, HistoryConfig(mode="ring"),
+                 monotonic_fn=clock, table_c7_interval=3600)
+    assert state.last_c7_sweep is None
+
+
+def test_the_latest_c7_view_skips_the_null_cycles():
+    conn = make_db()
+    conn.execute("INSERT INTO meters_history (polled_at, c7_total_coin_in_credits) "
+                 "VALUES ('2026-10-27T01:00:00', 100)")
+    conn.execute("INSERT INTO meters_history (polled_at, c7_total_coin_in_credits) "
+                 "VALUES ('2026-10-27T02:00:00', NULL)")
+    conn.execute("INSERT INTO meters_current (polled_at, c7_total_coin_in_credits) "
+                 "VALUES ('2026-10-27T03:00:00', NULL)")
+    row = conn.execute("SELECT polled_at, c7_total_coin_in_credits "
+                       "FROM latest_c7_meters").fetchone()
+    assert row == ("2026-10-27T01:00:00", 100)
