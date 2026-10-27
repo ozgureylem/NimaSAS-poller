@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import textwrap
 from collections import defaultdict
 from pathlib import Path
 
@@ -80,6 +81,124 @@ def read_all(client) -> dict[int, int | None]:
     return out
 
 
+# The identities Table C-7 states outright, in the meter's own description.
+# Eight carry a literal "[same as meter ...]" annotation; the last two say
+# "sum of" in prose. These are not coincidences to be broken apart -- they
+# are the same number BY DEFINITION, so no amount, count or event will ever
+# separate them, and a labelling run that tries is wasted.
+#
+# They are worth checking rather than merely asserting: the arithmetic is a
+# genuine cross-check of the machine's metering, and a machine that fails one
+# is reporting something inconsistent.
+# The identities Table C-7 states outright, in the meter's own description.
+# Eight carry a literal "[same as meter ...]" annotation; the last two say
+# "sum of" in prose.
+#
+# The distinction between a one-part and a multi-part identity matters, and
+# it is the difference between a wasted test and a useful one:
+#
+#   000F = 0082 is PERMANENT. The two are the same number for good, so no
+#   amount, count or event will ever separate them, and a labelling run that
+#   tries is wasted effort.
+#
+#   000D = 0080 + 0084 is CONDITIONAL. 000D equals 0080 only while 0084 is
+#   zero -- so the collision is real today and breaks the moment a
+#   nonrestricted ticket is redeemed. That one IS worth a test, and the test
+#   is naming the path rather than the amount.
+#
+# They are worth checking rather than merely asserting: the arithmetic is a
+# genuine cross-check of the machine's metering, and a machine that fails one
+# is contradicting the spec's own definition of its meter.
+SPEC_IDENTITIES = (
+    (0x000D, (0x0080, 0x0084), "total SAS cashable ticket in"),
+    (0x000E, (0x0086, 0x008A), "total SAS cashable ticket out"),
+    (0x000F, (0x0082,),        "total SAS restricted ticket in"),
+    (0x0010, (0x0088,),        "total SAS restricted ticket out"),
+    (0x0011, (0x0081, 0x0085), "total SAS cashable ticket in (quantity)"),
+    (0x0012, (0x0087, 0x008B), "total SAS cashable ticket out (quantity)"),
+    (0x0013, (0x0083,),        "total SAS restricted ticket in (quantity)"),
+    (0x0014, (0x0089,),        "total SAS restricted ticket out (quantity)"),
+    (0x0022, (0x0001, 0x0002), "total won"),
+    (0x0023, (0x0003, 0x0002), "total hand paid"),
+)
+
+
+def sas_only(code: int) -> bool:
+    """Whether this meter counts only what arrived through SAS.
+
+    The note under Table C-7's validation block: "Meter codes 0080 through
+    0093 and 00A0 through 00BD include only amounts accumulated using the SAS
+    protocol. They do not include amounts from any other process or
+    protocol."
+
+    That is the whole difference between those two blocks and their
+    all-sources counterparts in 0015-0039. On a cabinet where a gateway is
+    the only electronic route in or out -- a lab machine, and most production
+    machines -- the two hold identical numbers forever, and no choice of
+    amount changes it. Only an amount arriving by some NON-SAS process would
+    separate them, which is not a thing a SAS host can arrange.
+    """
+    return 0x0080 <= code <= 0x0093 or 0x00A0 <= code <= 0x00BD
+
+
+def explain(codes: list[int], values: dict[int, int]) -> tuple[list[str], str]:
+    """(notes about this group, what to do about what is left of it).
+
+    A declared identity explains part of a group, never the whole of it: at a
+    value of 1, "games won" sits beside half a dozen ticket quantities for no
+    better reason than that each happened once. Calling the group as a whole
+    "defined equal" would assert a relationship between those that the spec
+    does not state -- so identities are pulled out as their own notes and the
+    verdict speaks only for what remains genuinely ambiguous.
+    """
+    members = set(codes)
+    notes: list[str] = []
+    accounted: set[int] = set()
+
+    for total, parts, name in SPEC_IDENTITIES:
+        present = members & set(parts)
+        if total not in members or not present:
+            continue
+        if len(parts) == 1:
+            notes.append(
+                f"{total:04X} and {parts[0]:04X} are the SAME METER: Table C-7 "
+                f"defines {total:04X} as '[same as meter {parts[0]:04X}]'. "
+                f"Permanently equal -- record the identity, do not try to "
+                f"break it.")
+            accounted |= {total, parts[0]}
+        else:
+            missing = [p for p in parts if values.get(p, 0) == 0]
+            others = " + ".join(f"{p:04X}" for p in parts)
+            if missing:
+                notes.append(
+                    f"{total:04X} = {others} per Table C-7, and it equals "
+                    f"{', '.join(f'{p:04X}' for p in present)} here only because "
+                    f"{', '.join(f'{p:04X}' for p in missing)} is still zero. "
+                    f"Put something down that path and they separate.")
+                accounted |= {total} | present
+            else:
+                notes.append(f"{total:04X} = {others} per Table C-7.")
+
+    remaining = sorted(members - accounted)
+    if len(remaining) < 2:
+        return notes, ("Nothing else in this group is ambiguous once those "
+                       "identities are accounted for.")
+    if all(is_count(c) for c in remaining):
+        return notes, (
+            f"The other {len(remaining)} count events, not money, so distinct "
+            f"AMOUNTS do nothing for them. Separate them with distinct event "
+            f"COUNTS -- one ticket down one path, two down another.")
+    pair = [c for c in remaining if sas_only(c)]
+    if pair and len(pair) != len(remaining):
+        return notes, (
+            "The rest pair a SAS-only meter with an all-sources one (C-7's "
+            "note on 0080-0093 / 00A0-00BD). Equal while the gateway is the "
+            "only route in or out, and no amount changes that -- only a "
+            "non-SAS transfer would, which a SAS host cannot arrange.")
+    return notes, (f"The other {len(remaining)} are simply equal by chance. "
+                   f"Distinct amounts will separate them.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -113,10 +232,35 @@ def main() -> int:
           f"{len(unsupported)} not implemented")
     print(f"{len(zero)} read zero, {len(nonzero)} hold a value\n")
 
+    # --- the identities the spec declares, checked rather than assumed ----
+    print("--- Identities Table C-7 declares -------------------------------\n")
+    print("  Each of these is stated in the meter's own description, so the")
+    print("  arithmetic is a cross-check of the machine's metering rather than")
+    print("  an assumption about it.\n")
+    identity_failures = []
+    for total, parts, name in SPEC_IDENTITIES:
+        if total not in answered or any(p not in answered for p in parts):
+            continue
+        lhs = answered[total]
+        rhs = sum(answered[p] for p in parts)
+        parts_text = " + ".join(f"{p:04X}" for p in parts)
+        mark = "OK  " if lhs == rhs else "FAIL"
+        print(f"  {mark} {total:04X} = {parts_text:<15} {lhs:>12,} vs {rhs:>12,}   {name}")
+        if lhs != rhs:
+            identity_failures.append((total, parts, lhs, rhs))
+    if identity_failures:
+        print()
+        print("  A FAIL is the machine contradicting Table C-7's own definition of")
+        print("  the meter. Worth confirming against the screen before trusting")
+        print("  either side of it -- and worth reporting, since a CMS reconciling")
+        print("  on the declared identity would be reconciling on a false premise.")
+    print()
+
     print("--- Meters that cannot be distinguished from each other ----------\n")
     print("  Two meters holding the same number cannot both be matched to a")
-    print("  screen line with any confidence. These are the pairs a labelling")
-    print("  run has to break apart.\n")
+    print("  screen line with any confidence. But only some of these can be")
+    print("  broken apart by choosing better amounts, so each group carries the")
+    print("  verdict: pushing money at the others achieves nothing.\n")
 
     # Bucket by (kind, value), not value alone: 7 games won and 7 cents are
     # not the same number for this purpose, and pairing them would invent an
@@ -142,7 +286,14 @@ def main() -> int:
                 shown = f"{value:,}"
             print(f"  {len(codes)} meters all read {shown}:")
             for code in sorted(codes):
-                print(f"      {code:04X}  {label(code)}")
+                flag = "  (SAS only)" if sas_only(code) else ""
+                print(f"      {code:04X}  {label(code)}{flag}")
+            notes, remedy = explain(sorted(codes), nonzero)
+            for note in notes:
+                for i, line in enumerate(textwrap.wrap(note, 62)):
+                    print(f"      = {line}" if i == 0 else f"        {line}")
+            for i, line in enumerate(textwrap.wrap(remedy, 62)):
+                print(f"      -> {line}" if i == 0 else f"         {line}")
             print()
 
     if zero:
