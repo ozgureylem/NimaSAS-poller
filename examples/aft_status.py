@@ -17,10 +17,16 @@ credits?" is three questions, and only the last one moves money:
   3. Only then, a transfer.
 
 Worth knowing before step 3: of everything in this library, 0x72 is the
-one command that moves money, and on this project it has never run
-against hardware. A transfer that half-completes can leave the machine
-locked waiting on a host reply, and recovering that can end in a RAM
-clear -- which zeroes the meters you just validated.
+one command that moves money. It HAS now run against hardware -- pushes
+to the machine and host-initiated cashouts both, cleanly, with the
+meters balancing to the cent -- so the warning this paragraph used to
+carry ("has never run against hardware") is retired rather than left to
+be ignored. What remains true is the failure mode: a transfer that
+half-completes can leave the machine locked waiting on a host reply, and
+recovering that can end in a RAM clear, which zeroes the meters you just
+validated. Every observed transfer so far went 0x40 PENDING first and
+needed the interrogation poll to settle, so treat a PENDING as unfinished
+business rather than a result.
 
     python3 examples/aft_status.py /dev/ttyS0 --address 1
 """
