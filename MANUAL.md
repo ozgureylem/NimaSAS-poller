@@ -1774,11 +1774,19 @@ are cashed out by the machine's own means, which on a cabinet with a working
 printer means a printed ticket. It is a useful feature and the exact opposite
 of what an electronic cashout is for, so `aft_cashout.py` sends flags `00`.
 
-Restricted credits are the case where the electronic route is not merely
-tidier but the only legitimate one. Section 8 forbids restricted amounts
-leaving on a normal cashout ticket, from the hopper, or by attendant
-handpay. Returning them to the host preserves their restricted status, so
-transfer type `80` can carry them where a ticket-out never could.
+Restricted credits can leave by this route, and that is worth stating
+carefully because an earlier draft of this section overstated it. §8 says
+restricted amounts "may only be removed from a gaming machine by methods that
+preserve the restricted status of the amounts, such as by transferring
+restricted amounts to the host **or printing restricted tickets**. They must
+never be cashed out on a normal cashout ticket, from the hopper, or by an
+attendant handpay."
+
+So transfer type `80` is *a* legitimate route, not *the* legitimate route. A
+**restricted** ticket is equally valid — and the lab machine has done exactly
+that, with 29.10 recorded at `002D`, total restricted promotional ticket out.
+What is forbidden is a *normal cashout* ticket, the hopper, and a handpay.
+The distinction is the ticket's type, not paper versus wire.
 
 ### 7.5 A pending handpay blocks everything, and may clear without a key
 
