@@ -1947,6 +1947,94 @@ by hand at a cabinet, where typing the port is less friction than keeping a
 file in step with it. That is a defensible split, not an accident — but it
 is still a split, and it is the kind that only bites people who use both.
 
+### 7.7 Surveying machines on a live floor, headless
+
+The goal: carry the gateway to a cabinet, plug it into the SAS port, plug in
+power, wait under a minute, unplug both, move on — with no keyboard, no
+screen, no network and no login. Collect identity and every meter, change
+nothing.
+
+That is buildable, and `deploy/` has the two pieces:
+
+```bash
+sudo cp deploy/nimasas-floor-survey.service /etc/systemd/system/
+sudo systemctl enable nimasas-floor-survey     # enable, NOT start
+```
+
+On every boot from then on the gateway reads the machine, writes a JSON
+keyed by the machine's own serial and asset number, syncs, and **powers
+itself off**. The power light going out is the "done" signal — which is also
+what makes it safe to pull the plug, because the filesystem is unmounted
+before the operator touches it. Without a screen there is no other way to
+know, and yanking power mid-write is how a card gets corrupted.
+
+`sudo systemctl disable nimasas-floor-survey` gives the gateway back. Left
+enabled, every boot ends in a poweroff, which makes it very hard to log into.
+
+#### What you get per cabinet
+
+Everything asked for, and it is already what `meter_snapshot.py` collects:
+
+| | source |
+|---|---|
+| serial number, SAS version | LP `0x54` |
+| asset number, all three balances | LP `0x74` |
+| game ID, additional ID, denomination code, max bet, games implemented | LP `0x1F` |
+| per-game name, paytable, max bet, progressive group, wager categories | LP `0xB5` per game — 48 of them on the lab EGT |
+| every Table C-7 meter it implements, and which it does not | LP `0x6F`/`0xAF` |
+| the machine's own date and time | LP `0x7E` |
+
+That last one is not padding. A gateway carried round a floor has no network
+and may have a flat RTC battery, so its own clock can be arbitrarily wrong —
+and then every file's `taken_at_utc` is wrong together while looking
+perfectly fine. The EGM keeps its own time, so the survey records both and
+their disagreement tells you later which clock to distrust.
+
+#### The part that needs care, and it is not technical
+
+**Never plug into a SAS port that a live host is already driving.** Two
+masters on one RS-485 line collide electrically; both sides see CRC failures
+and timeouts, and the casino's system starts logging faults against a machine
+that is fine. If the cabinet is wired to a CMS, the cable has to be swapped,
+not shared — and that is an operations decision, not a technical one.
+
+**Survey idle cabinets.** This is the constraint most likely to be missed.
+§2.2.1 requires a FIFO exception queue "of at least 20 elements in
+non-volatile memory", and says that "in the event of exception queue
+overrun, the oldest exception is lost". While the CMS cable is unplugged
+nothing is draining that queue. On an idle machine almost nothing is
+generated and a 90-second swap costs the CMS nothing. On a machine being
+played, a single player generates around 2.4 exceptions a second — so a
+20-element queue fills in about eight seconds, and the host gets exception
+`0x70`, buffer overflow, plus a hole in its accounting when the cable goes
+back.
+
+So the rule is: **nobody playing, cable swapped rather than shared, back
+within the minute.** None of that is about this software being unsafe — it
+is about what any second host on a SAS line costs the first one.
+
+What this survey genuinely cannot do to a machine is worth stating too.
+`meter_snapshot.py` sends long polls only and **never a general poll**, so it
+cannot consume a queued exception even while it is connected. It sends no
+AFT transfer, no handpay reset, no validation answer, and no enable/disable.
+`tests/test_deploy_floor_survey.py` asserts the wrapper cannot be edited into
+calling a tool that would.
+
+#### Timing
+
+The boot dominates. A full sweep is a few seconds; a micro-PC takes 20–40s
+to reach the unit. Budget a minute per cabinet and measure the first one
+against a watch before planning a route round the floor. If boot is the
+bottleneck, that is a systemd problem (`systemd-analyze blame`) rather than
+a SAS one.
+
+The script's own ceiling is `NIMASAS_BUDGET_SECONDS`, 90 by default, so a
+cabinet that does not answer — wrong address, dead cable — gives up and
+powers off instead of holding the operator there. The log in the survey
+directory distinguishes "timed out" from "could not open the port" from
+"failed", which is the only diagnosis available after the fact when there was
+never a screen.
+
 ## 8. Where to go next
 
 - `README.md` — repository layout and the licensing note on

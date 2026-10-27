@@ -279,6 +279,14 @@ def main() -> int:
     version = try_call("LP 0x54 version/serial", client.send_sas_version_and_serial)
     machine = try_call("LP 0x1F machine id", client.send_gaming_machine_id)
     lock = try_call("LP 0x74 lock/status", client.aft_game_lock_and_status_request, 0xFF)
+    # The MACHINE's own clock, which matters more than it looks on a gateway
+    # carried from cabinet to cabinet with no network and possibly no RTC
+    # battery: this host's clock may be arbitrarily wrong, and then every
+    # snapshot's taken_at_utc is wrong together while looking fine. The EGM
+    # keeps its own time and is the better ordering key for a floor survey.
+    # Disagreement between the two is worth recording rather than resolving:
+    # it says which clock to distrust later.
+    egm_clock = try_call("LP 0x7E date/time", client.send_current_date_and_time)
     games = try_call("LP 0x51 games implemented",
                      client.send_meter, LongPoll.SEND_TOTAL_GAMES_IMPLEMENTED)
 
@@ -329,6 +337,11 @@ def main() -> int:
             "denomination_code": machine.denomination if machine else None,
             "max_bet": machine.max_bet if machine else None,
             "games_implemented": games,
+            # MMDDYYYY and HHMMSS as the machine reports them (Table 7.?),
+            # left as strings: reformatting invites a timezone assumption
+            # nothing here is entitled to make.
+            "machine_date": egm_clock.date if egm_clock else None,
+            "machine_time": egm_clock.time if egm_clock else None,
         },
         "games": game_info,
         # From 0x74, the only native source for the nonrestricted balance --
