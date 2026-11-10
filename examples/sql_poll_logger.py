@@ -117,9 +117,12 @@ What each cycle does, in order:
    the sweep fail on essentially every real machine it's run against.
 
 Every cycle's log line reports how long the meter poll took and across
-how many long-poll exchanges (``meter_poll=X.XXXs/N polls``) — measured
-wall-clock time against whatever this ran against, not a theoretical
-number. That's the real answer to "does this many polls fit inside
+how many exchanges (``meter_poll=X.XXXs/Nlp+Mgp``: N long polls and M
+heartbeat general polls, which §2.3.3 counts against one budget) —
+measured wall-clock time against whatever this ran against, not a
+theoretical number. The counts are what the cycle actually sent, so a
+C-7 sweep that was enabled but not due this cycle is not in them.
+That's the real answer to "does this many polls fit inside
 --interval on real hardware," and it comes with a WARNING if the meter
 poll alone is at or above --interval, with no separate flag needed to
 turn it on. --skip-full-meter-sweep is the lever if it doesn't fit.
@@ -255,7 +258,9 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
+import signal
 import random
 import sqlite3
 import sys
@@ -270,14 +275,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from saspy.config import connect_from_config
 from saspy.constants import (
+    AFT_TRANSFER_CODE_FULL_ONLY,
+    HANDPAY_RESET_CODES,
     SIMPLE_METER_WIDTH_BCD,
+    AftTransferType,
     ExceptionCode,
     LongPoll,
     MeterCode,
     ValidationType,
+    describe_aft_transfer_status,
+    clarify_exception,
     describe_exception,
 )
-from saspy.exceptions import SASError, SASPortCapabilityError, SASTimeoutError
+from saspy.exceptions import SASPreempted, SASError, SASPortCapabilityError, SASTimeoutError
+from saspy.bcd import decode_bcd
 from saspy.models import EnhancedValidationInfo
 
 DEFAULT_VALIDATION_SYSTEM_ID = 1  # 0 means "deny" per Table 15.8a — never use it for a real pool entry
@@ -516,7 +527,35 @@ assert set(PRIORITY_METER_COLUMNS) <= set(_ALL_GROUPED_METER_COLUMNS), (
 ALL_METER_FIELDS = PRIORITY_METER_COLUMNS + tuple(
     f for f in _ALL_GROUPED_METER_COLUMNS if f not in PRIORITY_METER_COLUMNS
 )
-DECREASE_CHECK_FIELDS = tuple(f for f in ALL_METER_FIELDS if f not in GAUGE_METER_FIELDS)
+# A third category, and the EGM proving it on 2026-10-28 is why it exists.
+# These are not cumulative counters and not free-moving gauges: they count
+# up from zero and are RESET BY A SPECIFIC EVENT. "Games since last power
+# reset" going 13 -> 0 is not an anomaly, it is the power cycle. The lab
+# cabinet lost power mid-soak, these dropped, and the run logged "meter
+# decrease detected" for something that had behaved exactly as specified.
+#
+# The consequence outside this file is worse than a spurious burst. The
+# rollover correction in the Linux migration spec §8.2 prepends an unbounded
+# generation digit on a confirmed drop, so applying it here would turn a
+# legitimate reset of 13 -> 0 into 100,000,000 -- permanently, since the
+# corrected value is defined to be monotonic forever. Any host doing
+# missing-digit correction has to exclude these by name.
+#
+# Note what is NOT here: lp1c_slot_door_opened and lp1c_power_reset are, per
+# Table 7.2c, the "slot door opened meter" and "power reset meter" -- counts
+# of how many times each has happened, which only ever rise.
+RESET_ON_EVENT_METER_FIELDS = frozenset(
+    {
+        "lp18_games_since_power_up",        # Table 7.7
+        "lp18_games_since_door_closure",    # Table 7.7
+        "c7_games_since_last_power_reset",  # MeterCode 0x25
+        "c7_games_since_slot_door_closure",  # MeterCode 0x26
+    }
+)
+
+DECREASE_CHECK_FIELDS = tuple(
+    f for f in ALL_METER_FIELDS
+    if f not in GAUGE_METER_FIELDS and f not in RESET_ON_EVENT_METER_FIELDS)
 
 # The 8 long-poll exchanges _poll_all_meters() always makes, regardless of
 # --skip-full-meter-sweep/--skip-table-c7-sweep: send_meters_10_through_15,
@@ -559,16 +598,88 @@ CREATE TABLE IF NOT EXISTS machine_epochs (
 CREATE INDEX IF NOT EXISTS idx_machine_epochs_unack
     ON machine_epochs (acknowledged_at);
 
+CREATE TABLE IF NOT EXISTS credit_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sampled_at TEXT NOT NULL,
+    credits INTEGER NOT NULL,
+    -- How many general polls had been spent on this sweep when the sample
+    -- was taken. Non-decreasing within a cycle; a large step between two
+    -- samples means the sampler was suppressing itself, which is the
+    -- design working rather than a gap in the data.
+    heartbeats INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_samples_at ON credit_samples (sampled_at);
+
 CREATE TABLE IF NOT EXISTS machine_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     occurred_at TEXT NOT NULL,
     exception_code INTEGER NOT NULL,
     description TEXT NOT NULL,
-    source TEXT NOT NULL,          -- 'cycle' or 'heartbeat'
+    -- 'cycle', 'heartbeat', 'rte' (the event a general poll returned under
+    -- real time event mode) or 'rte-interleaved' (an event that arrived in
+    -- place of a LONG poll's response, per 12.3, and was collected by the
+    -- client rather than discarded).
+    source TEXT NOT NULL,
+    -- The decoded Table 12.5 data, as JSON, for events that carry any.
+    -- NULL under ordinary polling, where an exception is a bare code with
+    -- no payload at all -- which is the whole reason RTE exists.
+    rte_fields TEXT,
     synced_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_machine_events_at ON machine_events (occurred_at);
+
+-- What a full interrogation found, on first connect and after a comms gap
+-- long enough for someone to have moved the cable.
+--
+-- The trigger is a PHYSICAL-ACT threshold, not a data-loss one. Events are
+-- already gone after ~8 seconds of silence on a played machine (§2.2.1's
+-- 20-element queue against ~2.4 exceptions/sec), and no sweep brings them
+-- back. What a sweep CAN establish is whether the thing now answering is
+-- the same machine, configured the same way, as the thing that was
+-- answering before -- and unplugging a cable, walking to another cabinet
+-- and plugging in takes far longer than 30 seconds.
+CREATE TABLE IF NOT EXISTS interrogations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    reason TEXT NOT NULL,            -- 'first_connect' | 'comms_restored' | 'options_changed'
+    gap_seconds REAL,                -- NULL on first connect
+    epoch_id INTEGER,
+    serial_number TEXT,
+    asset_number INTEGER,
+    sas_version TEXT,
+    -- Set when this interrogation found a DIFFERENT machine than the one
+    -- the previous epoch recorded. The whole point of the exercise.
+    machine_changed INTEGER NOT NULL DEFAULT 0,
+    identity_note TEXT,
+    enabled_features TEXT,           -- JSON, LP 0xA0 Tables 7.14c-e
+    games_found INTEGER,
+    ticket_out_records INTEGER,
+    last_redeemed TEXT,              -- JSON, LP 0x71/FF
+    duration_seconds REAL,
+    note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS interrogation_games (
+    interrogation_id INTEGER NOT NULL REFERENCES interrogations(id) ON DELETE CASCADE,
+    game_number INTEGER NOT NULL,
+    -- LP 0x53
+    game_id TEXT,
+    additional_id TEXT,
+    denomination INTEGER,
+    max_bet INTEGER,
+    progressive_group INTEGER,
+    game_options INTEGER,
+    paytable_id TEXT,
+    base_percentage TEXT,
+    -- LP 0xB5, which carries the human-readable names 0x53 does not
+    game_name TEXT,
+    paytable_name TEXT,
+    progressive_levels INTEGER,
+    wager_categories INTEGER,
+    PRIMARY KEY (interrogation_id, game_number)
+);
 
 CREATE TABLE IF NOT EXISTS poll_errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -576,6 +687,30 @@ CREATE TABLE IF NOT EXISTS poll_errors (
     poll_name TEXT NOT NULL,
     error_type TEXT NOT NULL,
     message TEXT
+);
+
+-- WHY A RUN ENDED, written to the DATABASE rather than to stdout.
+--
+-- 2026-11-08: the operator asked why the previous soak stopped. The poller
+-- prints its reason on every exit path -- "Stopped (signal 15)", a
+-- traceback, a serial-port message -- and prints it to the nohup log, which
+-- was gone. So a six-day run ended for a reason that existed, was written
+-- down, and could not be recovered. The database survived; the one line
+-- that mattered did not.
+--
+-- THE ABSENCE OF A ROW IS THE FINDING. A clean stop, a caught signal, an
+-- unhandled exception and a serial failure can all write 'stopped'. SIGKILL
+-- cannot -- not an OOM kill, not `kill -9`, not a power cut. So a 'started'
+-- row with no matching 'stopped' is positive evidence that the process was
+-- ended by something it could not catch, which is exactly the distinction
+-- nobody could make about 2026-11-08T17:16.
+CREATE TABLE IF NOT EXISTS poller_lifecycle (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    event TEXT NOT NULL,          -- 'started' | 'stopped'
+    reason TEXT,                  -- 'signal 15', an exception repr, 'end of run'
+    pid INTEGER,
+    argv TEXT
 );
 
 CREATE TABLE IF NOT EXISTS ticket_out_history (
@@ -601,6 +736,11 @@ CREATE TABLE IF NOT EXISTS ticket_in_events (
     amount_cents INTEGER,
     parsing_code INTEGER,
     validation_data_hex TEXT,
+    -- NULL unless --lab-ticket-authority answered this one. What the
+    -- gateway told the machine, and what the machine said back: the
+    -- decision is not recoverable from the meters afterwards, because a
+    -- denied ticket moves nothing at all.
+    authority_decision TEXT,
     synced_at TEXT
 );
 
@@ -638,6 +778,37 @@ CREATE VIEW IF NOT EXISTS latest_c7_meters AS
     ORDER BY polled_at DESC, id DESC
     LIMIT 1;
 
+-- Exception 0x69, AFT transfer complete, and what the acknowledging
+-- interrogation found. §8.8 makes acknowledging MANDATORY rather than
+-- optional: "if the host does not respond with a proper interrogation poll,
+-- the gaming machine must reissue exception 69 every 15 seconds until the
+-- host polls for and acknowledges the completion status" -- measured at 15.2s
+-- on an EGT Premier. And 0x69 is a PRIORITY exception, so it bypasses the
+-- §2.2.1 queue and is delivered ahead of everything waiting: an
+-- unacknowledged transfer puts a permanent 15-second beat at the FRONT of the
+-- stream and pushes real events further back.
+--
+-- The amounts are recorded as the machine reported them, not as this tool
+-- asked for them, because a partial transfer is the case where the two differ
+-- and the difference is the whole point of reading it back.
+CREATE TABLE IF NOT EXISTS aft_transfer_completions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    buffer_position INTEGER,
+    transfer_status INTEGER,
+    receipt_status INTEGER,
+    transfer_type INTEGER,
+    cashable_amount INTEGER,
+    restricted_amount INTEGER,
+    nonrestricted_amount INTEGER,
+    transaction_id TEXT,
+    transaction_date TEXT,
+    transaction_time TEXT,
+    asset_number INTEGER,
+    note TEXT,
+    synced_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS handpay_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     captured_at TEXT NOT NULL,
@@ -650,6 +821,41 @@ CREATE TABLE IF NOT EXISTS handpay_queue (
     synced_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS stream_gaps (
+    -- EVERY TIME THE EVENT STREAM FAILED ITS OWN ARITHMETIC.
+    --
+    -- §12.5.3 puts the coin-in meter INSIDE every game-start event, after
+    -- the wager. So two consecutive starts must differ by exactly the later
+    -- one's wager, and when they do not, a game start went missing and the
+    -- excess says how much was wagered in it.
+    --
+    -- This needs no meters at all, which is the point: it is the one check
+    -- that can run on every single event and tell the operator, while he is
+    -- standing there, that RTE and the meters have diverged. It found nine
+    -- lost game starts on 2026-11-06 -- three hours after they happened,
+    -- because nothing ran it until somebody asked by hand.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    detected_at TEXT NOT NULL,
+    previous_at TEXT,
+    previous_coin_in INTEGER,
+    this_coin_in INTEGER,
+    this_wager INTEGER,
+    unexplained_credits INTEGER NOT NULL,
+    synced_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS lab_auto_actions (
+    -- LAB ONLY. Every time this poller moved money or cleared a lockup by
+    -- itself. A gateway that does either without a human is a cash-dispensing
+    -- defect on a floor; in a lab running overnight it is the only way to keep
+    -- a cabinet spinning. The row is the audit trail that says which it was.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL,
+    action TEXT NOT NULL,          -- 'handpay_reset' | 'aft_credit'
+    detail TEXT,
+    outcome TEXT,
+    synced_at TEXT
+);
 CREATE TABLE IF NOT EXISTS validation_pool (
     validation_number INTEGER PRIMARY KEY,
     validation_system_id INTEGER NOT NULL,
@@ -658,6 +864,66 @@ CREATE TABLE IF NOT EXISTS validation_pool (
     assigned_at TEXT,
     assigned_amount_cents INTEGER
 );
+
+-- THE INBOUND COMMAND CHANNEL. Every other table in this schema is
+-- OUTBOUND -- the gateway writes, a server drains. validation_pool is
+-- inbound but it is DATA, not a command: nobody is waiting on it.
+--
+-- WfA ("Waiting for Amount") is the flow that needs the other direction. The
+-- server holds a ticket's validation number from the pool but not its value,
+-- because the dispense-detail drain never arrived -- the micro-PC-to-server
+-- LAN was down when the ticket printed, and dispense is deliberately
+-- local-only so it keeps working when that link is down. A cashier then
+-- scans the ticket at the cage and somebody has to ask the EGM what it was
+-- worth, right now, with a customer waiting.
+--
+-- So: a server INSERTs a row here and polls it for an answer. The poller
+-- owns the serial port and is the only process that can speak to the
+-- cabinet (one port, one master), so the request has to come to it.
+--
+-- STATES. pending -> claimed -> done | failed | expired. A request is never
+-- deleted by the poller; the server reads its own answer and is responsible
+-- for retention.
+--
+-- WHY A TABLE AND NOT A SOCKET. The database is already WAL, already
+-- durable across a power cut, already the thing the server drains, and
+-- already has a busy timeout. A socket would need its own lifecycle, its
+-- own restart semantics and its own audit trail. A request that survives a
+-- gateway reboot and can be read afterwards is worth more than a few
+-- milliseconds.
+CREATE TABLE IF NOT EXISTS host_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- When the SERVER wrote the row. The end-to-end budget is measured from
+    -- here, not from when the poller noticed.
+    requested_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    validation_number INTEGER,
+    -- The hard budget for this request in milliseconds. Past it the poller
+    -- stops spending poll slots and marks the row expired: a cashier who has
+    -- already given up must not still be costing the event stream.
+    deadline_ms INTEGER NOT NULL DEFAULT 1000,
+    state TEXT NOT NULL DEFAULT 'pending',
+    claimed_at TEXT,
+    completed_at TEXT,
+    -- 'local'      -- answered from ticket_out_history, ZERO poll slots
+    -- 'buffer-walk'-- answered by walking LP 0x4D, one slot per index
+    -- 'cache'      -- a repeat inside the 10 s pull cap, served from the
+    --                 previous answer rather than pulling again
+    served_from TEXT,
+    -- What this request COST the event stream. The number that decides
+    -- whether on-demand pulls are affordable on a busy floor.
+    polls_spent INTEGER NOT NULL DEFAULT 0,
+    -- Measured, so p95 is a measurement and not a claim.
+    latency_ms INTEGER,
+    amount_cents INTEGER,
+    result_json TEXT,
+    error TEXT
+);
+
+-- The poller asks "is there anything pending" at every poll-slot boundary,
+-- so that lookup must never scan.
+CREATE INDEX IF NOT EXISTS idx_host_requests_pending
+    ON host_requests (state, id);
 
 -- Ticket-in history: the two raw capture tables above, correlated into one
 -- row per ticket-in cycle. DROP+CREATE rather than IF NOT EXISTS because a
@@ -827,6 +1093,22 @@ DEFAULT_HISTORY_CAP = 200
 DEFAULT_HISTORY_INTERVAL = 60.0
 DEFAULT_BURST_COUNT = 10
 DEFAULT_GENERAL_POLL_RETRIES = 3
+# How many polls the startup drain will spend clearing a pre-existing queue.
+# §2.2.1 guarantees at least 20 elements; machines hold more (the lab
+# cabinet's is about 35), and a long unattended spell can leave the queue
+# full, so this is generous rather than exact. Capped because a machine
+# emitting faster than we drain would otherwise never let the run start.
+STARTUP_DRAIN_MAX = 64
+
+# How long the link must be down before a recovery is treated as "someone
+# may have moved this cable" rather than "a poll was missed".
+#
+# This is deliberately NOT the data-loss threshold. By §2.2.1's own arithmetic
+# the exception queue is gone after about 8 seconds of silence on a machine
+# being played, and no amount of sweeping afterwards recovers it. 30 seconds
+# is a PHYSICAL-ACT threshold: the time it takes to unplug a cable, walk to
+# another cabinet and plug it in. Nobody does that in less.
+DEFAULT_COMMS_GAP_SECONDS = 30.0
 DEFAULT_POOL_AGE_ALERT_HOURS = 36.0
 
 # SAS 6.02 §2.3.3 ("Polling Rate"): "The host may not issue general polls
@@ -862,13 +1144,111 @@ class PollState:
     # cycle, so a run always captures C-7 at least once however long it lives.
     last_c7_sweep: float | None = None
     burst_remaining: int = 0
+    # DRAIN PRIORITY. When the cabinet is producing events faster than the
+    # sweep leaves room to collect, the optional meter polls are deferred
+    # and the time is spent on general polls instead. See _should_drain().
+    draining: bool = False
+    drain_cycles: int = 0          # how many cycles this run spent draining
+    # What inbound WfA pulls cost the event stream this run, in poll
+    # slots. The number that decides whether on-demand pulls are
+    # affordable on a busy floor -- reported, not assumed.
+    wfa_polls_spent: int = 0
+    last_event_rate: float = 0.0   # events/s measured over the last sweep
+    last_capacity: float = 0.0     # polls/s §2.3.3 pacing allows
     # Continuity. epoch_id is the epoch every meter row written this cycle
     # belongs to; see "Continuity: epochs" above.
     epoch_id: int | None = None
     identity: dict | None = None
     cycles_since_identity: int = 0
+    # Consecutive cycles whose general poll failed outright, and when the
+    # first of them was. Together they are how long the link has been down,
+    # which is the only thing that distinguishes a flaky byte from somebody
+    # walking off with the cable.
+    consecutive_poll_failures: int = 0
+    gap_started_mono: float | None = None
+    interrogation_pending: float | None = None  # gap seconds, once recovered
+    # --rte was asked for, and whether the machine has actually been put into
+    # it. They are not the same thing, and the gap between them is where a
+    # whole soak went: see poll_and_log()'s retry.
+    rte_wanted: bool = False
+    rte_enabled: bool = False
+    # The pool-age alert is one CONDITION, not one event per cycle. These
+    # track the episode so poll_errors gets a record of it rather than a flood
+    # -- see _check_pool_age().
+    # Exception 0x3C seen; the re-read is deferred like the comms-restored
+    # interrogation, for the same reason -- see poll_and_log().
+    options_change_pending: str | None = None
+    # Off unless --decline-aft-cashout is passed. §8.7's stage 1 costs ~8s
+    # on every cashout when nothing answers it; declining skips straight to
+    # the ticket path. Per-model: on a cabinet with no printer "its own
+    # means" is an attendant, so this would make things worse there.
+    decline_aft_cashout: bool = False
+    # §12.5.3's coin-in meter, from the last game-start event seen. The
+    # live continuity check compares each new one against it.
+    last_game_start_coin_in: int | None = None
+    last_game_start_at: str | None = None
+    stream_gaps: int = 0
+    stream_credits_lost: int = 0
+    # Headroom: events collected and the window they arrived in.
+    events_this_cycle: int = 0
+    # SEEN, not filed. events_this_cycle is incremented in
+    # _dispatch_exception, and the heartbeat QUEUES most codes into `seen`
+    # to dispatch after the sweep -- so mid-sweep that counter is still
+    # near zero however hard the cabinet is flooding. The live drain probe
+    # read it anyway and therefore could never fire, which is why
+    # --drain-priority did nothing on its first burst (2026-11-09T00:18).
+    events_seen_live: int = 0
+    # LOSS THAT ACTUALLY HAPPENED, this cycle. Two independent witnesses:
+    # the cabinet's own 0x70, and §12.5.3's arithmetic on the coin-in
+    # carried inside each game start. Neither is a model of the queue --
+    # both are evidence that something is already gone.
+    overflows_this_cycle: int = 0
+    gaps_this_cycle: int = 0
+    # FAST POLLING UNDER PRESSURE. None until the machine has been asked;
+    # True only if LP 0xA0 Table 7.14e bit 0 says it supports 40 ms. Never
+    # assumed: a cabinet that does not advertise it never gets polled fast,
+    # whatever the flags say.
+    fast_poll_supported: bool | None = None
+    normal_poll_interval: float = 0.0   # what to restore when drain ends
+    # THE DECISION MUST NOT MOVE WHEN THE RATE MOVES.
+    #
+    # last_capacity is 1/current interval, so switching to 40 ms multiplies
+    # it by 7.5 -- and the SAME event rate then reads as a seventh of the
+    # budget and drain mode turns straight back off, which restores 300 ms,
+    # which makes it look busy again. Measured 2026-11-09T18:46: ON at 3.3
+    # ev/s "against a 3.3/s budget", OFF two seconds later at 2.59 "against
+    # a 25.0/s budget", repeatedly. The hysteresis cannot help: it guards
+    # the numerator and this moves the DENOMINATOR.
+    #
+    # So the decision uses the BASELINE budget -- what the configured
+    # interval could collect -- which does not change when we temporarily
+    # speed up. The question is "is the cabinet out-running our normal
+    # rate", and the answer must not depend on our answer to it.
+    baseline_capacity: float = 0.0
+    fast_poll_active: bool = False
+    fast_poll_fallback_announced: bool = False
+    pool_stale_since: str | None = None
+    pool_stale_last_row: float | None = None
+    pool_stale_last_print: float | None = None
     clear_candidate_cycles: int = 0
     clear_first_seen_at: str | None = None
+    # LAB ONLY, and None unless --lab-ticket-authority was given. See
+    # _capture_ticket_in() for why this tool is otherwise read-only on
+    # ticket-in, and why a file is what lifts that rather than a flag alone.
+    ticket_authority: dict | None = None
+    ticket_authority_binding: object | None = None  # ticket_lab_authority.MachineBinding
+    ticket_authority_path: str | None = None
+    # LAB ONLY, and only ever set when --lab-ticket-authority is also in
+    # effect. See LabAutoConfig for why that file is the gate.
+    #
+    # handpay_pending_since is monotonic, not wall clock: it is measuring how
+    # long a lockup has gone unattended, and a clock that can step backwards
+    # over NTP would make that negative.
+    handpay_pending_since: float | None = None
+    handpay_resets: int = 0
+    aft_pushes: int = 0
+    aft_cents_pushed: int = 0
+    aft_last_push_mono: float | None = None
     # The meters as they stood BEFORE the first zeroed reading. Confirmation
     # has to compare against this, not against the previous cycle: once the
     # first zero is in, last_meters is zero too, nothing can "fall to zero"
@@ -949,6 +1329,37 @@ CLEAR_FRACTION = 0.8
 IDENTITY_CHECK_CYCLES = 120
 
 
+# How long a second writer waits for the poller's write lock before giving up.
+# The poller's own cycle is 5-7s at 300ms pacing, so anything near SQLite's
+# default (and Python's 5s) loses the race on a busy gateway. §5.4's "replace
+# the pool without restarting anything" is only true if the replacement is
+# willing to wait out one cycle.
+GATEWAY_DB_BUSY_TIMEOUT_MS = 30_000
+
+
+def open_gateway_db(path: str, *, busy_timeout_ms: int = GATEWAY_DB_BUSY_TIMEOUT_MS):
+    """Open the gateway database the way every writer to it must.
+
+    TWO PRAGMAS, AND BOTH WERE MISSING. Three documents in this repository
+    asserted "SQLite is in WAL mode, so a second writer is fine"; nothing
+    anywhere ever set it. The database was in the default rollback-journal
+    mode, where a writer takes an EXCLUSIVE lock that blocks readers too --
+    the opposite of what the claim promised, and nobody had run the two tools
+    against each other to find out.
+
+    It surfaced as `sqlite3.OperationalError: database is locked` from
+    pool_replace.py's BEGIN IMMEDIATE while a soak was running, i.e. in
+    exactly the live-replacement case §5.4 describes a CMS performing.
+
+    journal_mode is persistent: set once, it stays in the file. busy_timeout
+    is per-connection and must be set by every process that writes.
+    """
+    conn = sqlite3.connect(path, timeout=busy_timeout_ms / 1000)
+    conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
 def read_identity(client) -> dict:
     """Who is answering. Every field is optional -- section 4.4 lets a machine
     ignore a long poll it does not support, and an unreadable identity is not
@@ -970,15 +1381,241 @@ def read_identity(client) -> dict:
     return identity
 
 
+def ticket_authority_binding_verdict(binding, identity: dict | None, *,
+                                     allow_unverified: bool) -> tuple[str, str] | None:
+    """Whether a run holding a bound ticket file may talk to this cabinet.
+
+    Returns None to proceed, or (reason, detail). Three cases that look alike
+    and are not:
+
+    MISMATCHED -- the machine identified itself and it is the wrong one.
+    Always fatal. No flag overrides it, because an operator cannot know better
+    than the cabinet's own identifiers.
+
+    UNVERIFIABLE -- nothing comparable. §4.4 lets a machine ignore LP 0x54 and
+    the lab EGM does, so a file bound only by serial cannot be checked against
+    it at all. Fatal by default (an unenforceable binding is not a binding),
+    overridable by an operator standing at the machine.
+
+    UNBOUND -- the file names no cabinet. Permitted, because whoever wrote the
+    file chose that, but it is said loudly.
+
+    SERIAL WINS WHERE BOTH EXIST, AND AN ASSET MISMATCH DOES NOT VETO IT. A
+    RAM clear wipes the asset number while the serial survives, so refusing a
+    cabinet whose serial matches because its asset was retyped would block a
+    legitimate machine after every clear. The fallback runs only where the
+    serial cannot be compared at all.
+
+    The original check was ``if seen and seen.strip() != bound``, which
+    silently treated UNVERIFIABLE as fine. Replacing that with a bare refusal
+    treated it as MISMATCHED and killed a running soak on a command line that
+    had worked minutes before. Both failures came from one conflation.
+    """
+    if binding is None or not binding.is_bound():
+        return ("unbound", "the ticket file names no cabinet at all")
+
+    seen_serial = usable_serial(identity)
+    if binding.serial is not None and seen_serial is not None:
+        if seen_serial != binding.serial.strip():
+            return ("mismatch",
+                    f"ticket file is for serial {binding.serial!r} but this "
+                    f"cabinet is {seen_serial!r}")
+        return None  # Serial is authoritative; the asset cannot overrule it.
+
+    seen_asset = usable_asset(identity)
+    if binding.asset is not None and seen_asset is not None:
+        if seen_asset != binding.asset:
+            return ("mismatch",
+                    f"ticket file is for asset {binding.asset} but this "
+                    f"cabinet is asset {seen_asset}")
+        return None
+
+    if allow_unverified:
+        return None
+    return ("unverifiable",
+            f"this cabinet reports {machine_key(identity) or 'no identity at all'} "
+            f"and the ticket file is bound to {binding.describe()}, so the "
+            "binding cannot be checked")
+
+
+# Imported, never copied: two placeholder lists drift, and the floor lessons
+# that built this one (an empty serial, all zeros, "n/a", and an IGT cabinet
+# reporting asset 7 with serial "7") were paid for once already in
+# survey_store.py. The sibling directory is on the path for the same reason
+# ticket_lab_authority is imported rather than reimplemented.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from saspy.constants import is_placeholder_identifier  # noqa: E402
+
+
+# Table A-1 defines exception 0x00 ("no activity") and then jumps to 0x11, so
+# 0x01-0x10 are entirely unassigned. A general poll answering with one of those
+# AND with this client's own address is unambiguously the Table 12.5 address
+# byte being read as an exception code -- real time event mode left enabled in
+# the cabinet by an unclean stop.
+#
+# The detection only holds for addresses 1-16. At address 20 a returned 0x14
+# is both the address and a real code ("reel 1 ... "), and nothing can tell
+# them apart from one byte; this project's cabinets are on address 1.
+RTE_STUCK_DETECTABLE_BELOW = 0x11
+
+
+def rte_looks_stuck(code: int, address: int) -> bool:
+    """Whether one general-poll byte says the cabinet is still in RTE."""
+    return (int(code) == int(address)
+            and 0 < int(address) < RTE_STUCK_DETECTABLE_BELOW)
+
+
+def recover_stuck_rte(client, address: int | None = None) -> tuple[str, int | None]:
+    """Clear real time event mode left on by an unclean stop, before anything
+    else reads the wire.
+
+    Returns (what happened, the exception code the probe consumed or None).
+
+    WHY THIS EXISTS. The teardown that disables RTE is not guaranteed to
+    succeed: LP 0x0E's acknowledgement can itself be pre-empted by a queued
+    event (§12.3), and on 2026-11-02 that is exactly what happened -- a soak
+    was stopped with SIGTERM, the service started, and its interrogation
+    logged "exception 0x01 during interrogation: unknown/unassigned code 0x01"
+    three times. The service unit's ExecStartPre, which exists for this, had
+    also failed.
+
+    Each of those mis-read polls is worse than a wrong log line: it consumes
+    ONE BYTE of a multi-byte Table 12.5 frame and leaves the rest in the
+    buffer, so the long polls that follow are misframed. The identity and
+    configuration an interrogation reads in that state cannot be trusted.
+
+    The transport resets the input buffer before every exchange, so the
+    half-frame left by the probe is discarded by the disable poll itself.
+    """
+    # The poller gets its address from the .ini through connect_from_config,
+    # not from argparse, so the client is the only thing that knows it.
+    if address is None:
+        address = getattr(client, "address", None)
+    if address is None:
+        return ("skipped: this client does not expose its address", None)
+    try:
+        code = client.general_poll()
+    except SASError as e:
+        return (f"could not probe the cabinet's framing ({type(e).__name__}: {e})",
+                None)
+    if not rte_looks_stuck(code, address):
+        return ("ordinary framing", int(code))
+    try:
+        client.enable_real_time_events(False)
+    except SASError as e:
+        return (f"the cabinet answered general polls with its own address "
+                f"(0x{int(code):02X}), so real time event mode was still on, "
+                f"and disabling it FAILED ({type(e).__name__}: {e}). Readings "
+                "from this run's interrogation are suspect.", None)
+    try:
+        again = client.general_poll()
+    except SASError as e:
+        return (f"disabled a stuck real time event mode, but the confirming "
+                f"poll failed ({type(e).__name__}: {e})", None)
+    if rte_looks_stuck(again, address):
+        return (f"real time event mode is STILL on after LP 0x0E "
+                f"(0x{int(again):02X}); power-cycle the cabinet -- §12 requires "
+                "the ordinary mode on power up", None)
+    return (f"real time event mode had been left ON (general poll answered "
+            f"0x{int(code):02X}, this machine's own address); disabled it, and "
+            f"the next poll answered 0x{int(again):02X}", int(again))
+
+
+def usable_serial(identity: dict | None) -> str | None:
+    """The serial number, or None if the machine did not really give one.
+
+    §4.4 lets a cabinet ignore LP 0x54 entirely, and this project's own lab
+    EGM does. Others answer with a placeholder -- an empty string, all zeros,
+    "n/a" -- which passes a `is not None` test and is not an identity.
+    survey_store.py learned this on the floor on 2026-10-27, where an IGT
+    cabinet reported asset 7 and serial "7": non-empty, not all zeros, not
+    "n/a", and reads like a real serial in a report. The placeholder list is
+    imported from there rather than copied so the two cannot drift.
+    """
+    if not identity:
+        return None
+    serial = (identity.get("serial_number") or "").strip()
+    if is_placeholder_identifier(serial):
+        return None
+    # A "serial" that is just the asset number re-typed identifies nothing
+    # the asset number does not already identify.
+    asset = identity.get("asset_number")
+    if asset not in (None, 0) and serial == str(asset):
+        return None
+    return serial
+
+
+def usable_asset(identity: dict | None) -> int | None:
+    """The asset number, or None if it was never assigned.
+
+    Zero is not an asset number: it is the field's unset value. SAS carries
+    it as a 4-byte little-endian BINARY integer (decode_binary_le), so a
+    letter is not representable in it at all -- the operator's "we always use
+    numbers, never letters" convention is satisfied by the protocol itself,
+    and there is nothing here to validate.
+    """
+    if not identity:
+        return None
+    asset = identity.get("asset_number")
+    return None if asset in (None, 0) else int(asset)
+
+
+def machine_key(identity: dict | None) -> tuple[str, str] | None:
+    """Which identifier this cabinet can actually be known by, and which one
+    it is. ('serial', '000106719'), ('asset', '246'), or None.
+
+    THE FALLBACK IS AN OPERATIONAL REQUIREMENT, not a convenience. Not every
+    machine announces a serial over SAS; on the Belize and Trinidad floors the
+    asset number is the identifier that is always present, never reissued, and
+    -- in Trinidad -- unique across all three properties, so it is a sound key
+    where the serial is absent.
+
+    It is a WEAKER key and the caller is told which it got. A serial is burned
+    in and survives a RAM clear; an asset number is typed in by an operator and
+    a RAM clear wipes it. An epoch keyed on an asset number is evidence about
+    a machine's identity that a RAM clear can erase.
+    """
+    serial = usable_serial(identity)
+    if serial is not None:
+        return ("serial", serial)
+    asset = usable_asset(identity)
+    if asset is not None:
+        return ("asset", str(asset))
+    return None
+
+
 def identity_changed(previous: dict | None, current: dict) -> tuple[str, str] | None:
     """(kind, description) of what changed, or None.
 
     The two identifiers are not equivalent and must not be treated as one.
-    The SERIAL NUMBER is burned into the machine and survives a RAM clear, so
-    a different serial means a different cabinet. The ASSET NUMBER is typed in
-    by an operator and a RAM clear wipes it, so an asset that changes while
-    the serial holds is a reconfiguration of the same machine -- calling that
-    a swap would mislabel every RAM clear as a cabinet change.
+    But NOT for the reason this comment gave until 2026-11-05, which was that
+    the serial is "burned into the machine and survives a RAM clear". IT IS
+    NOT. On the cabinets this project works with, the serial is TYPED IN AT
+    CONFIGURATION, during the RAM clear, exactly like the asset number. A
+    technician can leave it blank or mistype it, and on this project's own lab
+    machine one did -- which is what produced a ticket run refused for a
+    serial mismatch, and which explains the cabinets that "do not report a
+    serial" (the field is empty, not ignored per §4.4).
+
+    The serial is still the better key, for a different reason: entered
+    correctly it is a manufacturer number that is unique everywhere, while an
+    asset number is unique only by house policy -- and §5a of the handover
+    records a floor where that policy does not hold. So a different serial
+    still means a different cabinet, and an asset that changes while the
+    serial holds is still a reconfiguration. What changes is that neither
+    identifier is self-verifying: both are only as good as the data entry, and
+    a cleared machine can come back with a serial that is blank, mistyped, or
+    somebody else's.
+
+    WITH NO SERIAL ON EITHER SIDE THAT REASONING INVERTS, and this used to get
+    it backwards. "The asset changed but the serial held" is only reassuring
+    when there IS a serial holding. On a cabinet that reports none -- §4.4
+    permits it, and the lab EGM does it -- the asset number is the only
+    identity there is, and on these floors asset numbers are never reissued.
+    So a different asset number with nothing anchoring it is the best
+    available evidence of a DIFFERENT MACHINE, not of the same one
+    reconfigured. Reporting it as a reconfiguration would quietly carry one
+    cabinet's meter history onto another.
 
     Only fields BOTH readings carry are compared. A machine that stops
     answering 0x54 has not become a different machine, and treating a None as
@@ -986,12 +1623,19 @@ def identity_changed(previous: dict | None, current: dict) -> tuple[str, str] | 
     """
     if not previous:
         return None
-    was, now = previous.get("serial_number"), current.get("serial_number")
+    was, now = usable_serial(previous), usable_serial(current)
     if was is not None and now is not None and was != now:
         return "machine_changed", f"serial_number {was!r} -> {now!r}"
-    was, now = previous.get("asset_number"), current.get("asset_number")
-    if was is not None and now is not None and was != now:
-        return "asset_changed", f"asset_number {was!r} -> {now!r}"
+    had_serial = was is not None or now is not None
+    was_asset, now_asset = usable_asset(previous), usable_asset(current)
+    if was_asset is not None and now_asset is not None and was_asset != now_asset:
+        if had_serial:
+            return "asset_changed", f"asset_number {was_asset!r} -> {now_asset!r}"
+        return ("machine_changed",
+                f"asset_number {was_asset!r} -> {now_asset!r} and neither "
+                "reading carries a serial number, so the asset number is the "
+                "only identity this cabinet has (§4.4) -- on these floors it "
+                "is never reissued, so a different one is a different machine")
     return None
 
 
@@ -1034,6 +1678,66 @@ def load_persisted_meters(conn: sqlite3.Connection) -> dict | None:
     return dict(zip(ALL_METER_FIELDS, row))
 
 
+# Fields of interrogation_games worth comparing after exception 0x3C. Not all
+# of them: game_name and paytable_name are labels, and a vendor is free to
+# re-word one without changing anything that affects accounting.
+GAME_CONFIG_FIELDS = ("denomination", "max_bet", "progressive_group",
+                      "game_options", "paytable_id", "base_percentage")
+
+# A change in any of these invalidates comparisons across it, so it opens a new
+# epoch rather than only being noted.
+#
+# DENOMINATION is the one that matters and the reason this exists. SAS meters
+# are counted in credits (or in cents, per LP 0xA0's meter_model), so a
+# denomination change silently rescales every credit figure in the database:
+# 1000 credits at $0.01 and 1000 credits at $0.25 are the same meter reading
+# and twenty-four dollars apart. Without a boundary there is no way to know
+# which rows mean which.
+#
+# PAYTABLE_ID and BASE_PERCENTAGE change what the machine is, for an auditor,
+# even though they do not rescale a meter. Treated the same way: the epoch is
+# cheap and a mislabelled window is not.
+EPOCH_WORTHY_CONFIG_FIELDS = ("denomination", "paytable_id", "base_percentage")
+
+
+def game_config_diff(conn: sqlite3.Connection, previous_id: int,
+                     current_id: int) -> list[tuple[int, str, object, object]]:
+    """What changed between two interrogations' game configurations.
+
+    Returns (game_number, field, was, now) per difference. Games that appear
+    or disappear are reported as a change on the fields they carry, because an
+    operator enabling a game is exactly the kind of thing exception 0x3C
+    announces.
+
+    Only fields BOTH interrogations carry are compared: §4.4 lets a machine
+    refuse LP 0x53 for a game, and a refusal is not a change.
+    """
+    def rows(interrogation_id):
+        out = {}
+        for row in conn.execute(
+                f"SELECT game_number, {', '.join(GAME_CONFIG_FIELDS)} "
+                "FROM interrogation_games WHERE interrogation_id = ?",
+                (interrogation_id,)):
+            out[row[0]] = dict(zip(GAME_CONFIG_FIELDS, row[1:]))
+        return out
+
+    was_games, now_games = rows(previous_id), rows(current_id)
+    changes: list[tuple[int, str, object, object]] = []
+    for game in sorted(set(was_games) | set(now_games)):
+        was, now = was_games.get(game), now_games.get(game)
+        if was is None:
+            changes.append((game, "game", "absent", "present"))
+            continue
+        if now is None:
+            changes.append((game, "game", "present", "absent"))
+            continue
+        for field in GAME_CONFIG_FIELDS:
+            a, b = was.get(field), now.get(field)
+            if a is not None and b is not None and a != b:
+                changes.append((game, field, a, b))
+    return changes
+
+
 def open_epoch(conn, now: str, reason: str, identity: dict, detail: str) -> int:
     """Close the open epoch, start a new one, return its id."""
     conn.execute(
@@ -1065,6 +1769,19 @@ def migrate_epoch_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN epoch_id INTEGER")
             print(f"migrated: added epoch_id to {table} "
                   "(existing rows keep NULL -- they predate epoch tracking)")
+    # Same reasoning for the RTE payload column: a database from a run before
+    # --rte existed keeps its old machine_events shape, and every insert
+    # naming rte_fields would fail on it.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(ticket_in_events)")}
+    if columns and "authority_decision" not in columns:
+        conn.execute("ALTER TABLE ticket_in_events ADD COLUMN authority_decision TEXT")
+        print("migrated: added authority_decision to ticket_in_events "
+              "(existing rows keep NULL -- nothing answered them)")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(machine_events)")}
+    if columns and "rte_fields" not in columns:
+        conn.execute("ALTER TABLE machine_events ADD COLUMN rte_fields TEXT")
+        print("migrated: added rte_fields to machine_events "
+              "(existing rows keep NULL -- they predate real time events)")
     conn.commit()
 
 
@@ -1258,6 +1975,299 @@ def maintain_epoch(conn, client, state, values: dict, now: str) -> None:
 
 def utc_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+# Enter drain mode at this fraction of the pacing budget, leave at the
+# lower one. Hysteresis, because a threshold with no gap oscillates: one
+# busy cycle would defer the sweep, the quiet cycle that follows would
+# resume it, and the sweep would never finish while play stayed near the
+# line.
+# §2.2.1 guarantees AT LEAST 20 elements. This cabinet was measured at 67
+# (handover §2.2.1 work), and the floor figure is what a FLOOR design must
+# use -- but the warning below is about THIS cabinet, so it uses what this
+# cabinet was measured to hold. examples/queue_safety.py carries the same
+# constant for the same reason and reports both.
+MEASURED_LAB_QUEUE_DEPTH = 67
+
+# §2.2.1's own announcement that the queue overran and the oldest entries
+# are gone. The cabinet raising this is the only direct report of loss a
+# host ever gets; everything else is inference.
+BUFFER_OVERFLOW_EXCEPTION = 0x70
+
+# §12.2: under real time events the rate "can be increased to 40 ms in
+# order to better approximate real time", and Table 7.14e bit 0 is where a
+# machine advertises that it supports it. This is the floor -- never below.
+SAS_FAST_POLL_INTERVAL_S = 0.04
+
+DRAIN_ENTER_FRACTION = 0.50
+DRAIN_LEAVE_FRACTION = 0.30
+
+
+def _set_poll_interval(client, seconds: float) -> bool:
+    """Change the transport's §2.3.3 pacing floor, if there is one to change.
+
+    Written through the transport because that is where pacing is enforced
+    on every message -- the same place the headroom figure reads it from.
+    A copy held anywhere else could drift from the one actually in force.
+    """
+    transport = getattr(client, "transport", None)
+    if transport is None or not hasattr(transport, "_min_poll_interval"):
+        return False
+    transport._min_poll_interval = seconds
+    return True
+
+
+def _apply_drain_poll_rate(client, state: "PollState", now: str, *,
+                           want_fast: bool,
+                           fast_interval: float = SAS_FAST_POLL_INTERVAL_S,
+                           fallback_interval: float = 0.0) -> None:
+    """Poll faster while draining, and ONLY while draining.
+
+    The operator's instruction, 2026-11-09: "Normal polling will be 300ms
+    and under drain priority; it will be set to max_polling_rate. But only
+    during drain priority, it will be set back to 300ms as soon as drain
+    priority is off."
+
+    WHY IT IS WORTH DOING, and why it is not simply "poll faster". One
+    poll drains exactly one event, so the drain ceiling is 1 /
+    poll_interval. At 300 ms that is 3.3 events/s against the 11.5/s a
+    button burst produced on this cabinet -- a race that cannot be won, and
+    the queue only decides how many seconds before loss starts. At 40 ms it
+    is 25/s, which EXCEEDS the burst, so the queue drains back to empty and
+    nothing is lost. The faster rate buys retention, not just latency, and
+    this project's own 2026-11-02 note said otherwise (handover §31).
+
+    THREE THINGS IT WILL NOT DO.
+
+    It will not poll a machine that has not said it can. Table 7.14e bit 0
+    is read during interrogation and cached on the state; None means the
+    question was never answered, and None is not yes.
+
+    It will not go below 40 ms. §12.2 names that number; this project has
+    already polled at 14 ms once and recorded it as a bug.
+
+    It will not stay fast. The rate goes back the moment drain priority
+    ends, and the teardown restores it as well, so a run that dies mid-burst
+    does not hand the next tool a cabinet it has been hammering.
+    """
+    if want_fast == state.fast_poll_active:
+        return
+    if want_fast:
+        advertised = state.fast_poll_supported is True
+        if advertised:
+            interval = max(fast_interval, SAS_FAST_POLL_INTERVAL_S)
+        elif fallback_interval and fallback_interval > 0:
+            # THE OPERATOR'S CALL, 2026-11-09: "If a cabinet doesn't
+            # advertise; we can still try 100ms during drain priority."
+            #
+            # Not advertising is not a refusal -- §4.4 lets a machine ignore
+            # a long poll it does not implement, so an old cabinet that
+            # never answered LP 0xA0 has said nothing either way. A rate
+            # between the §2.3.3 floor and §12.2's 40 ms is a middle
+            # position: still faster than the conservative reading, still
+            # well short of what the advertised machines get.
+            interval = max(fallback_interval, SAS_FAST_POLL_INTERVAL_S)
+            if not state.fast_poll_fallback_announced:
+                state.fast_poll_fallback_announced = True
+                print(f"[{now}] the machine has NOT advertised Table 7.14e "
+                      f"bit 0 (40 ms). Using the fallback "
+                      f"{interval:.3f}s while draining rather than the "
+                      f"advertised rate — set --drain-fast-poll-fallback 0 "
+                      f"to stay at {state.normal_poll_interval:.3f}s.")
+        else:
+            if not state.fast_poll_fallback_announced:
+                state.fast_poll_fallback_announced = True
+                print(f"[{now}] fast polling NOT used: the machine has not "
+                      f"advertised Table 7.14e bit 0 (40 ms support) and no "
+                      f"fallback is configured. Staying at "
+                      f"{state.normal_poll_interval:.3f}s.")
+            return
+        if _set_poll_interval(client, interval):
+            state.fast_poll_active = True
+            why = ("the machine advertises 40 ms in LP 0xA0"
+                   if advertised else "fallback: the machine never said")
+            print(f"[{now}] poll rate {state.normal_poll_interval:.3f}s -> "
+                  f"{interval:.3f}s for the duration of drain priority "
+                  f"(§12.2; {why}). Drain ceiling {1/interval:.0f}/s "
+                  f"instead of {1/state.normal_poll_interval:.1f}/s.")
+    else:
+        if _set_poll_interval(client, state.normal_poll_interval):
+            state.fast_poll_active = False
+            print(f"[{now}] poll rate back to "
+                  f"{state.normal_poll_interval:.3f}s (drain priority off).")
+
+
+def _never_give_up() -> bool:
+    """The default: finish the sweep whatever happens, as it always did."""
+    return False
+
+
+def _live_drain_probe(state: "PollState", started: float, *,
+                      monotonic_fn=time.monotonic,
+                      min_seconds: float = 5.0,
+                      enter: float = DRAIN_ENTER_FRACTION,
+                      on_fire=None):
+    """Abandon the rest of the optional sweep WHILE it is running.
+
+    WHY MID-SWEEP AND NOT NEXT CYCLE. The first hardware run of drain
+    priority, 2026-11-08T23:51, measured 74% of the pacing budget and then
+    ran the full 56.9-second sweep anyway, because the decision was taken
+    from the PREVIOUS cycle's rate. Drain mode engaged 59 seconds later,
+    by which time the burst was over.
+
+    A 59-second reaction to a ten-second event is no reaction at all. The
+    operator's customers mash for a few seconds; the thing being defended
+    against is shorter than one cycle, so the decision has to live inside
+    the cycle.
+
+    `min_seconds` exists because a rate over a fraction of a second is
+    noise: one event in the first 50 ms reads as 20/s and would abandon
+    every sweep on this cabinet.
+    """
+    def probe() -> bool:
+        elapsed = monotonic_fn() - started
+        if elapsed < min_seconds:
+            return False
+        capacity = state.baseline_capacity or state.last_capacity
+        if not capacity:
+            return False
+        if (state.events_seen_live / elapsed) < enter * capacity:
+            return False
+        # FIRE EVERYTHING AT ONCE, not just the sweep.
+        #
+        # The operator, 2026-11-09, reading a table of mine: "Isn't it
+        # supposed to start faster polling immediately?" It was not. The
+        # probe abandoned the optional polls mid-sweep but left the poll
+        # RATE alone, because the rate was flipped at the top of a cycle
+        # from state.draining -- which this probe does not set until the
+        # next one. So a burst caught mid-sweep got the short sweep at once
+        # and the fast rate a cycle later, which is the whole latency the
+        # probe exists to remove, reintroduced one layer down.
+        #
+        # Setting state.draining here also makes the inter-cycle gap drain
+        # instead of sleep, which was subject to the same lag.
+        if not state.draining:
+            state.draining = True
+            if on_fire is not None:
+                on_fire()
+        return True
+    return probe
+
+
+def _should_drain(state: "PollState", enter: float = DRAIN_ENTER_FRACTION,
+                  leave: float = DRAIN_LEAVE_FRACTION) -> bool:
+    """Is the cabinet out-running the room the sweep leaves for collecting?
+
+    THE ARITHMETIC THIS EXISTS FOR. One poll drains exactly one event --
+    a general poll returns one Table 12.5 message, a pre-empted long poll
+    returns one event instead of its reply -- and §2.3.3 caps any
+    conforming host at one poll per 200 ms. So 5 events/s is the ceiling
+    for ANY SAS host, and nothing can change that.
+
+    What an implementation controls is how much of its own budget it
+    spends on draining. Measured 2026-11-08 under a deliberate button
+    burst: 170 exchanges in one 60-second sweep, of which only 97 were
+    general polls. **A long poll that is not pre-empted drains nothing**,
+    so 43% of the slots did no draining at all -- 1.6 events/s collected
+    against a 3.3/s budget, while the cabinet produced 11.51/s. Six game
+    starts were lost and the cabinet raised 24 buffer overflows.
+
+    Deferring the optional sweeps turns those wasted slots into drains.
+    It cannot beat the protocol ceiling; it roughly triples how close we
+    get to it, which is the difference between losing a real customer's
+    bets after seven seconds of mashing and after eleven.
+
+    The operator authorised the trade explicitly, 2026-11-08: "suspending
+    meter sweep is something I can exchange with accurate customer result
+    reading." Meters are cumulative, so a deferred sweep loses nothing;
+    an event is gone for good.
+    """
+    capacity = state.baseline_capacity or state.last_capacity
+    if not capacity:
+        return state.draining
+    used = state.last_event_rate / capacity
+    if state.draining:
+        return used > leave
+    return used >= enter
+
+
+def _drain_sleep(client, conn, state: "PollState", seconds: float, *,
+                 rte: bool, monotonic_fn=time.monotonic,
+                 sleep_fn=time.sleep, now_fn=utc_now) -> int:
+    """Spend the gap between cycles collecting events instead of sleeping.
+
+    An ordinary cycle ends with `time.sleep(interval)`, which is correct
+    when nothing is happening and exactly wrong when the cabinet is
+    flooding: the queue keeps filling and nothing drains. Under drain
+    priority the wait becomes general polls instead, paced by the
+    transport's own §2.3.3 floor.
+
+    SOURCE LABEL: these are filed as 'rte-heartbeat', which is what they
+    are -- a general poll issued outside the meter sweep to keep the
+    queue short. A new label would be more descriptive and would also be
+    SILENTLY DROPPED by rte_reconcile.py's RTE_SOURCES whitelist, which
+    has already happened once on this project ("'rte-heartbeat' was
+    missing here for exactly one run"). How much drain mode collected is
+    reported in the cycle line and counted in state.drain_cycles, which
+    needs no new label.
+
+    Returns the number of events collected, for that line.
+    """
+    if seconds <= 0:
+        return 0
+    if not state.draining:
+        sleep_fn(seconds)
+        return 0
+
+    deadline = monotonic_fn() + seconds
+    drained = 0
+    while monotonic_fn() < deadline:
+        try:
+            if rte:
+                event = client.general_poll_rte()
+                code = None if event is None else int(event.code)
+                fields = (event.fields or None) if event is not None else None
+            else:
+                code, fields = client.general_poll(), None
+        except SASError:
+            # A dead link is the cycle's own problem to diagnose and
+            # report; this is best-effort draining, exactly like the
+            # heartbeat. Fall back to waiting out the rest.
+            remaining = deadline - monotonic_fn()
+            if remaining > 0:
+                sleep_fn(remaining)
+            break
+        if code is None or code == ExceptionCode.NONE:
+            # Queue empty. Stop polling a quiet machine at full rate --
+            # that is pacing budget spent for nothing, and §2.3.3's floor
+            # is a minimum interval, not a target.
+            remaining = deadline - monotonic_fn()
+            if remaining > 0:
+                sleep_fn(remaining)
+            break
+        _dispatch_exception(client, conn, now_fn(), code, state=state,
+                            source="rte-heartbeat" if rte else "heartbeat",
+                            fields=fields)
+        drained += 1
+    return drained
+
+
+def _record_lifecycle(conn, event: str, reason: str | None) -> None:
+    """Write one row saying this run started or stopped, and why.
+
+    Deliberately never raises: a failure to record WHY a run ended must not
+    become the reason it ends. A bare except is right here and nowhere
+    else in this file.
+    """
+    try:
+        conn.execute(
+            "INSERT INTO poller_lifecycle (at, event, reason, pid, argv) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (utc_now(), event, reason, os.getpid(), " ".join(sys.argv[1:])))
+        conn.commit()
+    except Exception as e:  # noqa: BLE001 - see docstring
+        print(f"WARNING: could not record lifecycle '{event}': "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
 
 
 def _safe_commit(conn: sqlite3.Connection, now: str) -> bool:
@@ -1537,9 +2547,37 @@ def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
               f"{info.amount_cents} cashout; no new number consumed)")
         return
 
+    # OLDEST ISSUED FIRST, by AGE, not by number.
+    #
+    # Operator, 2026-11-10: "ORDER BY validation_number isn't a correct
+    # approach, because we always look at the age of the validation number.
+    # So for the lab it's not a problem, but for the floor it definitely
+    # needs to be ordered by the age of the validation numbers and oldest
+    # must be issued."
+    #
+    # Spec V2 §7.1 says only "the next available number" and does not fix the
+    # order, so this is the decision that settles it. Number order and issue
+    # order coincide only while every batch happens to be minted ascending;
+    # a second validation system id, a gap-fill or a re-mint breaks that, and
+    # the failure is silent -- a newer number handed out while an older one
+    # ages in the pool, which is the opposite of what the ticket's own
+    # validity window wants.
+    #
+    # NULLS LAST, deliberately. A NULL issued_at is a hand-inserted number
+    # with no batch info (see the pool-age check) -- its age is UNKNOWN, and
+    # unknown is not evidence of being oldest. SQLite's plain ORDER BY sorts
+    # NULLs FIRST, which would hand out the one number whose age nobody can
+    # vouch for, first.
+    #
+    # validation_number is the final tiebreak, which keeps the lab
+    # deterministic: --seed-validation-pool stamps every row with the same
+    # issued_at, so seeded pools behave exactly as they did before this
+    # change. That is why the old ordering was never wrong in the lab and
+    # would have been wrong on the floor.
     row = conn.execute(
         "SELECT validation_number, validation_system_id FROM validation_pool "
-        "WHERE status = 'available' ORDER BY validation_number LIMIT 1"
+        "WHERE status = 'available' "
+        "ORDER BY issued_at IS NULL, issued_at, validation_number LIMIT 1"
     ).fetchone()
     if row is None:
         conn.execute(
@@ -1594,7 +2632,16 @@ def _pool_age_hours(conn: sqlite3.Connection, now: str) -> float | None:
     return (datetime.datetime.fromisoformat(now) - datetime.datetime.fromisoformat(oldest)).total_seconds() / 3600.0
 
 
-def _check_pool_age(conn: sqlite3.Connection, now: str, *, max_age_hours: float) -> None:
+# A stale pool is a standing condition. Record it when it starts, once an
+# hour while it lasts (so it has a duration), and when it clears -- not once
+# per cycle, which produced 1302 rows in one hour on the lab database.
+POOL_STALE_ROW_INTERVAL_S = 3600.0
+POOL_STALE_PRINT_INTERVAL_S = 900.0
+
+
+def _check_pool_age(conn: sqlite3.Connection, now: str, *, max_age_hours: float,
+                    state: "PollState | None" = None,
+                    monotonic_fn=time.monotonic) -> None:
     """Per the Decisions Annex D-16: a pool older than ~36 hours is
     "genuinely abnormal... either the machine has dispensed nothing in a
     day and a half, or the gateway has been unable to reach the server
@@ -1612,42 +2659,395 @@ def _check_pool_age(conn: sqlite3.Connection, now: str, *, max_age_hours: float)
     if max_age_hours <= 0:
         return
     age = _pool_age_hours(conn, now)
-    if age is not None and age >= max_age_hours:
+    stale = age is not None and age >= max_age_hours
+
+    if not stale:
+        # Clearing is worth exactly one row: it is the record that a top-up or
+        # a pool replacement actually reached this gateway, which is the thing
+        # the alert exists to ask for.
+        if state is not None and state.pool_stale_since is not None:
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) "
+                "VALUES (?, ?, ?, ?)",
+                (now, "validation_pool", "PoolStaleCleared",
+                 f"stale since {state.pool_stale_since}; the oldest available "
+                 f"number is now {age if age is None else round(age, 1)}h old"),
+            )
+            _safe_commit(conn, now)
+            print(f"[{now}] validation_pool is no longer stale (was flagged "
+                  f"from {state.pool_stale_since}).")
+            state.pool_stale_since = None
+            state.pool_stale_last_row = None
+            state.pool_stale_last_print = None
+        return
+
+    # ONE CONDITION, NOT ONE ROW PER CYCLE.
+    #
+    # This used to INSERT a PoolStale row and commit on EVERY cycle the pool
+    # was stale. Measured on the lab database: 1302 rows in one hour at the
+    # early 2.8s cadence, then ~271/hour for four days -- tens of thousands of
+    # rows for a condition that never changed. poll_errors is the table a
+    # human reads to find poll FAILURES, and it was swamped: the real signal,
+    # ~90 core-meter timeouts an hour, sat underneath a flood of advisory
+    # rows that all said the same thing.
+    #
+    # It was also a write plus a commit every cycle, on a gateway whose whole
+    # --mode ring design exists to spare the flash exactly that.
+    #
+    # So: a row when the condition STARTS, one an hour while it lasts (which
+    # is what gives it a duration), and one when it clears. The console line
+    # repeats every fifteen minutes rather than every cycle -- often enough
+    # that somebody tailing the log cannot miss it, rarely enough that the
+    # log stays readable.
+    message = f"oldest available number is {age:.1f}h old (>= {max_age_hours}h)"
+    if state is None:
+        # No state to track an episode with: keep the old behaviour rather
+        # than silently dropping the alert.
         conn.execute(
             "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
-            (now, "validation_pool", "PoolStale", f"oldest available number is {age:.1f}h old (>= {max_age_hours}h)"),
-        )
+            (now, "validation_pool", "PoolStale", message))
         _safe_commit(conn, now)
+        print(f"[{now}] ALERT: validation_pool's oldest available number is "
+              f"{age:.1f}h old, at or above --pool-age-alert-hours "
+              f"{max_age_hours} — likely no top-up reaching this gateway, or "
+              "the machine isn't dispensing. Not a validity problem and not "
+              "blocking dispensing (see D-16).")
+        return
+
+    mono = monotonic_fn()
+    first = state.pool_stale_since is None
+    if first:
+        state.pool_stale_since = now
+    if first or state.pool_stale_last_row is None or (
+            mono - state.pool_stale_last_row) >= POOL_STALE_ROW_INTERVAL_S:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) "
+            "VALUES (?, ?, ?, ?)",
+            (now, "validation_pool", "PoolStale",
+             message if first else f"{message}; still stale since {state.pool_stale_since}"))
+        _safe_commit(conn, now)
+        state.pool_stale_last_row = mono
+    if first or state.pool_stale_last_print is None or (
+            mono - state.pool_stale_last_print) >= POOL_STALE_PRINT_INTERVAL_S:
         print(
             f"[{now}] ALERT: validation_pool's oldest available number is {age:.1f}h old, at or above "
             f"--pool-age-alert-hours {max_age_hours} — likely no top-up reaching this gateway, or the "
             "machine isn't dispensing. Not a validity problem and not blocking dispensing (see D-16)."
         )
+        state.pool_stale_last_print = mono
 
 
-def _capture_ticket_in(client, conn: sqlite3.Connection, now: str) -> None:
-    """Called on exception 0x67: read the ticket's validation data
-    (read-only — see this module's docstring for why redeem_ticket() is
-    deliberately never called here).
+# How many times to re-read LP 0x70 after exception 0x67 before concluding
+# there is genuinely nothing in escrow. Each read is paced by the transport
+# (--min-poll-interval), so 4 spans about a second at the 300ms default --
+# nothing against §15.12's thirty-second window, and enough for a validator
+# that has raised the exception on insertion but not yet finished moving the
+# ticket into the escrow position.
+TICKET_ESCROW_READS = 4
+
+
+def _capture_ticket_in(client, conn: sqlite3.Connection, now: str,
+                       state: "PollState | None" = None,
+                       escrow_reads: int = TICKET_ESCROW_READS) -> None:
+    """Called on exception 0x67: read the ticket's validation data, and
+    answer it ONLY if a lab ticket file was handed to this run.
+
+    Without --lab-ticket-authority this stays exactly as read-only as it
+    has always been: the ticket is recorded and never redeemed, the machine
+    returns it after its own thirty-second timeout (§15.12), and nothing
+    here decides what a ticket is worth. That refusal is deliberate and is
+    the right default for a gateway — a poller that pays tickets by itself
+    is a cash-dispensing defect.
+
+    What lifts it is a FILE, not a flag: the operator has to hand this run
+    a specific list of validation numbers bound to a specific cabinet
+    serial. That is the same boundary ticket_lab_authority.py draws, and
+    the lookup, the transfer codes and the expiry date are imported from it
+    rather than copied, so the two cannot drift apart.
+
+    The reason to have it here at all is the serial port: one port, one
+    master. ticket_lab_authority.py cannot run while a soak holds
+    /dev/ttyS0, so ticket-in was the one path a soak could never exercise
+    — which is why §3 of every rte_reconcile run so far has printed
+    [NO DATA].
     """
-    try:
-        ticket = client.send_ticket_validation_data()
-    except SASError as e:
+    # ONE READ USED TO BE ENOUGH, AND IT WAS NOT.
+    #
+    # This read a single LP 0x70, and if the machine said nothing was in
+    # escrow it returned -- no row, no log line, no error. The comment called
+    # that "a rare, harmless race". It is neither.
+    #
+    # The cabinet raises 0x67 when the validator takes the ticket, which is
+    # BEFORE the ticket reaches the escrow position. A poller that answers
+    # within the same cycle can therefore read 0x70 too early, see no escrow,
+    # and silently decline to answer at all -- so the machine waits out
+    # §15.12's thirty seconds and hands the ticket back. From the player's
+    # side: inserted, rejected, for no visible reason.
+    #
+    # Observed twice on 2026-11-01 and reproducible: two 0x67 exceptions at
+    # 22:06 produced NO ticket_in_events rows at all, and the ticket was only
+    # accepted on a third attempt a minute later (id 9, 22:07:30). "Spin
+    # once more and it goes in" is this, not the machine being fussy.
+    #
+    # So: re-read, and when the escrow really is empty, WRITE IT DOWN. A
+    # silent return is what made this invisible for weeks -- the one failure
+    # that left no trace anywhere, in a table whose whole purpose is that a
+    # denied ticket moves no meter and is otherwise unrecoverable.
+    ticket = None
+    for attempt in range(1, max(1, escrow_reads) + 1):
+        try:
+            ticket = client.send_ticket_validation_data()
+        except SASError as e:
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
+                (now, "send_ticket_validation_data", type(e).__name__, str(e)),
+            )
+            _safe_commit(conn, now)
+            return
+        if ticket.ticket_in_escrow:
+            if attempt > 1:
+                print(f"[{now}] ticket reached escrow on read {attempt}/"
+                      f"{escrow_reads} — exception 0x67 fires on insertion, "
+                      "before the validator has finished moving it")
+            break
+    if ticket is None or not ticket.ticket_in_escrow:
+        note = (f"NOT ANSWERED: exception 0x67 fired but LP 0x70 reported no "
+                f"ticket in escrow across {escrow_reads} read(s). The machine "
+                "will hold it for §15.12's thirty seconds and hand it back.")
         conn.execute(
-            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
-            (now, "send_ticket_validation_data", type(e).__name__, str(e)),
+            "INSERT INTO ticket_in_events (captured_at, amount_cents, parsing_code, "
+            "validation_data_hex, authority_decision) VALUES (?, ?, ?, ?, ?)",
+            (now, getattr(ticket, "amount_cents", None),
+             getattr(ticket, "parsing_code", None),
+             ticket.validation_data.hex() if ticket is not None else None, note),
         )
         _safe_commit(conn, now)
+        print(f"[{now}] {note}")
         return
-    if not ticket.ticket_in_escrow:
-        return  # exception fired, but nothing in escrow by the time we read it — rare, harmless race
+    decision = None
+    if state is not None and state.ticket_authority is not None:
+        decision = _answer_ticket_in(client, conn, ticket, state, now)
+
     conn.execute(
-        "INSERT INTO ticket_in_events (captured_at, amount_cents, parsing_code, validation_data_hex) "
-        "VALUES (?, ?, ?, ?)",
-        (now, ticket.amount_cents, ticket.parsing_code, ticket.validation_data.hex()),
+        "INSERT INTO ticket_in_events (captured_at, amount_cents, parsing_code, "
+        "validation_data_hex, authority_decision) VALUES (?, ?, ?, ?, ?)",
+        (now, ticket.amount_cents, ticket.parsing_code,
+         ticket.validation_data.hex(), decision),
     )
     _safe_commit(conn, now)
-    print(f"[{now}] ticket-in captured: amount_cents={ticket.amount_cents} (not redeemed — see module docstring)")
+    if decision is None:
+        print(f"[{now}] ticket-in captured: amount_cents={ticket.amount_cents} "
+              "(not redeemed — see module docstring)")
+    else:
+        print(f"[{now}] ticket-in captured: amount_cents={ticket.amount_cents} "
+              f"-> {decision}")
+
+
+def _pool_issued_ticket(conn: sqlite3.Connection, number: int):
+    """Did THIS gateway print the ticket now being inserted?
+
+    The two halves of ticket handling use different books. Ticket-OUT draws
+    a number from validation_pool and marks it 'assigned' with the amount
+    once the machine acknowledges the print; ticket-IN looks numbers up in
+    lab_tickets.json. Nothing joined them, so a ticket the cabinet printed
+    thirty seconds earlier came back as DENIED 0x82 "not in system" -- the
+    gateway refusing to recognise its own issuance.
+
+    Honouring one is a weaker claim than the lab file makes, not a stronger
+    one: the host is not deciding what an unknown ticket is worth, it is
+    reading back an amount it recorded when it authorised the print. That
+    is what a real CMS does. It stays behind the same lab gate only because
+    it still moves money.
+
+    Returns the (status, amount_cents) row, or None if this gateway never
+    issued that number.
+    """
+    return conn.execute(
+        "SELECT status, assigned_amount_cents FROM validation_pool "
+        "WHERE validation_number = ?", (number,)).fetchone()
+
+
+def _answer_ticket_in(client, conn: sqlite3.Connection, ticket,
+                      state: "PollState", now: str) -> str:
+    """LAB ONLY. Look the ticket up in the file this run was given and
+    answer LP 0x71 with it.
+
+    Returns what happened, as one line, for ticket_in_events. A denied
+    ticket moves no meter at all, so if this is not written down the
+    decision is unrecoverable afterwards.
+
+    The answer is the only thing here that changes machine state, and the
+    file is what authorises it. A number that is not in the file is denied
+    with 0x82, "not in system" — never silently ignored, which would leave
+    the machine holding the ticket for its full thirty seconds and tell the
+    player nothing.
+    """
+    # From the LIBRARY, not from examples/ticket_lab_authority.py.
+    #
+    # These are Table 15.12 and 15.12c -- spec tables, not lab logic. Taking
+    # them from the lab module made the product depend at runtime on the
+    # scaffolding that stands in for a server, so the public mirror could not
+    # drop the scaffolding without breaking the gateway. Validation numbers
+    # are always issued by the server; nothing here may need that module.
+    from saspy.constants import (  # noqa: E402
+        TICKET_NOT_IN_SYSTEM as NOT_IN_SYSTEM,
+        TICKET_TRANSFER_CODES as TRANSFER_CODES,
+        describe_redemption_status as describe,
+    )
+
+    # Table 15.11b: parsing code 00 means the 9 bytes are BCD, an 18-digit
+    # decimal number (2-digit system ID + 16). Any other shape is not
+    # something this file knows how to look up, and guessing at it would
+    # mean answering a ticket we have not actually identified.
+    if ticket.parsing_code != 0x00 or len(ticket.validation_data) != 9:
+        return (f"NOT ANSWERED: parsing code 0x{ticket.parsing_code:02X} with "
+                f"{len(ticket.validation_data)} bytes is not Table 15.11b's 00 "
+                "with 9 BCD bytes")
+
+    number = decode_bcd(ticket.validation_data)
+    digits = f"{number:018d}"
+    spec = state.ticket_authority.get(digits)
+
+    # A ticket this gateway printed itself is not in the lab file and never
+    # will be. Recognise it from validation_pool instead -- see
+    # _pool_issued_ticket() for why that is the weaker claim, not the
+    # stronger one.
+    reserved_number = None
+    deny_reason = "not in file"
+    if spec is None:
+        row = _pool_issued_ticket(conn, number)
+        if row is not None and row[0] == "assigned" and row[1]:
+            # RESERVE IT BEFORE SENDING LP 0x71, not after. If this process
+            # dies between the poll and the update, 'redeeming' blocks a
+            # second redemption of the same ticket -- which is the failure
+            # that costs real money. It is released again only on a clean
+            # refusal from the machine, where we know nothing moved.
+            conn.execute(
+                "UPDATE validation_pool SET status = 'redeeming' "
+                "WHERE validation_number = ? AND status = 'assigned'", (number,))
+            _safe_commit(conn, now)
+            reserved_number = number
+            spec = {"kind": "cashable", "cents": int(row[1]),
+                    "expiration": 0, "pool_id": 0}
+        elif row is not None and row[0] in ("redeemed", "redeeming"):
+            deny_reason = (f"this gateway issued ...{digits[-6:]} but it is "
+                           f"already '{row[0]}' -- a ticket is redeemable once")
+        elif row is not None:
+            # 'available' or 'retired': the number exists in the pool but was
+            # never put on a ticket, so there is nothing to pay.
+            deny_reason = (f"...{digits[-6:]} is '{row[0]}' in the pool, never "
+                           "issued on a ticket")
+
+    if spec is None:
+        # NEVER an early return. Silence leaves the machine holding the ticket
+        # for §15.12's full thirty seconds and tells the player nothing; that
+        # was the single most visible defect this file ever had.
+        code, amount = NOT_IN_SYSTEM, 0
+        note = f"DENIED 0x{NOT_IN_SYSTEM:02X} {deny_reason}"
+    else:
+        code = TRANSFER_CODES[spec["kind"]]
+        amount = spec["cents"]
+        note = f"honoured as {spec['kind']} for {amount} cents"
+        if ticket.amount_cents and ticket.amount_cents != amount:
+            note += f" (machine reported {ticket.amount_cents})"
+
+    try:
+        result = client.redeem_ticket(
+            transfer_code=code,
+            transfer_amount_cents=amount,
+            validation_number=number,
+            restricted_expiration=(spec["expiration"]
+                                   if spec and spec["kind"] == "restricted" else 0),
+            pool_id=(spec["pool_id"]
+                     if spec and spec["kind"] == "restricted" else 0),
+            parsing_code=ticket.parsing_code,
+        )
+    except SASError as e:
+        # Deliberately leaves a reserved number in 'redeeming'. The exchange
+        # may have failed after the machine took the ticket, and those two
+        # look identical from here; blocking a second redemption is the safe
+        # direction, and the row is visible for a human afterwards.
+        return f"{note}; LP 0x71 failed: {type(e).__name__}: {e}"
+    if reserved_number is not None:
+        # The outcome is the CATEGORY (status >> 5), not a single code: 0x01
+        # is "restricted promotional ticket redeemed" and is a success. Three
+        # outcomes, not two --
+        #   SUCCESS (0b000)            -> redeemed, the money moved
+        #   FAILED/incompatible/none   -> back to assigned; the player is
+        #                                 still holding a spendable ticket
+        #   waiting/pending (0b001/010) -> LEAVE IT RESERVED. The machine has
+        #                                 not said yet, and releasing a ticket
+        #                                 that then completes pays it twice.
+        category = result.machine_status >> 5
+        settled = {0b000: "redeemed"}.get(category)
+        if settled is None and category not in (0b001, 0b010):
+            settled = "assigned"
+        if settled is not None:
+            conn.execute(
+                "UPDATE validation_pool SET status = ? WHERE validation_number = ?",
+                (settled, reserved_number))
+            _safe_commit(conn, now)
+        note += f" (issued by this gateway; now {settled or 'redeeming'})"
+    return f"{note}; machine status 0x{result.machine_status:02X} {describe(result.machine_status)}"
+
+
+def _acknowledge_aft_transfer(client, conn: sqlite3.Connection, now: str) -> None:
+    """Called on exception 0x69: read the completion status and ACKNOWLEDGE it.
+
+    THE ACKNOWLEDGEMENT IS NOT OPTIONAL. §8.8: a transfer answered with
+    pending status 0x40 completes with exception 0x69, and "if the host does
+    not respond with a proper interrogation poll, the gaming machine must
+    reissue exception 69 every 15 seconds until the host polls for and
+    acknowledges the completion status". Measured on an EGT Premier: 15.2
+    seconds, indefinitely.
+
+    0x69 is a PRIORITY exception, so it bypasses §2.2.1's queue and arrives
+    ahead of everything waiting. An unacknowledged transfer therefore does not
+    merely leave a loose end -- it installs a permanent 15-second beat at the
+    FRONT of the exception stream and pushes real events behind it.
+
+    Until 2026-11-03 this poller did not handle 0x69 at all.
+    `grep 0x69 examples/sql_poll_logger.py` returned nothing, while
+    aft_push_credits.py had done it correctly all along. That mattered because
+    the poller is the process that will perform transfers once the bill-
+    validator bridge exists (docs/project/AFT-BRIDGE-DESIGN.md).
+
+    transfer code FF is the acknowledging form; FE reads the same status
+    WITHOUT acknowledging and does not stop the reissue, so it is not what
+    this wants.
+    """
+    try:
+        result = client.aft_interrogate_transfer(0x00, acknowledge=True)
+    except SASError as e:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) "
+            "VALUES (?, ?, ?, ?)",
+            (now, "aft_interrogate_transfer", type(e).__name__, str(e)))
+        _safe_commit(conn, now)
+        print(f"[{now}] exception 0x69 (AFT transfer complete) could NOT be "
+              f"acknowledged: {type(e).__name__}: {e}. §8.8 means the machine "
+              "will reissue it every 15 seconds, as a priority exception, "
+              "until it is.")
+        return
+
+    note = (f"transfer status 0x{int(result.transfer_status):02X}, "
+            f"receipt status 0x{int(result.receipt_status):02X}")
+    conn.execute(
+        "INSERT INTO aft_transfer_completions (captured_at, buffer_position, "
+        "transfer_status, receipt_status, transfer_type, cashable_amount, "
+        "restricted_amount, nonrestricted_amount, transaction_id, "
+        "transaction_date, transaction_time, asset_number, note) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (now, result.transaction_buffer_position, result.transfer_status,
+         result.receipt_status, result.transfer_type, result.cashable_amount,
+         result.restricted_amount, result.nonrestricted_amount,
+         result.transaction_id, result.transaction_date,
+         result.transaction_time, result.asset_number, note))
+    _safe_commit(conn, now)
+    print(f"[{now}] AFT transfer complete (0x69) acknowledged: {note}; "
+          f"cashable={result.cashable_amount} restricted={result.restricted_amount} "
+          f"nonrestricted={result.nonrestricted_amount} "
+          f"id={result.transaction_id!r}")
 
 
 def _capture_ticket_in_completion(client, conn: sqlite3.Connection, now: str) -> None:
@@ -1684,7 +3084,9 @@ def _capture_ticket_in_completion(client, conn: sqlite3.Connection, now: str) ->
     print(f"[{now}] ticket-in completion captured: machine_status=0x{result.machine_status:02X} amount_cents={result.amount_cents}")
 
 
-def _capture_handpay(client, conn: sqlite3.Connection, now: str) -> None:
+def _capture_handpay(client, conn: sqlite3.Connection, now: str,
+                     state: "PollState | None" = None,
+                     monotonic_fn=time.monotonic) -> None:
     """Called on exception 0x51. Issues the long poll 0x1B that §7.8.1
     REQUIRES, and without which the machine never stops shouting.
 
@@ -1723,6 +3125,13 @@ def _capture_handpay(client, conn: sqlite3.Connection, now: str) -> None:
     This reads and records. It does NOT reset the handpay -- that is long
     poll 0x94, it moves money, and it belongs to a human running
     examples/handpay_clear.py, not to a logger.
+
+    The one exception is an explicitly licensed lab run: with
+    --lab-auto-handpay-reset the clock started here is what
+    _lab_auto_handpay_reset() later measures against. Starting it is free
+    and unconditional -- the decision to act on it is not made in this
+    function, and is refused outright unless a bound lab ticket file is
+    also in effect.
     """
     try:
         info = client.send_handpay_information()
@@ -1742,6 +3151,13 @@ def _capture_handpay(client, conn: sqlite3.Connection, now: str) -> None:
          info.reset_id, int(all_zeros)),
     )
     _safe_commit(conn, now)
+    if state is not None and not all_zeros:
+        # An all-zeros read is a re-read of an already-reported entry, not a
+        # new lockup, so it must not restart the clock -- otherwise a 0x51
+        # reissue would keep pushing the deadline out forever and the
+        # auto-reset would never fire.
+        if state.handpay_pending_since is None:
+            state.handpay_pending_since = monotonic_fn()
     if all_zeros:
         print(f"[{now}] handpay queue read (0x1B): all zeros -- the entry was "
               f"already reported and acknowledged (§7.8.1)")
@@ -1750,6 +3166,224 @@ def _capture_handpay(client, conn: sqlite3.Connection, now: str) -> None:
               f"amount={info.amount} partial_pay={info.partial_pay} "
               f"reset_id=0x{info.reset_id:02X}; the queue entry is now reported, "
               f"so the 15-second 0x51 reissue should stop")
+
+
+# ---------------------------------------------------------------------------
+# LAB ONLY: the poller acting on money by itself
+# ---------------------------------------------------------------------------
+#
+# READ THIS BEFORE ENABLING EITHER OF THE TWO FLAGS BELOW.
+#
+# Everything else in this file is a gateway: it observes, records and
+# reconciles, and the one thing it refuses to do is decide what money is
+# worth. Two features break that deliberately, for one reason -- an
+# unattended overnight soak on a lab cabinet stops dead the first time a
+# jackpot locks it up or the credits run out, and a soak that stops at 1am
+# measures nothing after 1am.
+#
+# They must never run on a floor. A poller that clears handpays by itself
+# records a jackpot as paid when nobody paid it; a poller that pushes credits
+# by itself is a money printer with a cron job. Neither failure is subtle and
+# neither is recoverable from the meters, because the meters will agree with
+# the gateway -- they will both be wrong in the same direction.
+#
+# THE GATE. Both require --lab-ticket-authority to be in effect, and that is
+# not decoration. The lab ticket file is the project's existing statement of
+# "this is the lab cabinet": it binds to one machine by serial (falling back
+# to asset number, §4.4), it carries a hard 2026-11-30 expiry, and the run
+# exits rather than act against any other cabinet. Reusing it means these two
+# features inherit that binding and that expiry for free and cannot be
+# switched on against a floor machine by a stray flag in a unit file.
+# deploy/nimasas-poller.service carries none of the three.
+
+LAB_AUTO_HANDPAY_MIN_SECONDS = 60.0
+# Below a minute you are not clearing an unattended lockup, you are racing the
+# attendant walking towards the machine.
+
+LAB_AUTO_AFT_MAX_PUSHES = 40
+LAB_AUTO_AFT_MAX_TOTAL_CENTS = 200_000
+LAB_AUTO_AFT_MIN_INTERVAL_S = 120.0
+# Three independent ceilings, because the failure mode that matters is a loop:
+# a credit read that always comes back zero (a machine that stops answering LP
+# 0x74 reads as broke, not as silent) would otherwise push every cycle until
+# morning. Whichever ceiling is hit first stops the feature for the rest of
+# the run -- it does not pause and retry, because a run that has pushed forty
+# times has something wrong with it that another push will not fix.
+
+
+@dataclass
+class LabAutoConfig:
+    """LAB ONLY. Off unless explicitly constructed from the lab flags."""
+
+    handpay_reset_after_s: float = 0.0     # 0 = off
+    aft_credit_cents: int = 0              # 0 = off
+    aft_floor_cents: int = 0
+    aft_pool_id: int = 0
+
+    def any_enabled(self) -> bool:
+        return bool(self.handpay_reset_after_s or self.aft_credit_cents)
+
+
+def _record_lab_action(conn: sqlite3.Connection, now: str, action: str,
+                       detail: str, outcome: str) -> None:
+    conn.execute(
+        "INSERT INTO lab_auto_actions (occurred_at, action, detail, outcome) "
+        "VALUES (?, ?, ?, ?)", (now, action, detail, outcome))
+    _safe_commit(conn, now)
+    print(f"[{now}] LAB AUTO {action}: {detail} -> {outcome}")
+
+
+def _lab_auto_handpay_reset(client, conn: sqlite3.Connection, now: str,
+                            state: "PollState", *, after_seconds: float,
+                            monotonic_fn=time.monotonic) -> bool:
+    """LP 0x94 on a lockup nobody has come to clear. Returns True if sent.
+
+    §7.9 makes two outcomes possible and the reset code does not tell them
+    apart. Where the W2-G Reset To Credit Meter function has been enabled
+    (LP 0xA8, which this tool does not send), the money goes back onto the
+    machine as credits; otherwise the handpay is recorded as paid by an
+    attendant who was never there. Code 0x00 is returned either way.
+
+    THAT AMBIGUITY IS THE WHOLE REASON --lab-auto-aft-credit EXISTS. On a
+    cabinet without reset-to-credit-meter the lockup clears and the credit
+    meter stays at zero, so the soak stops spinning anyway unless something
+    puts credits back. The handpay information read at 0x51 carries
+    reset_id, which says which kind of reset this machine offers; it is
+    recorded in handpay_queue every time, so the morning's reconciliation
+    can say which outcome actually happened rather than guessing.
+    """
+    if after_seconds <= 0 or state.handpay_pending_since is None:
+        return False
+    waited = monotonic_fn() - state.handpay_pending_since
+    if waited < after_seconds:
+        return False
+    try:
+        code = client.reset_handpay()
+    except SASError as e:
+        # §7.9: a machine not configured for remote handpay reset "must
+        # ignore long poll 94", and ignoring means silence. So a timeout
+        # here says the feature is off at the cabinet -- a different fact
+        # from code 0x01, which says the feature is on and the machine
+        # declined. Do not retry it every cycle; stop the clock and let a
+        # human find the row in the morning.
+        state.handpay_pending_since = None
+        _record_lab_action(
+            conn, now, "handpay_reset", f"after {waited:.0f}s",
+            f"NO ANSWER ({type(e).__name__}: {e}) -- §7.9 says a machine not "
+            "configured for remote handpay reset ignores LP 0x94 entirely, so "
+            "this most likely means the feature is off at the cabinet. Not "
+            "retried; clear it by hand.")
+        return False
+    outcome = HANDPAY_RESET_CODES.get(code, f"unknown reset code 0x{code:02X}")
+    state.handpay_resets += 1
+    if code == 0x00:
+        state.handpay_pending_since = None
+    else:
+        # 0x01 "unable to reset" and 0x02 "not currently in a handpay
+        # condition" both mean nothing changed. Stop the clock either way:
+        # 0x02 means the lockup is already gone and our clock was stale,
+        # and 0x01 retried every cycle is a machine being nagged.
+        state.handpay_pending_since = None
+    _record_lab_action(
+        conn, now, "handpay_reset",
+        f"LP 0x94 after {waited:.0f}s unattended (reset #{state.handpay_resets})",
+        f"code 0x{code:02X} {outcome}")
+    return True
+
+
+def _lab_auto_aft_credit(client, conn: sqlite3.Connection, now: str,
+                         state: "PollState", *, amount_cents: int,
+                         floor_cents: int, pool_id: int = 0,
+                         monotonic_fn=time.monotonic,
+                         sleep_fn=time.sleep) -> bool:
+    """Push credits when the cabinet has run dry. Returns True if it did.
+
+    Reads the three balances with LP 0x74 (lock code 0xFF, status only, no
+    lock) rather than trusting a meter column: under --skip-full-meter-sweep
+    every sm_ column is NULL, and c7_current_credits only refreshes on the
+    C-7 sweep, which routine runs throttle to once every five minutes. A
+    five-minute-old credit figure is not a basis for moving money.
+    """
+    if amount_cents <= 0:
+        return False
+    if state.aft_pushes >= LAB_AUTO_AFT_MAX_PUSHES:
+        return False
+    if state.aft_cents_pushed >= LAB_AUTO_AFT_MAX_TOTAL_CENTS:
+        return False
+    if (state.aft_last_push_mono is not None
+            and monotonic_fn() - state.aft_last_push_mono < LAB_AUTO_AFT_MIN_INTERVAL_S):
+        return False
+    try:
+        lock = client.aft_game_lock_and_status_request(lock_code=0xFF)
+    except SASError as e:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) "
+            "VALUES (?, ?, ?, ?)",
+            (now, "aft_game_lock_and_status_request(lab auto credit)",
+             type(e).__name__, str(e)))
+        _safe_commit(conn, now)
+        # Silence is NOT zero credits. Refusing to push on a failed read is
+        # the whole difference between this and a money printer.
+        return False
+    on_machine = (int(lock.current_cashable_amount or 0)
+                  + int(lock.current_restricted_amount or 0)
+                  + int(lock.current_non_restricted_amount or 0))
+    if on_machine > floor_cents:
+        return False
+    transaction_id = f"LABAUTO{int(time.time())}"
+    try:
+        result = client.aft_transfer_funds(
+            transfer_code=AFT_TRANSFER_CODE_FULL_ONLY,
+            transaction_index=0x00,
+            transfer_type=int(AftTransferType.IN_HOUSE_TO_GAMING_MACHINE),
+            cashable_amount=amount_cents,
+            restricted_amount=0,
+            nonrestricted_amount=0,
+            pool_id=pool_id,
+            expiration=0,
+            asset_number=lock.asset_number,
+            registration_key=bytes(20),
+            transaction_id=transaction_id,
+        )
+    except SASError as e:
+        # An exchange that fails AFTER the machine acted looks identical to
+        # one that failed before. Do not retry with a fresh transaction ID --
+        # that is how a cabinet gets paid twice. Count it against the cap and
+        # let the morning reconcile it from the meters.
+        state.aft_pushes += 1
+        state.aft_last_push_mono = monotonic_fn()
+        _record_lab_action(
+            conn, now, "aft_credit", f"{amount_cents / 100:,.2f} as {transaction_id}",
+            f"FAILED ({type(e).__name__}: {e}) -- it may or may not have "
+            "landed. Not retried: reusing the ID risks status 0x81, a fresh "
+            "one risks paying twice. Reconcile from the meters.")
+        return False
+    state.aft_pushes += 1
+    state.aft_cents_pushed += amount_cents
+    state.aft_last_push_mono = monotonic_fn()
+    category, _ = describe_aft_transfer_status(result.transfer_status)
+    if category == "PENDING":
+        # §8.8, and not optional: an unacknowledged completion makes the
+        # machine reissue exception 0x69 every fifteen seconds forever, as a
+        # PRIORITY exception delivered ahead of anything queued. Left alone
+        # overnight that is a permanent beat in the event stream.
+        for _ in range(12):
+            sleep_fn(1.0)
+            try:
+                final = client.aft_interrogate_transfer(0x00, acknowledge=True)
+            except SASError:
+                break
+            category, _ = describe_aft_transfer_status(final.transfer_status)
+            if category != "PENDING":
+                result = final
+                break
+    _record_lab_action(
+        conn, now, "aft_credit",
+        f"{amount_cents / 100:,.2f} cashable, machine had "
+        f"{on_machine / 100:,.2f} (floor {floor_cents / 100:,.2f}), "
+        f"push #{state.aft_pushes}/{LAB_AUTO_AFT_MAX_PUSHES}",
+        f"status 0x{result.transfer_status:02X} {category}")
+    return True
 
 
 class _MeterSupport:
@@ -1831,12 +3465,14 @@ class _MeterPollFailure(Exception):
 def _poll_all_meters(
     client,
     *,
+    now: str = "",
     full_sweep: bool = True,
     table_c7_sweep: bool = True,
     validation_meters_sweep: bool = True,
     last_accepted_bill_poll: bool = True,
     heartbeat=None,
     heartbeat_every: int = 8,
+    give_up_optional=None,
 ) -> dict:
     """Poll every meter this tool knows how to read, in one pass, and
     return {column: value} covering every name in ALL_METER_FIELDS.
@@ -1876,9 +3512,58 @@ def _poll_all_meters(
         if heartbeat is not None and exchanges % heartbeat_every == 0:
             heartbeat()
 
+    if give_up_optional is None:
+        give_up_optional = _never_give_up
+
     def poll(name, fn, *args):
+        """One long poll, with §12.4's requeue rather than a failure.
+
+        §12.4: "When the host receives an event response to a long poll, it
+        considers the long poll NACKed and REINSERTS THE LONG POLL INTO ITS
+        TRANSMIT QUEUE." Not "gives up on it", which is what this did until
+        2026-11-06.
+
+        The difference is the whole of acceptance row P7. A customer
+        pressing CHANGE and CASHOUT repeatedly -- which the operator has
+        watched customers do on purpose, believing it affects the system --
+        raises a burst of events, every one of which can pre-empt a long
+        poll. Exhaust the transport's reissue budget and the meter read was
+        simply lost, and recorded as a fault.
+
+        It is not a fault. Every pre-emption CARRIED A REAL EVENT AWAY: the
+        queue is shorter for it and nothing was dropped. So the poll is put
+        back and sent again after a heartbeat, and a heartbeat is the right
+        thing to do first because a general poll drains one event for one
+        byte, where reissuing this long poll drains one for seventy.
+
+        Only when the second attempt is pre-empted too does it become a
+        failure -- and even then it is recorded under its own error type,
+        so a mashing customer never again looks like a dying cable.
+        """
         try:
             result = fn(*args)
+        except SASPreempted as first:
+            # §12.4's requeue. Drain cheaply, then send it again.
+            beat()
+            # `now` IS A PARAMETER, and was not until 2026-11-08.
+            #
+            # This line read `f"[{now}] ..."` with no `now` anywhere in
+            # this function's scope. It is on the §12.4 requeue path, which
+            # only runs when a long poll is pre-empted -- so it never
+            # executed in any test or any ordinary cycle, and raised
+            # NameError the first time a real customer-style button burst
+            # drove it. That ENDED TWO SOAKS: 2026-11-08T17:16 (unexplained
+            # for a day) and 2026-11-08T22:51, the second one deliberately
+            # reproduced with the log attached. See handover §29.
+            print(f"[{now}] {name} was pre-empted "
+                  f"{first.events_collected} time(s) by real time events "
+                  f"(§12.3); requeued per §12.4 after a heartbeat")
+            try:
+                result = fn(*args)
+            except SASPreempted as second:
+                raise _MeterPollFailure(name, second) from second
+            except SASError as e:
+                raise _MeterPollFailure(name, e) from e
         except SASError as e:
             raise _MeterPollFailure(name, e) from e
         METER_SUPPORT.record_success(name)
@@ -1956,13 +3641,25 @@ def _poll_all_meters(
 
     if full_sweep:
         for lp, column in SINGLE_METER_COLUMNS.items():
+            if give_up_optional():
+                # Stop HERE, mid-sweep. Everything still unread is left
+                # None, which is what a skipped sweep already means.
+                for remaining in SINGLE_METER_COLUMNS.values():
+                    values.setdefault(remaining, None)
+                break
             values[column] = poll_optional(f"send_meter({lp.name})", client.send_meter, lp)
+        for column in SINGLE_METER_COLUMNS.values():
+            values.setdefault(column, None)
     else:
         for column in SINGLE_METER_COLUMNS.values():
             values[column] = None
 
     if table_c7_sweep:
         for i in range(0, len(TABLE_C7_EXTENDED_CODES), TABLE_C7_CHUNK_SIZE):
+            if give_up_optional():
+                for remaining in TABLE_C7_EXTENDED_COLUMNS:
+                    values.setdefault(remaining, None)
+                break
             chunk_codes = TABLE_C7_EXTENDED_CODES[i:i + TABLE_C7_CHUNK_SIZE]
             chunk_columns = TABLE_C7_EXTENDED_COLUMNS[i:i + TABLE_C7_CHUNK_SIZE]
             chunk_num = i // TABLE_C7_CHUNK_SIZE + 1
@@ -2018,6 +3715,10 @@ def _poll_all_meters(
 
     if validation_meters_sweep:
         for vt in VALIDATION_METER_TYPES:
+            if give_up_optional():
+                for column in VALIDATION_METER_COLUMNS_FLAT:
+                    values.setdefault(column, None)
+                break
             result = poll(f"send_validation_meters({vt.name})", client.send_validation_meters, vt)
             total_col, amount_col = VALIDATION_METER_COLUMNS[vt]
             values[total_col] = result.total_validations
@@ -2029,9 +3730,174 @@ def _poll_all_meters(
     return values
 
 
+AFT_CASHOUT_REQUEST = 0x6A       # §8.7, AFT request for host cashout
+AFT_WIN_CASHOUT_REQUEST = 0x6B   # §8.7, AFT request for host to cash out a win
+
+
+def _decline_aft_cashout(client, conn: sqlite3.Connection, now: str,
+                         exception_code: int) -> None:
+    """Answer §8.7's 0x6A with an all-zeros LP 0x72: "not by AFT, use your
+    own means."
+
+    WHAT THIS IS WORTH, measured on the wire 2026-10-28 with nothing
+    answering. Cashout on this cabinet is a THREE-STAGE LADDER and only the
+    middle stage is in the migration spec:
+
+        0x6A  AFT request for host cashout     8 repeats over   7.652 s
+        0x57  system validation request       10 repeats over   9.796 s
+        0x51  handpay is pending              then every      15.248 s
+        button press -> handpay                               17.884 s
+
+    So the machine falls through to the ticket path on its own -- stage 1 is
+    not a dead end -- but EVERY CASHOUT BURNS ABOUT EIGHT SECONDS THERE,
+    with a fully stocked validation pool and nothing wrong. A player presses
+    cash out and watches a dead screen before the ticket even begins. They
+    press again, and then they call somebody.
+
+    §8.7 permits exactly this answer: "all amounts may be set to zero to
+    instruct the gaming machine to perform the cashout by whatever other
+    means are available."
+
+    IT MOVES NO MONEY. Every amount is zero; this is a decline, not a
+    transfer. That matters here because this poller is otherwise forbidden
+    from touching money at all.
+
+    AND IT ADDS NO DEPENDENCY, which is the real argument. If the gateway is
+    down, stage 1 times out after ~8 s and the machine proceeds exactly as
+    it does today. That is the opposite of stage 2, where a missing answer
+    CAUSES a handpay. So this is upside when the gateway is up and costs
+    nothing when it is not.
+
+    OFF BY DEFAULT, and per-model. examples/host_cashout.py measured a
+    denied cashout on an EGT Premier WITH NO PRINTER producing a handpay
+    inside two minutes: with no printer, "whatever other means are
+    available" is an attendant. On such a cabinet this makes things worse,
+    faster. The ladder above is this cabinet's; check it per model before
+    enabling anywhere.
+    """
+    try:
+        result = client.aft_transfer_funds(
+            transfer_code=AFT_TRANSFER_CODE_FULL_ONLY,
+            transaction_index=0x00,
+            transfer_type=int(AftTransferType.IN_HOUSE_FROM_GAMING_MACHINE_TO_HOST),
+            cashable_amount=0,
+            restricted_amount=0,
+            nonrestricted_amount=0,
+            transaction_id=f"DECLINE{int(time.time())}",
+        )
+    except SASError as e:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) "
+            "VALUES (?, ?, ?, ?)",
+            (now, f"decline_aft_cashout(0x{exception_code:02X})",
+             type(e).__name__, str(e)))
+        _safe_commit(conn, now)
+        print(f"[{now}] could not decline the AFT cashout request: {e}. "
+              f"The machine will time out stage 1 on its own in ~8s and "
+              f"carry on, so this is slow rather than broken.")
+        return
+    conn.execute(
+        "INSERT INTO lab_auto_actions (occurred_at, action, detail, outcome) "
+        "VALUES (?, ?, ?, ?)",
+        (now, "decline_aft_cashout",
+         f"0x{exception_code:02X}: all-zeros LP 0x72 (§8.7)",
+         f"status 0x{int(getattr(result, 'transfer_status', 0) or 0):02X}"))
+    _safe_commit(conn, now)
+    print(f"[{now}] declined the AFT cashout request (§8.7 all-zeros LP "
+          f"0x72). The machine goes straight to its own cashout means "
+          f"instead of burning ~8s waiting for a host that is not there.")
+
+
+GAME_STARTED = 0x7E
+
+
+def _check_stream_continuity(conn: sqlite3.Connection, now: str,
+                             state: "PollState", fields: dict | None) -> None:
+    """§12.5.3's arithmetic, on every game start, while it is happening.
+
+    THE ONE CHECK THAT NEEDS NO METERS. §12.5.3 places the coin-in meter
+    inside the game-start event, AFTER the wager, so two consecutive starts
+    must differ by exactly the later one's wager:
+
+        this.total_coin_in - previous.total_coin_in == this.wager_cents
+
+    When they differ by more, a game start went missing in between, and the
+    excess is how much was wagered in it. The stream audits itself.
+
+    WHY THIS RUNS LIVE RATHER THAN IN A REPORT. rte_reconcile.py has had
+    this arithmetic since it was written, and on 2026-11-06 it found nine
+    lost game starts in the operator's session -- THREE HOURS LATE, because
+    nothing ran it until he asked by hand. The soak report showed the
+    start/end gap climbing and nothing that explained it.
+
+    The operator's requirement is that extended meters and RTE must match
+    unless the gateway lost communication. This is how a gateway knows the
+    moment they stop matching, instead of finding out from a post-mortem.
+
+    A NOTE ON WHAT IT CANNOT SEE. A gateway restart or a dead cable breaks
+    the chain legitimately -- play continues while nobody is polling -- and
+    the next start after the gap will look like a loss. The caller resets
+    the chain on a comms gap for exactly that reason, so a run that spans
+    one does not cry wolf.
+    """
+    if not fields:
+        return
+    coin_in = fields.get("total_coin_in")
+    wager = fields.get("wager_cents")
+    if coin_in is None:
+        return
+
+    previous, previous_at = state.last_game_start_coin_in, state.last_game_start_at
+    state.last_game_start_coin_in = coin_in
+    state.last_game_start_at = now
+    if previous is None or wager is None:
+        return
+
+    # §12.5.3's meter only ever rises. A fall is a RAM clear or a bad read,
+    # not a lost event, and reporting it as one would be a false alarm on
+    # the day a technician clears the machine.
+    if coin_in < previous:
+        state.last_game_start_coin_in = coin_in
+        return
+
+    unexplained = (coin_in - previous) - wager
+    if unexplained <= 0:
+        return
+
+    state.stream_gaps += 1
+    state.gaps_this_cycle += 1
+    state.stream_credits_lost += unexplained
+    conn.execute(
+        "INSERT INTO stream_gaps (detected_at, previous_at, previous_coin_in, "
+        "this_coin_in, this_wager, unexplained_credits) VALUES (?,?,?,?,?,?)",
+        (now, previous_at, previous, coin_in, wager, unexplained))
+    _safe_commit(conn, now)
+    # SPINS, NOT CREDITS. The operator, 2026-11-09: "I would like to know
+    # how many spins were undetected." A credit figure is the money, which
+    # the meters already have; the SPIN count is what is missing from the
+    # player's history, and it is the thing a CMS cannot reconstruct.
+    #
+    # Exact only while the bet is unchanged across the gap -- the missing
+    # spins are missing, so their wagers are unknown and this cabinet's
+    # own last wager is the only divisor available. Labelled as an
+    # estimate rather than dressed up as a count.
+    spins = (unexplained / wager) if wager else 0
+    spin_note = (f" ~{spins:.0f} spin(s) at {wager}/spin"
+                 + ("" if spins == int(spins) else
+                    " — NOT a whole number, so the bet changed inside the gap")
+                 if wager else "")
+    print(f"[{now}] ** STREAM GAP: coin in rose {coin_in - previous} but this "
+          f"game wagered {wager}; {unexplained} credits unaccounted for,"
+          f"{spin_note}. "
+          f"A game start went missing between {previous_at} and now. "
+          f"({state.stream_gaps} gap(s), {state.stream_credits_lost} credits "
+          f"this run.)")
+
+
 def _dispatch_exception(
     client, conn: sqlite3.Connection, now: str, exception_code: int, *,
-    source: str = "cycle", state: "PollState | None" = None
+    source: str = "cycle", state: "PollState | None" = None,
+    fields: dict | None = None
 ) -> None:
     """Record one general-poll exception, then act on it if it is actionable.
 
@@ -2054,10 +3920,19 @@ def _dispatch_exception(
     investigate" into "the door was open".
     """
     if exception_code != ExceptionCode.NONE:
+        if state is not None:
+            # The numerator for the headroom figure below. Counted here
+            # rather than at the drain so that a heartbeat's own events and
+            # an interleaved one are weighed the same -- they cost the same
+            # poll slot, which is the resource being measured.
+            state.events_this_cycle += 1
+            if int(exception_code) == BUFFER_OVERFLOW_EXCEPTION:
+                state.overflows_this_cycle += 1
         conn.execute(
-            "INSERT INTO machine_events (occurred_at, exception_code, description, source) "
-            "VALUES (?, ?, ?, ?)",
-            (now, int(exception_code), describe_exception(int(exception_code)), source),
+            "INSERT INTO machine_events (occurred_at, exception_code, description, "
+            "source, rte_fields) VALUES (?, ?, ?, ?, ?)",
+            (now, int(exception_code), describe_exception(int(exception_code)), source,
+             json.dumps(fields, sort_keys=True) if fields else None),
         )
         _safe_commit(conn, now)
 
@@ -2071,19 +3946,579 @@ def _dispatch_exception(
               f"(0x{int(exception_code):02X}); a new epoch opens with this "
               "cycle's meters.")
 
+    if int(exception_code) == GAME_STARTED and state is not None:
+        # Before anything else: the stream's own arithmetic, on every start.
+        _check_stream_continuity(conn, now, state, fields)
+
     if exception_code == ExceptionCode.TICKET_INSERTED:
-        _capture_ticket_in(client, conn, now)
+        _capture_ticket_in(client, conn, now, state)
     elif exception_code == ExceptionCode.TICKET_TRANSFER_COMPLETE:
         _capture_ticket_in_completion(client, conn, now)
     elif exception_code in (ExceptionCode.CASH_OUT_TICKET_PRINTED, ExceptionCode.HANDPAY_VALIDATED):
         _drain_ticket_out_history(client, conn, now)
     elif exception_code == ExceptionCode.SYSTEM_VALIDATION_REQUEST:
         _handle_cashout_request(client, conn, now)
+    elif int(exception_code) == 0x69:
+        _acknowledge_aft_transfer(client, conn, now)
+    elif (int(exception_code) in (AFT_CASHOUT_REQUEST, AFT_WIN_CASHOUT_REQUEST)
+          and state is not None and state.decline_aft_cashout):
+        _decline_aft_cashout(client, conn, now, int(exception_code))
+    elif int(exception_code) == 0x3C:
+        # "Operator changed options" -- the ONLY in-band signal that this
+        # cabinet's configuration has moved, a denomination among the things
+        # it covers. It was recognised in the description table and dispatched
+        # nowhere, which meant a denomination change could happen with nothing
+        # in the database marking when: every credit figure after it wrong by
+        # a factor, and no way to find the boundary afterwards.
+        #
+        # Deferred rather than acted on here, exactly like the comms-restored
+        # interrogation: re-reading the configuration is ~150 long polls and
+        # this dispatcher can be running from inside a meter sweep.
+        if state is not None:
+            state.options_change_pending = now
+            print(f"[{now}] exception 0x3C: the operator changed options. "
+                  "Re-reading the machine's configuration after this cycle's "
+                  "sweep -- a denomination change makes every credit figure "
+                  "before and after it incomparable.")
     elif exception_code == ExceptionCode.HANDPAY_PENDING:
-        _capture_handpay(client, conn, now)
+        _capture_handpay(client, conn, now, state)
+    elif exception_code == ExceptionCode.HANDPAY_RESET:
+        # Somebody turned the key, or our own LP 0x94 landed. Either way the
+        # lockup is gone and the clock must stop, or the next cycle would
+        # "reset" a handpay that no longer exists.
+        if state is not None:
+            state.handpay_pending_since = None
 
 
-def _make_heartbeat(client, conn: sqlite3.Connection, now: str, seen: list):
+def interrogate(client, conn: sqlite3.Connection, state: "PollState", now: str,
+                *, reason: str, gap_seconds: float | None = None,
+                heartbeat=None, monotonic_fn=time.monotonic) -> int:
+    """Everything the machine will tell us about itself, in one pass.
+
+    Run on first connect and whenever the link has been down long enough for
+    somebody to have moved the cable (DEFAULT_COMMS_GAP_SECONDS). The
+    question it answers is not "what did we miss" -- events lost to a gap are
+    gone and §2.2.1 says so -- but "is this the same machine, configured the
+    same way, as the one that was answering before".
+
+    IT MUST BE HEARTBEAT-DRIVEN, and that is not a detail. On the lab cabinet
+    this pass is ~150 long polls at the 88 ms each a 73-poll sweep measured,
+    which is thirteen seconds of not draining the exception queue -- longer
+    than the queue takes to overflow on a machine being played. An
+    interrogation that ran without draining would cause exactly the loss it
+    exists to detect, and would do it silently, at the moment its output is
+    most trusted.
+
+    Every poll is individually optional. §4.4 lets a machine ignore a long
+    poll it does not implement, and a cabinet that answers nothing here has
+    still been interrogated -- the row records what it refused, which is
+    itself a fact about the machine.
+    """
+    started = monotonic_fn()
+    identity = read_identity(client)
+    state.identity = identity
+    state.cycles_since_identity = 0
+
+    previous = conn.execute(
+        "SELECT serial_number, asset_number, sas_version FROM machine_epochs "
+        "WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+    changed = None
+    if previous is not None:
+        changed = identity_changed(
+            {"serial_number": previous[0], "asset_number": previous[1],
+             "sas_version": previous[2]}, identity)
+
+    if previous is None:
+        # Nothing to compare against yet. The baseline has to be written here
+        # or the NEXT interrogation has nothing to detect a swap against --
+        # which is the whole purpose, and was this function's first bug.
+        state.epoch_id = open_epoch(
+            conn, now, "first_seen", identity,
+            f"first interrogation ({reason})")
+        print(f"[{now}] epoch {state.epoch_id} opened (first_seen): "
+              f"serial {identity.get('serial_number')} "
+              f"asset {identity.get('asset_number')}")
+    elif changed and changed[0] == "machine_changed":
+        state.epoch_id = open_epoch(
+            conn, now, "machine_changed", identity,
+            f"after {reason}: {changed[1]}")
+        print(f"[{now}] *** DIFFERENT MACHINE after {reason}: {changed[1]}")
+        print(f"[{now}] epoch {state.epoch_id} opened. Meters from here belong "
+              "to the new cabinet; nothing before this line does.")
+    elif reason == "comms_restored":
+        state.epoch_id = open_epoch(
+            conn, now, "comms_restored", identity,
+            f"link down {gap_seconds:.0f}s; same machine answered on recovery"
+            if gap_seconds else "link restored")
+        print(f"[{now}] epoch {state.epoch_id} opened (comms_restored): same "
+              f"machine, but {gap_seconds:.0f}s of events are unrecoverable "
+              "(§2.2.1) so continuity is broken here.")
+
+    if heartbeat:
+        heartbeat()
+
+    features = None
+    try:
+        f = client.send_enabled_features()
+        features = {k: v for k, v in vars(f).items()}
+        # Table 7.14e bit 0. Cached because the fast-poll decision is taken
+        # every time drain priority flips, and re-reading LP 0xA0 there
+        # would cost a long poll in the one condition where poll slots are
+        # the scarce resource.
+        state.fast_poll_supported = bool(
+            getattr(f, "max_polling_rate_40ms", False))
+    except SASError as e:
+        features = {"error": f"{type(e).__name__}: {e}"}
+    if heartbeat:
+        heartbeat()
+
+    cur = conn.execute(
+        "INSERT INTO interrogations (started_at, reason, gap_seconds, epoch_id, "
+        "serial_number, asset_number, sas_version, machine_changed, "
+        "identity_note, enabled_features) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (now, reason, gap_seconds, state.epoch_id,
+         identity.get("serial_number"), identity.get("asset_number"),
+         identity.get("sas_version"),
+         1 if (changed and changed[0] == "machine_changed") else 0,
+         changed[1] if changed else None,
+         json.dumps(features, sort_keys=True, default=str)))
+    interrogation_id = cur.lastrowid
+    _safe_commit(conn, now)
+
+    games = _interrogate_games(client, conn, interrogation_id, heartbeat)
+    redeemed = _interrogate_last_redeemed(client, heartbeat)
+    tickets = backfill_ticket_out_history(client, conn)
+
+    conn.execute(
+        "UPDATE interrogations SET games_found = ?, ticket_out_records = ?, "
+        "last_redeemed = ?, duration_seconds = ? WHERE id = ?",
+        (games, tickets,
+         json.dumps(redeemed, sort_keys=True, default=str) if redeemed else None,
+         monotonic_fn() - started, interrogation_id))
+    _safe_commit(conn, now)
+    print(f"[{now}] interrogation {interrogation_id} ({reason}): "
+          f"{games} game(s), {tickets} ticket-out record(s), "
+          f"{monotonic_fn() - started:.1f}s")
+    return interrogation_id
+
+
+def _interrogate_games(client, conn, interrogation_id: int, heartbeat) -> int:
+    """Every game the machine implements, by both routes.
+
+    LP 0x53 carries the configuration -- denomination, max bet, paytable id,
+    base percentage -- and LP 0xB5 carries the human-readable game and
+    paytable NAMES that 0x53 does not. Neither is a superset, so both are
+    read, and a game answering only one still gets a row.
+
+    Game numbering starts at 1. Game 0 is "the machine as a whole" in most
+    polls and is not a game, so it is not enumerated here.
+    """
+    # LP 0x51 is the count. If the machine will not give it, LP 0x54's list
+    # of ENABLED games is a floor rather than the full set -- a disabled game
+    # is still implemented and still has a configuration worth recording --
+    # so it is only the fallback.
+    implemented = None
+    try:
+        implemented = client.send_meter(LongPoll.SEND_TOTAL_GAMES_IMPLEMENTED)
+    except SASError:
+        pass
+    if not implemented:
+        try:
+            enabled = client.send_enabled_game_numbers()
+            implemented = max(enabled) if enabled else 0
+        except SASError:
+            implemented = 0
+    if not implemented:
+        return 0
+
+    found = 0
+    for number in range(1, int(implemented) + 1):
+        config = extended = None
+        try:
+            config = client.send_game_n_configuration(number)
+        except SASError:
+            pass
+        if heartbeat:
+            heartbeat()
+        try:
+            extended = client.send_extended_game_n_information(number)
+        except SASError:
+            pass
+        if heartbeat:
+            heartbeat()
+        if config is None and extended is None:
+            continue
+        found += 1
+        conn.execute(
+            "INSERT INTO interrogation_games (interrogation_id, game_number, "
+            "game_id, additional_id, denomination, max_bet, progressive_group, "
+            "game_options, paytable_id, base_percentage, game_name, "
+            "paytable_name, progressive_levels, wager_categories) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT (interrogation_id, game_number) DO NOTHING",
+            (interrogation_id, number,
+             getattr(config, "game_id", None),
+             getattr(config, "additional_id", None),
+             getattr(config, "denomination", None),
+             getattr(config, "max_bet", None) if config else getattr(extended, "max_bet", None),
+             getattr(config, "progressive_group", None) if config
+             else getattr(extended, "progressive_group", None),
+             getattr(config, "game_options", None),
+             getattr(config, "paytable_id", None),
+             getattr(config, "base_percentage", None),
+             getattr(extended, "game_name", None),
+             getattr(extended, "paytable_name", None),
+             getattr(extended, "progressive_levels", None),
+             getattr(extended, "wager_categories", None)))
+    return found
+
+
+def _interrogate_last_redeemed(client, heartbeat) -> dict | None:
+    """LP 0x71/FF, the read-only status query -- the only SAS-side record of
+    the last ticket this machine was asked to redeem, including a refusal.
+    One cycle deep (§15.12), so an interrogation is the last chance to see
+    whatever is still in it."""
+    try:
+        result = client.redeem_ticket_status()
+    except (SASError, AttributeError):
+        return None
+    finally:
+        if heartbeat:
+            heartbeat()
+    return {k: v for k, v in vars(result).items()} if result else None
+
+
+# Exceptions whose deadline is shorter than a meter sweep, so a heartbeat
+# must act on them where it finds them instead of queueing them for the end.
+#
+#   0x67  ticket inserted            §15.12 allows 30 s
+#   0x57  system validation request  §15.7 allows TEN
+#
+# Everything else waits: handling a cashout or a config re-read mid-sweep is
+# the "long polls from inside a long poll loop" the deferral was built to
+# avoid, and nothing else here has a deadline a sweep can miss.
+# How many general polls one heartbeat may spend draining before it gives
+# the sweep its turn back.
+#
+# Twenty is a whole §2.2.1 queue: a heartbeat that drains twenty and still
+# finds more has met a machine generating faster than the host may poll,
+# which no cap fixes and §12.2's relaxation is the only lever for. Below
+# that it empties the queue and the sweep resumes with nothing waiting.
+HEARTBEAT_DRAIN_CAP = 20
+
+LATENCY_CRITICAL_EXCEPTIONS = frozenset({0x67, 0x57})
+
+
+def _make_credit_sampler(client, conn: sqlite3.Connection, every: int):
+    """LP 0x1A on an EMPTY queue only, so the credit gauge costs no event.
+
+    WHY THIS EXISTS. Detector 7 in rte_reconcile.py is the operator's
+    ledger -- credits before, minus wagers, plus wins, equals credits after
+    -- and it is the only check on this project that can score an
+    individual game END. Its resolution is set by how often the gauge is
+    read. Today that is once per cycle, about 25 games, so a one-game fault
+    is far below one interval's tolerance and only the signed total over
+    hundreds of intervals can see it. One reading between consecutive games
+    makes the per-game chain exact.
+
+    THE CONSTRAINT IS THE OPERATOR'S, AND IT DECIDES THE DESIGN:
+
+        "The cost is important. Button bursts shouldn't make the events
+        lost. All our aim is gathering correct data without jeopardizing
+        the correct polling."
+
+    So this is NOT a timer. It fires only in the one moment when a poll
+    provably cannot displace an event: immediately after a heartbeat has
+    drained the queue to EMPTY (§18). A poll issued against an empty queue
+    has no event to carry, so the slot it spends was not carrying one.
+
+    Under a button burst the queue is never empty -- the heartbeat hits
+    HEARTBEAT_DRAIN_CAP instead of returning on ExceptionCode.NONE -- and
+    the sampler never runs. **It suppresses itself exactly when the machine
+    is busiest, which is precisely when event collection must not be
+    competed with**, and resumes with no intervention when the burst ends.
+    The gauge is a convenience; the event stream is the product.
+
+    ONE HONEST CAVEAT. Between the heartbeat reading empty and this poll
+    going out, an event can arrive -- §12.3 then lets the machine answer
+    THIS long poll with that event instead of the credit value. Nothing is
+    lost: the event is collected by the normal pre-emption path and only
+    the credit sample is missed. SASPreempted is therefore skipped in
+    silence, not recorded as a fault.
+    """
+    def sample() -> None:
+        sample.beats += 1
+        if every <= 0 or sample.beats % every:
+            return
+        try:
+            credits = client.send_meter(LongPoll.SEND_CURRENT_CREDITS)
+        except SASPreempted:
+            # An event beat us to the slot. It was collected; this reading
+            # was not. Not a fault, and not worth a row.
+            sample.preempted += 1
+            return
+        except SASError:
+            sample.failed += 1
+            return
+        try:
+            conn.execute(
+                "INSERT INTO credit_samples (sampled_at, credits, heartbeats) "
+                "VALUES (?, ?, ?)", (utc_now(), int(credits), sample.beats))
+        except sqlite3.Error:
+            # A sample is diagnostics. It must never abort a cycle.
+            sample.failed += 1
+            return
+        sample.taken += 1
+
+    sample.beats = 0
+    sample.taken = 0
+    sample.preempted = 0
+    sample.failed = 0
+    return sample
+
+
+# WfA ON-DEMAND PULLS. The spec's three numbers, and what each one costs:
+#
+#   500 ms p95, 1 s hard, end to end     -- a cashier is at the window
+#   repeat pulls >= 10 s apart            -- the abuse control
+#   "an on-demand pull takes the NEXT poll slot and never interrupts an
+#    in-flight poll -- a naive bypass here would reintroduce exactly the
+#    mid-poll gap this project exists to remove"
+#
+# The third is the one with teeth, and it is satisfied structurally rather
+# than by care: the servicer is only ever called from the heartbeat, which by
+# construction runs BETWEEN exchanges. There is no code path from here into
+# the middle of a frame, so "never interrupts an in-flight poll" is not a
+# rule somebody has to remember.
+#
+# THE LATENCY BUDGET IS MET BY NOT GOING TO THE WIRE. A full LP 0x4D walk is
+# 31 exchanges; at the ~83 ms per long poll this gateway actually measures
+# that is 2.6 seconds, which blows the 1 s hard budget on its own. No amount
+# of scheduling fixes that.
+#
+# What fixes it is that the gateway usually already knows. It drains LP 0x4D
+# continuously into ticket_out_history and backfills the whole buffer at
+# startup, so the ticket a cashier is scanning is normally a row we already
+# have. That path costs ZERO poll slots and answers in under a millisecond.
+# The wire walk is the fallback for the case the local record cannot cover --
+# the gateway was down when the ticket printed, or its database was replaced.
+#
+# WHERE THIS DIFFERS FROM THE CREDIT SAMPLER, deliberately. That one fires
+# only on an EMPTY queue, so a button burst suppresses it completely: the
+# gauge is a convenience and the event stream is the product. A WfA pull
+# cannot take that rule, because the thing waiting on it is a person at a
+# cage window, not a detector's resolution. So the wire walk DOES run under
+# load -- but it is capped per visit, it stops at its deadline, and every
+# request records what it cost in poll slots. The trade is made visible
+# rather than argued about.
+WFA_POLLS_PER_VISIT = 4
+WFA_PULL_RATE_CAP_S = 10.0
+WFA_BUFFER_INDICES = 31
+WFA_DEFAULT_DEADLINE_MS = 1000
+
+
+def _lookup_ticket_out_local(conn: sqlite3.Connection, validation_number: int):
+    """The fast path: has this gateway already seen the ticket print?
+
+    Indexed by ticket_out_history's UNIQUE(validation_number, ...), whose
+    leading column is the one asked for here. Most recent first, because a
+    validation number should be unique but a pool that was re-seeded by hand
+    is exactly the kind of thing that turns out not to be.
+    """
+    row = conn.execute(
+        "SELECT amount_cents, validation_type, ticket_date, ticket_time, "
+        "       ticket_number, captured_at "
+        "  FROM ticket_out_history WHERE validation_number = ? "
+        " ORDER BY id DESC LIMIT 1", (int(validation_number),)).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return {"amount_cents": row[0], "validation_type": row[1],
+            "ticket_date": row[2], "ticket_time": row[3],
+            "ticket_number": row[4], "captured_at": row[5]}
+
+
+def _make_request_servicer(client, conn: sqlite3.Connection, state=None, *,
+                           now_fn=utc_now, clock=time.monotonic,
+                           polls_per_visit: int = WFA_POLLS_PER_VISIT,
+                           rate_cap_s: float = WFA_PULL_RATE_CAP_S):
+    """Serve inbound host_requests at poll-slot boundaries.
+
+    Returns a callable taking no arguments. Call it from the heartbeat and
+    nowhere else -- see the note above on why that placement IS the
+    never-interrupt rule.
+
+    One request is worked at a time. A walk that does not finish inside one
+    visit keeps its position and resumes on the next, so a request never
+    holds the sweep: it takes `polls_per_visit` slots, yields, and comes
+    back.
+    """
+    walk = {}            # in-flight buffer walk, if any: id -> next index
+
+    def _finish(req_id, started_at, *, state_name, served_from=None,
+                amount=None, payload=None, error=None, polls=0):
+        now = now_fn()
+        latency = None
+        if started_at is not None:
+            latency = int(max(0.0, (clock() - started_at)) * 1000)
+        conn.execute(
+            "UPDATE host_requests SET state = ?, completed_at = ?, "
+            "       served_from = ?, amount_cents = ?, result_json = ?, "
+            "       error = ?, latency_ms = ?, "
+            "       polls_spent = polls_spent + ? "
+            " WHERE id = ?",
+            (state_name, now, served_from, amount,
+             json.dumps(payload) if payload is not None else None,
+             error, latency, int(polls), req_id))
+        _safe_commit(conn, now)
+        walk.pop(req_id, None)
+
+    def _elapsed_ms(requested_at: str) -> float:
+        """How long the SERVER has been waiting. The budget is end to end,
+        so it runs from the row's own requested_at and not from the moment
+        this gateway noticed it."""
+        try:
+            started = datetime.datetime.fromisoformat(requested_at)
+        except (TypeError, ValueError):
+            return 0.0
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=datetime.timezone.utc)
+        delta = datetime.datetime.now(datetime.timezone.utc) - started
+        return delta.total_seconds() * 1000.0
+
+    def service() -> None:
+        try:
+            row = conn.execute(
+                "SELECT id, kind, validation_number, deadline_ms, "
+                "       requested_at, state "
+                "  FROM host_requests "
+                " WHERE state IN ('pending','claimed') ORDER BY id LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            return
+        if row is None:
+            return
+        req_id, kind, number, deadline_ms, requested_at, req_state = row
+        started = clock()
+
+        if kind != "wfa_pull":
+            _finish(req_id, None, state_name="failed",
+                    error=f"unknown request kind {kind!r}")
+            return
+        if number is None:
+            _finish(req_id, None, state_name="failed",
+                    error="wfa_pull with no validation_number")
+            return
+
+        if req_state == "pending":
+            conn.execute(
+                "UPDATE host_requests SET state = 'claimed', claimed_at = ? "
+                " WHERE id = ?", (now_fn(), req_id))
+            _safe_commit(conn, now_fn())
+
+        # THE FAST PATH, and the reason the budget is achievable at all.
+        local = _lookup_ticket_out_local(conn, number)
+        if local is not None:
+            _finish(req_id, started, state_name="done", served_from="local",
+                    amount=local["amount_cents"], payload=local, polls=0)
+            return
+
+        # Past the hard deadline: stop spending the event stream on somebody
+        # who is no longer waiting. Expired is not failed -- the request was
+        # well formed and the answer simply did not arrive in time.
+        budget = deadline_ms if deadline_ms else WFA_DEFAULT_DEADLINE_MS
+        if _elapsed_ms(requested_at) > budget:
+            _finish(req_id, started, state_name="expired",
+                    error=f"deadline {budget} ms exceeded before an answer",
+                    polls=0)
+            return
+
+        # THE 10-SECOND PULL CAP, and the case it actually protects.
+        #
+        # The first version of this guarded a repeat of a ticket we had
+        # already FOUND, which is close to dead code: a successful walk
+        # inserts the record into ticket_out_history, so the next scan of
+        # the same ticket is answered by the fast path above at zero cost
+        # and never reaches here. A test caught it on the day it was
+        # written.
+        #
+        # The expensive repeat is the one that finds NOTHING. A validation
+        # number the cabinet's buffer does not hold costs a full 31-index
+        # walk EVERY time it is scanned, and a cashier with a bad ticket
+        # will scan it more than once. That is the abuse the cap is for, so
+        # the lookup below deliberately does NOT require an amount: a
+        # remembered "not in the buffer" is exactly what must be reused.
+        cached = conn.execute(
+            "SELECT amount_cents, result_json, completed_at FROM host_requests "
+            " WHERE validation_number = ? AND state = 'done' AND id <> ? "
+            " ORDER BY id DESC LIMIT 1", (int(number), req_id)).fetchone()
+        if cached is not None and _elapsed_ms(cached[2]) < rate_cap_s * 1000:
+            _finish(req_id, started, state_name="done", served_from="cache",
+                    amount=cached[0],
+                    payload=json.loads(cached[1]) if cached[1] else None,
+                    polls=0)
+            return
+
+        # THE SLOW PATH. One index per poll slot, `polls_per_visit` of them,
+        # then yield back to the sweep and resume on the next heartbeat.
+        index = walk.get(req_id, 1)
+        spent = 0
+        while spent < polls_per_visit and index <= WFA_BUFFER_INDICES:
+            try:
+                record = client.send_enhanced_validation_information(
+                    function_code=index)
+            except SASError:
+                # A machine with no printer ignores every index (§4.4), and a
+                # single timeout is not evidence either way. Count the slot,
+                # move on; the deadline is what ends this, not one failure.
+                spent += 1
+                index += 1
+                continue
+            spent += 1
+            index += 1
+            if _is_empty_ticket_out_record(record):
+                continue
+            _insert_ticket_out_record(conn, record, now_fn())
+            if int(record.validation_number) == int(number):
+                _finish(req_id, started, state_name="done",
+                        served_from="buffer-walk",
+                        amount=record.amount_cents,
+                        payload={"amount_cents": record.amount_cents,
+                                 "validation_type": record.validation_type,
+                                 "ticket_date": record.date,
+                                 "ticket_time": record.time,
+                                 "ticket_number": record.ticket_number,
+                                 "buffer_index": record.index_number},
+                        polls=spent)
+                return
+
+        conn.execute(
+            "UPDATE host_requests SET polls_spent = polls_spent + ? WHERE id = ?",
+            (spent, req_id))
+        _safe_commit(conn, now_fn())
+        service.polls_spent += spent
+        if state is not None:
+            state.wfa_polls_spent += spent
+
+        if index > WFA_BUFFER_INDICES:
+            # The whole buffer, and the number is not in it. That is an
+            # ANSWER, not a failure: §15.10's buffer holds 31 records and a
+            # busy cabinet wraps it. The server's fallback is the physical
+            # visit, and it needs to know it has reached that point.
+            _finish(req_id, started, state_name="done",
+                    served_from="buffer-walk", amount=None,
+                    payload={"found": False,
+                             "searched_indices": WFA_BUFFER_INDICES},
+                    polls=0)
+            return
+        walk[req_id] = index
+
+    service.polls_spent = 0
+    return service
+
+
+def _make_heartbeat(client, conn: sqlite3.Connection, now: str, seen: list,
+                    *, rte: bool = False, state: "PollState | None" = None,
+                    credit_sampler=None, request_servicer=None):
     """A general poll to run between long polls, so the machine's exception
     queue is drained while the meter sweep is in progress.
 
@@ -2100,25 +4535,190 @@ def _make_heartbeat(client, conn: sqlite3.Connection, now: str, seen: list):
     sweep: handling a ticket or cashout mid-sweep would mean issuing long
     polls from inside a long poll loop. One sweep of latency is well within
     the 30 seconds section 15.12 allows for a validation response.
+
+    THE INTERLEAVED BUFFER IS DRAINED FIRST, and that ordering is the whole
+    reason this function touches it at all. Under RTE an event can arrive in
+    place of a LONG poll's reply (12.3); the client keeps it, and the cycle
+    used to write those only at the end -- after every heartbeat code. So an
+    event that arrived DURING the long poll immediately before a heartbeat
+    was stored AFTER the heartbeat's own event, and the row ids ran backwards
+    against arrival.
+
+    On the 41-hour soak that inverted two game starts in one cycle: ids 2883
+    and 2884 carried total_coin_in 281,750 and 281,725, in that order. Since
+    12.5.3's total_coin_in only ever rises, rte_reconcile read the inversion
+    as a 50-credit jump with a 25-credit wager and reported 300 credits
+    "unaccounted for" across twelve gaps -- in adjacent pairs, which is the
+    signature of a swap rather than a loss. Nothing had been lost. Draining
+    here puts both sources into one list in true arrival order.
+
+    Entries are (code, fields, source) because the two sources keep their own
+    labels: an event that pre-empted a long poll is still 'rte-interleaved',
+    not something the heartbeat found.
+
+    UNDER RTE THIS MUST USE THE RTE POLL, and getting that wrong is not a
+    cosmetic bug. ``general_poll()`` returns ``response[0]``, the first byte
+    of the reply. In the ordinary mode that byte IS the exception code; under
+    real time event reporting the reply is Table 12.5's "address, FF, code,
+    data..., CRC", so the first byte is the gaming machine's ADDRESS. On
+    address 1 every heartbeat then reports a phantom "exception 0x01", and
+    worse, it consumes one byte of a multi-byte frame and leaves the rest in
+    the buffer for the next read to misframe.
+
+    Found on an idle lab cabinet within a minute of the first --rte run: ten
+    or eleven "exception 0x01 drained during the meter sweep: unknown/
+    unassigned code 0x01" per cycle, followed by a burst of interleaved
+    events whose codes were partly frame fragments. The cycle's own general
+    poll had been converted; this one had not.
     """
 
-    def heartbeat() -> None:
-        try:
-            code = client.general_poll()
-        except SASError:
-            # A failed heartbeat is not this cycle's problem to solve -- the
-            # cycle's own general poll has its own retry path. Draining is
-            # best-effort; the sweep must not abort over it.
-            return
-        if code != ExceptionCode.NONE:
-            seen.append(code)
+    def note(code: int, fields: dict | None, source: str) -> None:
+        """Queue the code, or act on it now if its deadline is short.
 
+        THE DEFERRAL MISSES THE DEADLINE, and the lab proved it. A 0x67
+        collected by a heartbeat used to wait for the whole sweep: 5.4 s on an
+        ordinary cycle, 16.8 s on a Table C-7 cycle, and **69.4 s** during the
+        startup interrogation measured on 2026-11-02. §15.12 gives thirty
+        seconds, so the machine had returned the ticket long before we read
+        LP 0x70 -- which is why four ticket_in_events rows that day say
+        "exception 0x67 fired but LP 0x70 reported no ticket in escrow".
+
+        §15.7 gives a system validation request only TEN seconds, so 0x57 is
+        worse: a C-7 cycle alone overruns it, and a 0x57 that goes unanswered
+        becomes a handpay.
+
+        The objection to dispatching here was "issuing long polls from inside a
+        long poll loop". SAS has no rule against that -- a sweep IS a sequence
+        of long polls, and Table 3.1's implied-ACK concern is about REPEATED
+        IDENTICAL polls, which these are not.
+        """
+        if state is not None:
+            # Every code the heartbeat sees costs one poll slot, which is
+            # the resource the drain probe is measuring. Counted here,
+            # before the latency-critical branch, so both paths weigh the
+            # same.
+            state.events_seen_live += 1
+        if int(code) in LATENCY_CRITICAL_EXCEPTIONS:
+            try:
+                _dispatch_exception(client, conn, now, int(code),
+                                    source=source, state=state, fields=fields)
+            except SASError:
+                # Best-effort, exactly like the heartbeat itself: the sweep
+                # must not abort because a ticket could not be answered.
+                pass
+            return
+        seen.append((int(code), fields, source))
+
+    def _drain_interleaved() -> None:
+        """Anything that pre-empted a long poll arrived BEFORE whatever this
+        heartbeat is about to read. Draining it first is what keeps row ids
+        in arrival order -- see the inversion described above."""
+        if not rte:
+            return
+        try:
+            for event in client.drain_rte_events():
+                note(int(event.code), event.fields or None, "rte-interleaved")
+        except SASError:
+            pass
+
+    def heartbeat() -> None:
+        heartbeat.count += 1
+        _drain_interleaved()
+
+        # THE WfA SLOT. This is the "next poll slot" the scheduling rule
+        # names: we are between exchanges, nothing is in flight, and a
+        # request serviced here cannot open a mid-poll gap.
+        #
+        # It sits AFTER the interleaved drain and is followed by another,
+        # because the servicer may issue LP 0x4D and §12.3 lets an event
+        # arrive in its place. Without the second drain those events would be
+        # filed after this heartbeat's own and the ids would run backwards --
+        # the same inversion that once produced twelve phantom "lost" game
+        # starts in adjacent pairs.
+        if request_servicer is not None:
+            try:
+                request_servicer()
+            except sqlite3.Error:
+                # An inbound request must never be able to stop the sweep.
+                # The row stays claimed and the next visit picks it up.
+                pass
+            _drain_interleaved()
+        # DRAIN TO EMPTY, not once.
+        #
+        # A heartbeat used to take exactly one general poll and return, so a
+        # sweep alternated long poll / general poll blindly. That drains ONE
+        # event per two slots while events can arrive faster, so under a
+        # burst the queue falls further behind with every pair.
+        #
+        # The queue is what decides whether anything is lost, and the
+        # inequality is:
+        #
+        #     sweep duration  <  queue depth / event rate
+        #
+        # At 300 ms, 60 long polls is 18 s of sweep. Against this cabinet's
+        # measured 67-deep queue and a 3.2 events/s burst the limit is 20.9 s,
+        # so it survived with 14% to spare. Against §2.2.1's guaranteed 20 the
+        # limit is 6.2 s, and the same sweep is THREE TIMES OVER. That is the
+        # floor risk, not a bench curiosity.
+        #
+        # Draining to empty removes the sweep's duration from the inequality
+        # altogether: the queue can only grow by what arrives between two
+        # checks, however long the whole sweep takes. A 73-poll sweep becomes
+        # safe on a cabinet that guarantees only 20.
+        #
+        # THE CAP IS NOT OPTIONAL. A machine firing events continuously would
+        # otherwise hold the sweep forever, and a meter row that never gets
+        # written is worse than a late one. On the cap the sweep resumes and
+        # the next heartbeat carries on draining -- nothing is dropped, it
+        # just takes longer.
+        drained = 0
+        while drained < HEARTBEAT_DRAIN_CAP:
+            try:
+                if rte:
+                    event = client.general_poll_rte()
+                    # §12.6: silence is no activity, not a failure.
+                    if event is None or int(event.code) == ExceptionCode.NONE:
+                        # THE QUEUE IS EMPTY. This is the only moment a
+                        # credit poll cannot cost an event, so it is the
+                        # only moment one is issued. See
+                        # _make_credit_sampler.
+                        if credit_sampler is not None:
+                            credit_sampler()
+                        return
+                    note(int(event.code), event.fields or None, "rte-heartbeat")
+                else:
+                    code = client.general_poll()
+                    if code == ExceptionCode.NONE:
+                        if credit_sampler is not None:
+                            credit_sampler()
+                        return
+                    note(int(code), None, "heartbeat")
+            except SASError:
+                # A failed heartbeat is not this cycle's problem to solve --
+                # the cycle's own general poll has its own retry path.
+                # Draining is best-effort; the sweep must not abort over it.
+                return
+            drained += 1
+            heartbeat.count += 1
+        heartbeat.capped += 1
+
+    # How many general polls this sweep actually spent. Read by the caller
+    # for the meter_poll=.../N label: the heartbeats share the §2.3.3 budget
+    # with the long polls, so a label that counts only long polls understates
+    # what the cycle put on the wire.
+    heartbeat.count = 0
+    # How many heartbeats hit the drain cap. Non-zero means events were
+    # arriving faster than one heartbeat could clear, which is the signal
+    # that the machine is under a burst -- worth seeing rather than
+    # inferring from cycle length afterwards.
+    heartbeat.capped = 0
     return heartbeat
 
 
 def _general_poll_with_retry(
-    client, conn: sqlite3.Connection, now: str, *, max_attempts: int, sleep_fn=time.sleep
-) -> tuple[int, int]:
+    client, conn: sqlite3.Connection, now: str, *, max_attempts: int,
+    sleep_fn=time.sleep, rte: bool = False
+) -> tuple[int, int, dict | None]:
     """SAS delivers exactly one pending exception per poll (§2.2.1); if
     the host doesn't drain it before the next one arrives, the earlier
     exception is overwritten with no trail at all — a real event, gone,
@@ -2139,11 +4739,19 @@ def _general_poll_with_retry(
     Each attempt after the first waits out whatever's left of that
     200 ms window since the previous attempt started, never more.
 
-    Returns (exception_code, attempt_number) on success. Raises the
-    final SASError if every attempt fails. Every failed attempt is
-    logged to poll_errors individually, numbered, so a flaky link shows
-    up as a distinguishable run of attempts rather than one opaque
-    failure.
+    Returns (exception_code, attempt_number, rte_fields) on success.
+    Raises the final SASError if every attempt fails. Every failed
+    attempt is logged to poll_errors individually, numbered, so a flaky
+    link shows up as a distinguishable run of attempts rather than one
+    opaque failure.
+
+    Under ``rte`` the poll is LP 0x0E's Table 12.5 message rather than a
+    single byte, and silence means something different: 12.6 says a
+    machine in real time event mode reports no activity by sending
+    NOTHING, so a None here is the idle it looks like, not a timeout to
+    retry. Retrying it would spend the whole attempt budget every quiet
+    cycle. (The lab cabinet sends an explicit code-00 event anyway, in
+    defiance of 12.6; both shapes land on ExceptionCode.NONE here.)
     """
     last_error: SASError | None = None
     attempt_started: float | None = None
@@ -2154,7 +4762,12 @@ def _general_poll_with_retry(
                 sleep_fn(remaining)
         attempt_started = time.monotonic()
         try:
-            return client.general_poll(), attempt
+            if not rte:
+                return client.general_poll(), attempt, None
+            event = client.general_poll_rte()
+            if event is None:
+                return int(ExceptionCode.NONE), attempt, None
+            return int(event.code), attempt, (event.fields or None)
         except SASError as e:
             last_error = e
             conn.execute(
@@ -2187,6 +4800,15 @@ def poll_and_log(
     general_poll_retries: int = DEFAULT_GENERAL_POLL_RETRIES,
     pool_age_alert_hours: float = DEFAULT_POOL_AGE_ALERT_HOURS,
     retry_sleep_fn=time.sleep,
+    rte: bool = False,
+    credit_poll_every: int = 0,
+    serve_host_requests: bool = False,
+    comms_gap_seconds: float = DEFAULT_COMMS_GAP_SECONDS,
+    lab_auto: "LabAutoConfig | None" = None,
+    drain_priority: bool = False,
+    drain_fast_poll: bool = False,
+    drain_fast_poll_interval: float = SAS_FAST_POLL_INTERVAL_S,
+    drain_fast_poll_fallback: float = 0.0,
 ) -> None:
     """Run one full cycle: a general poll (retried immediately, up to
     ``general_poll_retries`` consecutive attempts, on failure — see
@@ -2207,8 +4829,9 @@ def poll_and_log(
     of early, repeated, non-blocking signal for validation_pool.
 
     Every cycle's log line reports how long the meter poll itself took
-    and how many long-poll exchanges that was (``meter_poll=X.XXXs/N
-    polls``) — this is measured wall-clock time against whatever's on
+    and how many exchanges that was (``meter_poll=X.XXXs/Nlp+Mgp``: long
+    polls and heartbeat general polls, counted as sent rather than as
+    enabled) — this is measured wall-clock time against whatever's on
     the other end of ``client``, not a theoretical figure, so it's the
     real answer to "does the meter sweep fit in --interval on this
     hardware." Pass ``interval`` (the caller's own poll-cycle interval,
@@ -2230,21 +4853,71 @@ def poll_and_log(
                 "This tool never deletes ticket/event rows to free space; see the module docstring."
             )
 
-    _check_pool_age(conn, now, max_age_hours=pool_age_alert_hours)
+    _check_pool_age(conn, now, max_age_hours=pool_age_alert_hours,
+                    state=state, monotonic_fn=monotonic_fn)
+
+    # LAB ONLY, and off unless the lab flags built a LabAutoConfig. Placed
+    # here, before the general poll, on purpose: it then runs on every cycle
+    # including ones whose meter sweep aborts, and a one-cycle lag against a
+    # threshold measured in minutes is not worth a second code path. See the
+    # block comment above LabAutoConfig for why these exist at all.
+    if lab_auto is not None:
+        try:
+            _lab_auto_handpay_reset(
+                client, conn, now, state,
+                after_seconds=lab_auto.handpay_reset_after_s,
+                monotonic_fn=monotonic_fn)
+            _lab_auto_aft_credit(
+                client, conn, now, state,
+                amount_cents=lab_auto.aft_credit_cents,
+                floor_cents=lab_auto.aft_floor_cents,
+                pool_id=lab_auto.aft_pool_id,
+                monotonic_fn=monotonic_fn)
+        except SASError as e:
+            # Never let a lab convenience take the soak down with it.
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, "
+                "message) VALUES (?, ?, ?, ?)",
+                (now, "lab_auto", type(e).__name__, str(e)))
+            _safe_commit(conn, now)
 
     try:
-        exception_code, attempt = _general_poll_with_retry(
-            client, conn, now, max_attempts=general_poll_retries, sleep_fn=retry_sleep_fn
+        exception_code, attempt, rte_fields = _general_poll_with_retry(
+            client, conn, now, max_attempts=general_poll_retries,
+            sleep_fn=retry_sleep_fn, rte=rte,
         )
     except SASError as e:
+        # A down link is measured, not just logged. One failed poll is a
+        # missed byte; a run of them long enough for somebody to walk to
+        # another cabinet is a different event entirely, and only the clock
+        # tells them apart.
+        poll_mono = monotonic_fn()
+        if state.gap_started_mono is None:
+            state.gap_started_mono = poll_mono
+        state.consecutive_poll_failures += 1
         print(
             f"[{now}] general poll failed after {general_poll_retries} consecutive attempt(s): "
             f"{type(e).__name__}: {e}"
+            f" (link down {poll_mono - state.gap_started_mono:.0f}s, "
+            f"{state.consecutive_poll_failures} cycle(s))"
         )
     else:
+        if state.gap_started_mono is not None:
+            gap = monotonic_fn() - state.gap_started_mono
+            print(f"[{now}] link restored after {gap:.0f}s and "
+                  f"{state.consecutive_poll_failures} failed cycle(s)")
+            if gap >= comms_gap_seconds:
+                # Deferred, not run here: the interrogation needs the
+                # heartbeat that only exists once the meter sweep is set up,
+                # and running ~150 long polls from inside the general-poll
+                # handler would be a sweep nested in a sweep.
+                state.interrogation_pending = gap
+            state.gap_started_mono = None
+            state.consecutive_poll_failures = 0
         if attempt > 1:
             print(f"[{now}] general poll recovered on attempt {attempt}/{general_poll_retries}")
-        _dispatch_exception(client, conn, now, exception_code, state=state)
+        _dispatch_exception(client, conn, now, exception_code, state=state,
+                            source="rte" if rte else "cycle", fields=rte_fields)
 
     mono_now = monotonic_fn()
 
@@ -2260,25 +4933,150 @@ def poll_and_log(
     # make a ten-minute-old meter indistinguishable from one read a second
     # ago. The latest_c7_meters view below is how you ask for the last real
     # sweep without caring which rows those were.
+    # A FAILED RTE ENABLE MUST NOT BE PERMANENT, and it used to be.
+    #
+    # main() enabled real time event reporting once, at startup, and on
+    # SASError printed "Continuing in the ordinary polling mode" and never
+    # tried again. After the power cut of 2026-11-01 the gateway was back and
+    # polling in about thirty seconds; the EGM takes minutes to boot. The
+    # poller came up, found nothing answering, fell back, and would have run
+    # the entire soak without the real time events it was started for --
+    # announced in one line at startup and invisible afterwards.
+    #
+    # That is the ordinary case on a floor, not an unlucky one: a gateway
+    # micro-PC boots faster than a cabinet, so every mains event produces it.
+    # A supervisor does not help, because the process does not exit; it runs
+    # happily in the wrong mode.
+    #
+    # One long poll per cycle, only while it is still failing -- and while it
+    # is failing the machine is not answering anything else either.
+    if state.rte_wanted and not state.rte_enabled:
+        try:
+            client.enable_real_time_events(True)
+            state.rte_enabled = True
+            print(f"[{now}] RTE ENABLED (LP 0x0E) on retry: the machine is "
+                  "answering now. Events arrive as Table 12.5 messages from "
+                  "here on; anything before this line was collected in the "
+                  "ordinary single-byte mode.")
+        except SASError:
+            # Not logged per cycle: the general poll below reports the same
+            # silence, and two lines a cycle for one dead link is noise.
+            pass
+    if state.rte_wanted:
+        rte = state.rte_enabled
+
     c7_due = table_c7_sweep and (
         table_c7_interval <= 0
         or state.last_c7_sweep is None
         or (mono_now - state.last_c7_sweep) >= table_c7_interval
     )
 
+    heartbeat_codes: list = []
+    # Only the main sweep's heartbeat samples credits. The interrogation
+    # heartbeats deliberately do not: an interrogation is already ~150 long
+    # polls and the one thing it must not do is get longer.
+    credit_sampler = (_make_credit_sampler(client, conn, credit_poll_every)
+                      if credit_poll_every > 0 else None)
+    request_servicer = (_make_request_servicer(client, conn, state)
+                        if serve_host_requests else None)
+    heartbeat = _make_heartbeat(client, conn, now, heartbeat_codes,
+                                rte=rte, state=state,
+                                credit_sampler=credit_sampler,
+                                request_servicer=request_servicer)
+
+    # DRAIN PRIORITY. Decided from the LAST cycle's measured rate, because
+    # this cycle's is not known until its sweep has run -- and the sweep is
+    # the thing being decided about.
+    #
+    # The 8 grouped polls are never deferred. They carry coin in, coin out
+    # and games played, which every reconciliation window anchors to, and
+    # they are 8 exchanges against the 64 that are deferred. A burst must
+    # not leave the window with no meter sample at all; it may leave it
+    # with a coarser one.
+    draining = drain_priority and _should_drain(state)
+    if draining != state.draining:
+        print(f"[{now}] drain priority {'ON' if draining else 'OFF'}: "
+              f"{state.last_event_rate:.2f} events/s against the "
+              f"{(state.baseline_capacity or state.last_capacity):.1f}/s "
+              f"BASELINE budget. "
+              + ("Deferring the optional meter sweeps; coin in, coin out and "
+                 "games played still read every cycle."
+                 if draining else "Resuming the full sweep."))
+    if draining != state.draining and drain_fast_poll:
+        _apply_drain_poll_rate(client, state, now, want_fast=draining,
+                               fast_interval=drain_fast_poll_interval,
+                               fallback_interval=drain_fast_poll_fallback)
+    state.draining = draining
+    if draining:
+        state.drain_cycles += 1
+
     try:
-        heartbeat_codes: list = []
         values = _poll_all_meters(
             client,
-            heartbeat=_make_heartbeat(client, conn, now, heartbeat_codes),
+            now=now,
+            give_up_optional=(
+                _live_drain_probe(
+                    state, monotonic_fn(), monotonic_fn=monotonic_fn,
+                    on_fire=((lambda: _apply_drain_poll_rate(
+                        client, state, now, want_fast=True,
+                        fast_interval=drain_fast_poll_interval,
+                        fallback_interval=drain_fast_poll_fallback))
+                        if drain_fast_poll else None))
+                if drain_priority else None),
+            heartbeat=heartbeat,
             heartbeat_every=heartbeat_every,
-            full_sweep=full_meter_sweep,
-            table_c7_sweep=c7_due,
-            validation_meters_sweep=validation_meters_sweep,
-            last_accepted_bill_poll=last_accepted_bill_poll,
+            full_sweep=full_meter_sweep and not draining,
+            table_c7_sweep=c7_due and not draining,
+            validation_meters_sweep=validation_meters_sweep and not draining,
+            last_accepted_bill_poll=last_accepted_bill_poll and not draining,
         )
     except _MeterPollFailure as failure:
         meter_poll_elapsed = monotonic_fn() - mono_now
+        # THE RATE MUST BE UPDATED HERE TOO.
+        #
+        # This path returns early, before the headroom block that records
+        # last_event_rate / last_capacity. So on 2026-11-09T00:18 a burst
+        # failed three sweeps in a row and _should_drain() kept reading the
+        # last SUCCESSFUL cycle's 25% -- the condition that should trigger
+        # drain mode was the condition preventing the trigger from being
+        # computed. A pre-empted sweep is the strongest evidence of a burst
+        # there is, and it was the one the decision could not see.
+        _pace = getattr(getattr(client, "transport", None),
+                        "_min_poll_interval", 0.0) or 0.0
+        state.last_capacity = (1.0 / _pace) if _pace > 0 else 0.0
+        if meter_poll_elapsed > 0:
+            state.last_event_rate = max(
+                state.events_seen_live, state.events_this_cycle
+            ) / meter_poll_elapsed
+        # A 24-REISSUE PRE-EMPTION IS A BURST. Act on it here, not next
+        # cycle.
+        #
+        # Operator, 2026-11-09: "it moved almost 30 seconds after button
+        # burst." The burst hit send_meters_10_through_15 -- one of the 8
+        # GROUPED polls, which run first and carry no give_up_optional()
+        # probe because they are never deferred. So the cycle died 20.4s
+        # into that poll's reissues, before any probe point existed, and
+        # drain mode waited for the next cycle's decision.
+        #
+        # SASPreempted after the full retry budget is not ambiguous: 24
+        # real time events arrived in place of one reply. Entering drain
+        # mode on it costs nothing if the burst is over -- the next cycle
+        # measures a quiet machine and leaves again -- and saves ~30
+        # seconds when it is not. It also makes the NEXT pre-emption's
+        # reissues run at 40 ms instead of 300 ms, which is where most of
+        # those 20.4 seconds went.
+        if drain_priority and isinstance(failure.original, SASPreempted):
+            if not state.draining:
+                state.draining = True
+                print(f"[{now}] drain priority ON (a long poll was "
+                      f"pre-empted {failure.original.events_collected} "
+                      f"time(s) — that is a burst, not a decision to defer "
+                      f"to the next cycle).")
+            if drain_fast_poll:
+                _apply_drain_poll_rate(
+                    client, state, now, want_fast=True,
+                    fast_interval=drain_fast_poll_interval,
+                    fallback_interval=drain_fast_poll_fallback)
         conn.execute(
             "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) VALUES (?, ?, ?, ?)",
             (now, failure.poll_name, type(failure.original).__name__, str(failure.original)),
@@ -2289,6 +5087,35 @@ def poll_and_log(
             f"[{now}] meters poll failed after {meter_poll_elapsed:.3f}s ({failure.poll_name}): "
             f"{type(failure.original).__name__}: {failure.original}"
         )
+        # DRAIN BEFORE RETURNING, which this did not do until 2026-11-06.
+        #
+        # A failed sweep used to return straight out of the cycle, past the
+        # drain_rte_events() call near the end. The events were not lost --
+        # the client holds them in its pending list until somebody drains it
+        # -- but they sat there until the NEXT cycle and were written with
+        # that cycle's timestamp, up to a full sweep later.
+        #
+        # The failure that skips the drain is a §12.3 pre-emption burst, and
+        # a pre-emption burst is by definition the moment the machine has
+        # the most queued. So the one cycle that collected the most events
+        # was the one that filed them last and timed them worst, and the
+        # operator's button-pressing at 21:02 is exactly that case: two
+        # polls each burned all 24 reissues, and every event either of them
+        # carried off the machine waited for the following cycle.
+        #
+        # Nothing here depends on that being the start/end gap's cause -- it
+        # is not proven to be -- but a drain that runs only on the happy
+        # path is wrong on its own terms.
+        if rte:
+            stranded = client.drain_rte_events()
+            for event in stranded:
+                _dispatch_exception(client, conn, event.arrived_at or now,
+                                    int(event.code), state=state,
+                                    source="rte-interleaved",
+                                    fields=(event.fields or None))
+            if stranded:
+                print(f"[{now}] {len(stranded)} event(s) collected during the "
+                      f"failed sweep were still filed")
         return
 
     # Only a cycle that actually completed its sweep consumes the cadence. A
@@ -2298,31 +5125,175 @@ def poll_and_log(
     if c7_due:
         state.last_c7_sweep = mono_now
 
+    # A gap long enough for the cable to have moved. Run here, after the
+    # sweep, so the heartbeat is available to keep the exception queue
+    # draining through ~150 long polls of interrogation.
+    if state.interrogation_pending is not None:
+        gap = state.interrogation_pending
+        state.interrogation_pending = None
+        print(f"[{now}] link was down {gap:.0f}s (>= {comms_gap_seconds:.0f}s): "
+              "interrogating the machine before trusting anything else")
+        try:
+            # The continuity chain cannot survive a gap: play carried on
+            # while nobody was polling, so the next game start will show a
+            # coin-in jump that is NOT a lost event. Forgetting the previous
+            # reading is what stops this crying wolf after every reboot and
+            # every pulled cable -- which is precisely the exemption the
+            # operator stated: "unless gateway lost communication due to a
+            # reboot or faulty sas cable."
+            if state.last_game_start_coin_in is not None:
+                print(f"[{now}] continuity chain reset across the comms gap: "
+                      f"play during it is not a lost event")
+            state.last_game_start_coin_in = None
+            state.last_game_start_at = None
+            interrogate(client, conn, state, now, reason="comms_restored",
+                        gap_seconds=gap,
+                        heartbeat=_make_heartbeat(client, conn, now,
+                                                  heartbeat_codes, rte=rte,
+                                                  state=state),
+                        monotonic_fn=monotonic_fn)
+        except SASError as e:
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) "
+                "VALUES (?, ?, ?, ?)",
+                (now, "interrogate(comms_restored)", type(e).__name__, str(e)))
+            _safe_commit(conn, now)
+            print(f"[{now}] interrogation failed: {type(e).__name__}: {e}")
+
     # Anything the heartbeats drained is handled now -- see _make_heartbeat()
     # for why it is deferred rather than acted on inside the sweep.
-    for code in heartbeat_codes:
+    #
+    # AFTER the comms-restored interrogation above and BEFORE the options
+    # re-read below, deliberately: a 0x3C found by a heartbeat in this sweep
+    # should be acted on in this cycle, not the next one.
+    for code, hb_fields, hb_source in heartbeat_codes:
         print(f"[{now}] exception 0x{code:02X} drained during the meter sweep: "
               f"{describe_exception(code)}")
-        _dispatch_exception(client, conn, now, code, source="heartbeat", state=state)
+        # Table A-1's own name for a handful of codes misleads a reader badly
+        # enough to have cost this project days. The spec name is what gets
+        # logged; this is what a person needs beside it.
+        _clarify = clarify_exception(code)
+        if _clarify:
+            print(f"    ^ {_clarify}")
+        _dispatch_exception(client, conn, now, code, source=hb_source,
+                            state=state, fields=hb_fields)
+
+    # Exception 0x3C said the operator changed options. Re-read the
+    # configuration and find out WHAT, because the exception does not say.
+    #
+    # Deferred to here for the same reason the comms-restored interrogation
+    # is: it is ~150 long polls, and the dispatcher that set the flag can
+    # have been running from inside the sweep above.
+    if state.options_change_pending is not None:
+        seen_at = state.options_change_pending
+        state.options_change_pending = None
+        previous = conn.execute(
+            "SELECT id FROM interrogations ORDER BY id DESC LIMIT 1").fetchone()
+        print(f"[{now}] re-reading the configuration after the 0x3C seen at "
+              f"{seen_at}")
+        try:
+            interrogate(client, conn, state, now, reason="options_changed",
+                        heartbeat=_make_heartbeat(client, conn, now,
+                                                  heartbeat_codes, rte=rte,
+                                                  state=state),
+                        monotonic_fn=monotonic_fn)
+        except SASError as e:
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) "
+                "VALUES (?, ?, ?, ?)",
+                (now, "interrogate(options_changed)", type(e).__name__, str(e)))
+            _safe_commit(conn, now)
+            print(f"[{now}] configuration re-read failed: {type(e).__name__}: {e}")
+        else:
+            current = conn.execute(
+                "SELECT id FROM interrogations ORDER BY id DESC LIMIT 1").fetchone()
+            if previous is None or current is None or previous[0] == current[0]:
+                print(f"[{now}] 0x3C: nothing to compare against -- this is the "
+                      "first configuration reading in this database.")
+            else:
+                changes = game_config_diff(conn, previous[0], current[0])
+                if not changes:
+                    # Not nothing: 0x3C covers options this tool cannot read
+                    # (bill acceptor settings, attendant menus). Saying so is
+                    # better than implying the exception was spurious.
+                    note = ("0x3C with no change in any game configuration "
+                            "field this tool reads -- the option that changed "
+                            "is one LP 0x53/0xB5 does not report")
+                    print(f"[{now}] {note}")
+                    conn.execute("UPDATE interrogations SET note = ? WHERE id = ?",
+                                 (note, current[0]))
+                    _safe_commit(conn, now)
+                else:
+                    detail = "; ".join(
+                        f"game {g}: {f} {a!r} -> {b!r}" for g, f, a, b in changes)
+                    print(f"[{now}] 0x3C changed: {detail}")
+                    conn.execute("UPDATE interrogations SET note = ? WHERE id = ?",
+                                 (f"0x3C: {detail}", current[0]))
+                    material = [c for c in changes
+                                if c[1] in EPOCH_WORTHY_CONFIG_FIELDS]
+                    if material:
+                        why = "; ".join(
+                            f"game {g}: {f} {a!r} -> {b!r}" for g, f, a, b in material)
+                        epoch_id = open_epoch(
+                            conn, now, "options_changed", state.identity or {},
+                            f"operator changed options (0x3C seen {seen_at}): {why}")
+                        state.epoch_id = epoch_id
+                        print(f"[{now}] EPOCH {epoch_id}: {why}. Meter readings "
+                              "either side of this boundary are not comparable "
+                              "-- SAS counts credits, so a denomination change "
+                              "rescales every figure in the database.")
+                    _safe_commit(conn, now)
 
     meter_poll_elapsed = monotonic_fn() - mono_now
+    # What this cycle actually put on the wire, not what the flags allow.
+    #
+    # This used to read ``table_c7_sweep`` -- the flag saying C-7 sweeps are
+    # enabled at all -- where it meant ``c7_due``, the decision this cycle
+    # made. With --table-c7-interval 300 that is wrong on 149 cycles out of
+    # every 150: the label read "22polls" for a cycle that had made 9, and
+    # the over-count landed in the one message a human reads when deciding
+    # whether the sweep is too heavy. A 2.4x exaggeration there argues for
+    # cutting a sweep that was never the problem.
+    #
+    # AND THE SAME MISTAKE RECURRED on 2026-11-08 with drain priority: the
+    # line read "60lp" for a cycle that made 8, because `draining` was
+    # missing from every term below while the call site had it. 8 long
+    # polls plus 8 heartbeats at the 0.3 s floor is 4.8 s, and the cycle
+    # took 4.796 s -- the arithmetic was the only thing that said so. The
+    # rule this keeps failing: **this count must be computed from the same
+    # expressions the call site uses, never from the flags they are
+    # derived from.**
     meter_poll_count = (
         GROUPED_METER_POLL_COUNT
-        + (1 if last_accepted_bill_poll else 0)
-        + (len(SINGLE_METER_COLUMNS) if full_meter_sweep else 0)
-        + (TABLE_C7_CHUNK_COUNT if table_c7_sweep else 0)
-        + (len(VALIDATION_METER_TYPES) if validation_meters_sweep else 0)
+        + (1 if last_accepted_bill_poll and not draining else 0)
+        + (len(SINGLE_METER_COLUMNS) if full_meter_sweep and not draining else 0)
+        + (TABLE_C7_CHUNK_COUNT if c7_due and not draining else 0)
+        + (len(VALIDATION_METER_TYPES)
+           if validation_meters_sweep and not draining else 0)
     )
-    if interval is not None and meter_poll_elapsed >= interval:
-        print(
-            f"[{now}] WARNING: meter poll took {meter_poll_elapsed:.3f}s across {meter_poll_count} long-poll "
-            f"exchanges — at or above --interval {interval}s. This cycle's meter sweep alone doesn't leave "
-            "room for the general poll or the configured sleep. Consider --skip-full-meter-sweep, "
-            "--skip-table-c7-sweep, or --skip-validation-meters-sweep. A larger "
-            f"--interval is NOT the remedy: {SAS_MAX_POLL_INTERVAL_S}s is the ceiling "
-            "(§2.3.3) and the sweep is already over it, so the fix is a shorter sweep."
-        )
-
+    # The heartbeats are general polls, and §2.3.3 counts general polls and
+    # long polls against ONE budget. Reporting them separately keeps both
+    # facts visible: how much work the sweep is, and how much of the 200 ms
+    # floor the whole cycle consumes.
+    heartbeat_count = heartbeat.count
+    # THE COST, ON EVERY CYCLE LINE, because a knob whose price is invisible
+    # gets left on. `supp` is the headline: heartbeats that found the queue
+    # NOT empty, where the sampler stood down. A burst drives it to the whole
+    # count, which is the design working.
+    if credit_sampler is None:
+        credit_note = ""
+    else:
+        due = credit_sampler.beats // max(1, credit_poll_every)
+        supp = due - (credit_sampler.taken + credit_sampler.preempted
+                      + credit_sampler.failed)
+        credit_note = (f" credits={credit_sampler.taken}"
+                       f"/{credit_sampler.beats}gp")
+        if credit_sampler.preempted:
+            credit_note += f" preempted={credit_sampler.preempted}"
+        if credit_sampler.failed:
+            credit_note += f" failed={credit_sampler.failed}"
+        if supp > 0:
+            credit_note += f" stood-down={supp}"
     # Decide which epoch these readings belong to BEFORE writing them, so a
     # clear or a swap never lands rows in the epoch it ended.
     #
@@ -2389,16 +5360,143 @@ def poll_and_log(
     _safe_commit(conn, now)
     state.last_meters = values
 
+    # Events that arrived in place of a LONG poll's response rather than a
+    # general poll's. Section 12.3 allows a machine in real time event mode
+    # to pre-empt any long poll reply with an event; the client reissues the
+    # long poll and keeps the event instead of discarding it, and this is
+    # where those get recorded.
+    #
+    # Draining EVERY cycle is not optional. The client's pending list has no
+    # cap, so a caller that enables RTE and never drains grows it without
+    # bound for as long as the run lasts -- which on a multi-hour soak with a
+    # ~70-long-poll sweep is the one memory leak this tool could have.
+    if rte:
+        interleaved = client.drain_rte_events()
+        for event in interleaved:
+            # event.arrived_at, NOT `now`.
+            #
+            # These are drained once per cycle, so `now` is the end of the
+            # sweep and is IDENTICAL for every event in the batch. Stamping
+            # forty-odd events with one time throws away when each landed,
+            # and that is the only thing that can distinguish a poller which
+            # stalled for a minute from one which was sweeping and
+            # collecting the whole time.
+            #
+            # It is not a cosmetic difference. A queue-safety check read "no
+            # event arrived inside this 58-second gap" off cycle-stamped
+            # rows and reported six stalls during a soak that was running
+            # perfectly -- the absence was guaranteed by the stamping, not
+            # by anything the gateway did.
+            _dispatch_exception(client, conn, event.arrived_at or now,
+                                int(event.code), state=state,
+                                source="rte-interleaved",
+                                fields=(event.fields or None))
+        if interleaved:
+            print(f"[{now}] {len(interleaved)} event(s) arrived interleaved with "
+                  f"long polls: "
+                  f"{', '.join(f'0x{e.code:02X}' for e in interleaved)}")
+
+    # HEADROOM, not occupancy.
+    #
+    # "42 events per cycle against a queue of 67" was the wrong measure and
+    # this project used it for days: §12.3 drains the queue on EVERY message,
+    # so a cycle's event count says nothing about depth. What matters is the
+    # RATE against what §2.3.3's pacing allows us to collect:
+    #
+    #     capacity = 1 / min_poll_interval     events per second
+    #
+    # On 2026-11-06 the operator was at 3.2 events/s against a capacity of
+    # 3.3 -- 97% -- and nothing said so. Autoplay alone is 25%; sixty
+    # seconds of pressing CHANGE and CASHOUT took it to the ceiling, and the
+    # queue built because a stalled long poll is dead air where nothing is
+    # collected.
+    # Read off the transport rather than taken as an argument: the pacing
+    # floor is enforced there, on every write, and a copy passed down here
+    # could drift from the one actually in force. The thing being reported
+    # must be the thing being obeyed.
+    pace = getattr(getattr(client, "transport", None),
+                   "_min_poll_interval", 0.0) or 0.0
+    capacity = (1.0 / pace) if pace > 0 else 0.0
+    collected = state.events_this_cycle
+    rate = (collected / meter_poll_elapsed) if meter_poll_elapsed > 0 else 0.0
+    used = (100.0 * rate / capacity) if capacity else 0.0
+    headroom = f"{rate:.2f}/{capacity:.1f}ev/s={used:.0f}%"
+    # What _should_drain() reads on the next cycle.
+    state.last_event_rate, state.last_capacity = rate, capacity
+
+    # WHAT CAN ACTUALLY BE MEASURED, AND WHAT CANNOT.
+    #
+    # This line has been wrong twice, in two different ways, and the second
+    # is worth keeping written down because it was subtler and it shipped.
+    #
+    # FIRST: warned when the sweep ran longer than --interval. That is the
+    # sleep between cycles and says nothing about whether events survive,
+    # so it fired on every full sweep and became background. The operator
+    # objected, correctly.
+    #
+    # SECOND (2026-11-09, mine): warned when the sweep ran longer than
+    # `queue_depth / rate`, calling that "the time the queue survives".
+    # **The arithmetic does not hold.** `rate` is events_this_cycle /
+    # elapsed -- the rate this poller COLLECTED events. A collected event
+    # is not in the queue. So it divided the queue depth by the rate the
+    # queue is being EMPTIED and called the answer a time-to-overflow. It
+    # fired at 00:41:43 on a cycle collecting 1.66 events/s while making
+    # 102 general polls in 59.7s -- draining 1.71/s, slightly faster than
+    # it collected, with the queue stable and nothing lost.
+    #
+    # THE ARRIVAL RATE IS NOT OBSERVABLE. A host sees what it collected and
+    # what the cabinet reports losing. It never sees what the cabinet
+    # produced. Any warning resting on arrival rate rests on a number we
+    # do not have, however reasonable the formula looks.
+    #
+    # So this warns on the two things that ARE measured: evidence of loss
+    # that already happened, and saturation of the poll budget (the EVENT
+    # HEADROOM line below, which was right all along).
+    lost_now = state.overflows_this_cycle + state.gaps_this_cycle
+    if lost_now:
+        print(
+            f"[{now}] WARNING: EVENTS WERE LOST IN THIS CYCLE — "
+            f"{state.overflows_this_cycle} buffer overflow(s) reported by "
+            f"the cabinet, {state.gaps_this_cycle} stream gap(s) from "
+            f"§12.5.3's own arithmetic. The sweep took "
+            f"{meter_poll_elapsed:.1f}s across {meter_poll_count} long "
+            f"polls and {heartbeat_count} general polls, collecting "
+            f"{rate:.2f} of a {capacity:.1f}/s budget. Shorten the sweep: "
+            f"--drain-priority (defers the optional polls automatically "
+            f"under load), --skip-validation-meters-sweep, "
+            f"--table-c7-interval 300, or --skip-full-meter-sweep. A larger "
+            f"--interval is NOT the remedy — it is the sleep between "
+            f"cycles, and {SAS_MAX_POLL_INTERVAL_S}s is the §2.3.3 ceiling."
+        )
+    elif interval is not None and meter_poll_elapsed >= interval:
+        # A long sweep that loses nothing is a COST, not a fault: it buys
+        # 154 Table C-7 meters and 39 single ones. Said once, quietly.
+        print(f"[{now}] note: sweep {meter_poll_elapsed:.1f}s over "
+              f"--interval {interval}s, collecting {rate:.2f}/{capacity:.1f} "
+              f"events/s with nothing reported lost")
+
+    if used >= 70.0:
+        print(f"[{now}] ** EVENT HEADROOM {used:.0f}% -- {rate:.2f} events/s "
+              f"against the {capacity:.1f}/s that §2.3.3 pacing allows us to "
+              f"collect. Above this the queue builds, and a stalled long poll "
+              f"is dead air where nothing drains. Shorten the sweep or widen "
+              f"--min-poll-interval's budget.")
+    state.events_this_cycle = 0
+    state.events_seen_live = 0
+    state.overflows_this_cycle = 0
+    state.gaps_this_cycle = 0
+
     note = "history written" if write_history else "history skipped (cadence)"
     if decreased:
         note += ", meter decrease detected"
     elif anomaly:
         note += ", anomaly signaled"
     print(
-        f"[{now}] coin_in={values['total_coin_in']} coin_out={values['total_coin_out']} "
+        f"[{now}] {headroom} coin_in={values['total_coin_in']} coin_out={values['total_coin_out']} "
         f"games_played={values['games_played']} ticket_in_cashable_cents={values['ticket_in_cashable_cents']} "
         f"ticket_out_cashable_cents={values['ticket_out_cashable_cents']} "
-        f"meter_poll={meter_poll_elapsed:.3f}s/{meter_poll_count}polls — {note}"
+        f"meter_poll={meter_poll_elapsed:.3f}s/{meter_poll_count}lp+{heartbeat_count}gp"
+        f"{credit_note} — {note}"
     )
 
 
@@ -2422,18 +5520,17 @@ def _sas_poll_interval(value: str) -> float:
     return parsed
 
 
-def main() -> int:
-    # Line-buffer stdout. Python block-buffers it when it is not a terminal,
-    # so under `nohup ... > soak.log` nothing appears until ~8KB has built up
-    # -- about four minutes of cycles at ~250 bytes each. A long-running
-    # process whose log stays empty for minutes after it starts is
-    # indistinguishable from one that failed to start, and the first thing
-    # anyone does is tail the log. Costs nothing: one flush per cycle.
-    try:
-        sys.stdout.reconfigure(line_buffering=True)
-    except (AttributeError, ValueError):
-        pass  # not a reconfigurable stream; the log is merely less prompt
+def build_parser() -> argparse.ArgumentParser:
+    """The command line, built separately so it can be inspected without
+    running the poller.
 
+    Split out on 2026-11-10 so a test could format every help string. They
+    had been unformattable for a day: a drain-priority f-string produced a
+    literal "50%% of", argparse read "%% o" as a conversion and `--help`
+    raised TypeError for the whole tool. A help string nobody can print is
+    worse than no help string, and nothing could have caught it while the
+    parser existed only inside main().
+    """
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("config", help="gateway .ini file (see saspy/config.py or MANUAL.md)")
     parser.add_argument("--db", default="gateway.sqlite3", help="SQLite file to write to")
@@ -2524,6 +5621,65 @@ def main() -> int:
         "Ignored when --skip-table-c7-sweep is given",
     )
     parser.add_argument(
+        "--drain-priority",
+        action="store_true",
+        help="when the cabinet produces events faster than the sweep leaves "
+             # argparse runs help through %-formatting, so every literal
+             # percent sign must be doubled -- including the ones an
+             # f-string computes. ".0%" produces a bare "%", which argparse
+             # then read as a conversion: "50% of" parsed as "% o" and
+             # raised "%o format: an integer is required, not dict". That
+             # broke --help for the WHOLE tool, not just this flag, from
+             # 2026-11-09 until it was found on 2026-11-10.
+             f"room to collect ({DRAIN_ENTER_FRACTION * 100:.0f}%% of the "
+             f"§2.3.3 budget), defer the optional meter sweeps and spend "
+             f"the time on general polls instead; resume below "
+             f"{DRAIN_LEAVE_FRACTION * 100:.0f}%%. Coin in, coin out and games "
+             "played are still read every cycle -- only the 39 single "
+             "meters, 13 Table C-7 chunks and 12 validation polls are "
+             "deferred, and those are cumulative so nothing is lost by "
+             "reading them later. Measured on 2026-11-08: a button burst "
+             "put 43%% of poll slots into long polls that drain nothing, "
+             "collecting 1.6 events/s against a 3.3/s budget while the "
+             "cabinet produced 11.5/s. OFF by default -- it changes what "
+             "goes on the wire",
+    )
+    parser.add_argument(
+        "--drain-fast-poll",
+        action="store_true",
+        help="while --drain-priority is ON, poll at the machine's "
+             f"advertised {SAS_FAST_POLL_INTERVAL_S*1000:.0f} ms rate "
+             "instead of --min-poll-interval, and go back the moment it "
+             "ends. §12.2 allows the rate to be increased under real time "
+             "events; Table 7.14e bit 0 is where the machine says it "
+             "supports it, and a machine that has not said so is never "
+             "polled fast. One poll drains one event, so this raises the "
+             "drain ceiling from 3.3/s to 25/s — above the 11.5/s a button "
+             "burst produced on the lab cabinet. Requires --drain-priority. "
+             "OFF by default: it changes what goes on the wire",
+    )
+    parser.add_argument(
+        "--drain-fast-poll-interval",
+        type=float,
+        default=SAS_FAST_POLL_INTERVAL_S,
+        metavar="SECONDS",
+        help=f"the rate --drain-fast-poll uses (default "
+             f"{SAS_FAST_POLL_INTERVAL_S}). Clamped at "
+             f"{SAS_FAST_POLL_INTERVAL_S} — §12.2 names that number, and "
+             "this project has polled below it once and recorded it as a bug",
+    )
+    parser.add_argument(
+        "--drain-fast-poll-fallback",
+        type=float,
+        default=0.10,
+        metavar="SECONDS",
+        help="the rate to use while draining on a machine that has NOT "
+             "advertised Table 7.14e bit 0 (default 0.10). §4.4 lets a "
+             "machine ignore a long poll it does not implement, so silence "
+             "is not a refusal — it is no answer. 0 disables the fallback "
+             "and such a machine stays at --min-poll-interval",
+    )
+    parser.add_argument(
         "--skip-validation-meters-sweep",
         action="store_true",
         help=f"skip the {len(VALIDATION_METER_TYPES)} LP 0x50 exchanges, one per validation type "
@@ -2540,6 +5696,138 @@ def main() -> int:
         "some older gaming machines don't support LP 0x48 at all, and that failure is a genuine "
         "SASError on the whole exchange (not a soft per-field skip like LP 0x6F's), which would "
         "otherwise abort every cycle's row write on such a machine.",
+    )
+    parser.add_argument(
+        "--lab-ticket-authority",
+        metavar="PATH",
+        default=None,
+        help="LAB ONLY. Answer ticket-in (exception 0x67 / LP 0x70 / LP 0x71) from "
+        "this file of validation numbers, instead of only recording the insertion. "
+        "Without it this tool never calls redeem_ticket() and the machine returns "
+        "every ticket after its own 30-second timeout, which is the correct default "
+        "for a gateway. The file is the authorisation, not the flag: it binds to one "
+        "cabinet by serial and the run refuses any other. Same format, same expiry "
+        "date and same lookup as examples/ticket_lab_authority.py, imported from it "
+        "rather than copied. A gateway that decides what tickets are worth has no "
+        "place on a floor -- delete both before one goes near one.",
+    )
+    parser.add_argument(
+        "--decline-aft-cashout",
+        action="store_true",
+        help="answer §8.7's AFT host-cashout request (0x6A/0x6B) with an "
+        "all-zeros LP 0x72, which the spec defines as 'cash out by whatever "
+        "other means are available'. MOVES NO MONEY -- every amount is zero, "
+        "so it is a decline, not a transfer. Measured on this cabinet: "
+        "cashout is a three-stage ladder and stage 1 burns ~8s before the "
+        "ticket path is even tried, on every cashout, with a full validation "
+        "pool. Declining skips it. OFF BY DEFAULT and PER-MODEL: on a "
+        "cabinet with no printer 'other means' is an attendant, so there "
+        "this makes a handpay arrive sooner rather than a ticket.")
+    parser.add_argument(
+        "--lab-auto-handpay-reset",
+        type=float,
+        metavar="SECONDS",
+        default=0.0,
+        help="LAB ONLY, REQUIRES --lab-ticket-authority. Send LP 0x94 (remote "
+        "handpay reset) when a lockup has gone this many seconds with nobody "
+        "clearing it, so an unattended overnight soak does not stop at the "
+        f"first jackpot. Minimum {LAB_AUTO_HANDPAY_MIN_SECONDS:.0f}s. On a "
+        "floor this records a jackpot as PAID when nobody paid it, and the "
+        "meters will agree with the gateway because both are wrong the same "
+        "way. §7.9 also means the financial outcome is ambiguous: with W2-G "
+        "Reset To Credit Meter enabled the money returns as credits, "
+        "otherwise it is recorded as handed to a player, and reset code 0x00 "
+        "comes back either way. Every reset is written to lab_auto_actions.",
+    )
+    parser.add_argument(
+        "--lab-auto-aft-credit",
+        type=float,
+        metavar="AMOUNT",
+        default=0.0,
+        help="LAB ONLY, REQUIRES --lab-ticket-authority. Push this many "
+        "dollars of cashable credit by AFT whenever the cabinet's balance "
+        "falls to --lab-aft-credit-floor or below, so a soak keeps spinning "
+        "after it cashes out or a handpay clears without returning credits. "
+        f"Hard ceilings: {LAB_AUTO_AFT_MAX_PUSHES} pushes per run, "
+        f"{LAB_AUTO_AFT_MAX_TOTAL_CENTS / 100:,.0f} total, one every "
+        f"{LAB_AUTO_AFT_MIN_INTERVAL_S:.0f}s. Balances are read with LP 0x74 "
+        "rather than a meter column, and a FAILED read never counts as zero "
+        "credits -- that distinction is what keeps this from being a money "
+        "printer with a cron job. Every push is written to lab_auto_actions.",
+    )
+    parser.add_argument(
+        "--lab-aft-credit-floor",
+        type=float,
+        metavar="AMOUNT",
+        default=1.0,
+        help="The balance at or below which --lab-auto-aft-credit tops up. "
+        "Default 1.00.",
+    )
+    parser.add_argument(
+        "--ticket-authority-unverified-serial",
+        action="store_true",
+        help="Run --lab-ticket-authority against a cabinet that will not report "
+        "its serial number. §4.4 lets a machine ignore LP 0x54, and on such a "
+        "cabinet the ticket file's serial binding cannot be checked at all -- so "
+        "the default is to refuse, because an unenforceable binding is not a "
+        "binding. This says the operator is at the machine and knows which one it "
+        "is. It does NOT weaken the mismatch check: a cabinet that reports the "
+        "WRONG serial is still refused, flag or no flag.",
+    )
+    parser.add_argument(
+        "--min-poll-interval",
+        type=float,
+        default=0.2,
+        metavar="SECONDS",
+        help="§2.3.3's floor, enforced between EVERY message to the machine -- "
+        "general polls and long polls together, since the specification counts "
+        "them against one budget: 'The host may not issue general polls or long "
+        "polls to any single gaming machine at a rate faster than once per 200 "
+        "ms.' (default: %(default)s). §12.2 permits 40 ms while real time events "
+        "are enabled, which is a permission and not a target: §12.3 delivers at "
+        "most ONE event per poll, so 200 ms already allows five a second against "
+        "a measured play rate near 0.85. Raising it is the interesting direction "
+        "-- the ceiling is 5000 ms and the general poll must stay inside it, so "
+        "this times (--heartbeat-every + 1) has to remain under 5 s. 0 disables "
+        "pacing and is for simulated ports only.",
+    )
+    parser.add_argument(
+        "--serve-host-requests",
+        action="store_true",
+        help="serve inbound WfA pulls from the host_requests table. A server "
+        "INSERTs a row naming a validation number and polls it for an "
+        "answer; the poller services it at a poll-slot boundary, which is "
+        "where the scheduling rule puts it -- an on-demand pull takes the "
+        "NEXT slot and never interrupts an in-flight poll. Most requests "
+        "are answered from ticket_out_history at zero poll cost; only a "
+        "ticket this gateway never saw print falls back to walking LP 0x4D, "
+        "and that walk is capped per visit, stops at the request's "
+        "deadline, and records what it spent. Off by default: it is the "
+        "only inbound command channel this gateway has, and a gateway "
+        "nobody is asking should not be listening.",
+    )
+    parser.add_argument(
+        "--credit-poll-every",
+        type=int,
+        default=0,
+        metavar="N",
+        help="read the current-credits meter (LP 0x1A) every N heartbeats, "
+        "ON AN EMPTY QUEUE ONLY (default: 0, off). This feeds detector 7 in "
+        "rte_reconcile.py -- the credit ledger, credits before minus wagers "
+        "plus wins equals credits after -- which is the only check that "
+        "scores an individual game END. Its resolution is set by how often "
+        "the gauge is read: once per cycle today, about 25 games, which is "
+        "coarser than a one-game fault. "
+        "THE COST IS BOUNDED BY CONSTRUCTION, not by this number. The poll "
+        "is issued only in the moment a heartbeat has just drained the queue "
+        "to EMPTY, so there was no event for that slot to carry. Under a "
+        "button burst the queue is never empty, the heartbeat hits its drain "
+        "cap instead, and the sampler does not run at all -- it gets out of "
+        "the way exactly when event collection matters most, and resumes by "
+        "itself afterwards. Try 8 on a cabinet playing 1,500 games/hour: "
+        "that is roughly one reading every few seconds against a game every "
+        "2.4s. Measure before trusting it; this project has been wrong about "
+        "polling cost from first principles before.",
     )
     parser.add_argument(
         "--heartbeat-every",
@@ -2579,6 +5867,56 @@ def main() -> int:
         "it's a health signal that a top-up isn't reaching this gateway, or the machine isn't dispensing. "
         "0 or negative disables it.",
     )
+    parser.add_argument(
+        "--comms-gap-seconds",
+        type=float,
+        default=DEFAULT_COMMS_GAP_SECONDS,
+        metavar="SECONDS",
+        help="how long the link must be down before a recovery triggers a full "
+        f"interrogation (default: %(default)s). NOT a data-loss threshold: by "
+        "§2.2.1's arithmetic the exception queue is gone after roughly 8 seconds "
+        "of silence on a played machine and no sweep recovers it. This is the "
+        "time it takes somebody to unplug a cable, walk to another cabinet and "
+        "plug it in -- which is what the interrogation detects. 0 disables it.",
+    )
+    parser.add_argument(
+        "--no-interrogate-on-connect",
+        dest="interrogate_on_connect",
+        action="store_false",
+        help="skip the startup interrogation. It is on by default because the "
+        "first connect is the one moment with nothing to lose -- no cycle has "
+        "run, so the ~150 long polls cost no exception queue -- and it is what "
+        "later reconnects are compared against.",
+    )
+    parser.add_argument(
+        "--rte",
+        action="store_true",
+        help="enable real time event reporting (LP 0x0E) for the run. Exceptions "
+        "then arrive as Table 12.5 event messages carrying DATA -- a game's wager "
+        "and win, a bill's denomination, a door's identity -- instead of a bare "
+        "code, and the decoded fields are stored as JSON in machine_events."
+        "rte_fields. Section 12.3 also lets the machine answer a LONG poll with an "
+        "event instead of the reply; those are collected and stored with source "
+        "'rte-interleaved' rather than discarded. RTE is turned off again on exit, "
+        "including on Ctrl-C; §12 requires machines to power up in the ordinary "
+        "mode, so a power cycle also clears it.",
+    )
+    return parser
+
+
+def main() -> int:
+    # Line-buffer stdout. Python block-buffers it when it is not a terminal,
+    # so under `nohup ... > soak.log` nothing appears until ~8KB has built up
+    # -- about four minutes of cycles at ~250 bytes each. A long-running
+    # process whose log stays empty for minutes after it starts is
+    # indistinguishable from one that failed to start, and the first thing
+    # anyone does is tail the log. Costs nothing: one flush per cycle.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass  # not a reconfigurable stream; the log is merely less prompt
+
+    parser = build_parser()
     args = parser.parse_args()
 
     history = HistoryConfig(
@@ -2588,9 +5926,63 @@ def main() -> int:
         burst_count=args.burst_count,
     )
     state = PollState()
+    state.decline_aft_cashout = bool(args.decline_aft_cashout)
+    if state.decline_aft_cashout:
+        print("§8.7 AFT host-cashout requests will be DECLINED with an "
+              "all-zeros LP 0x72, so a cashout goes straight to the ticket "
+              "path instead of burning ~8s in stage 1. This moves no money.")
+
+    # Checked BEFORE the port is opened. A refusal that first takes /dev/ttyS0
+    # cannot even be read while a soak holds it, and an argument that needs no
+    # hardware to validate has no business grabbing hardware to be rejected.
+    # THE GATE on the two features that let this poller act on money by
+    # itself. The lab ticket file is the authorisation, exactly as it is for
+    # ticket-in: it binds to one cabinet, it expires, and the run exits
+    # rather than act against any other machine. A flag alone is too easy to
+    # leave in a unit file.
+    lab_auto = None
+    if args.drain_fast_poll and not args.drain_priority:
+        print("--drain-fast-poll does nothing without --drain-priority: it "
+              "only changes the rate WHILE draining, and without it nothing "
+              "ever drains.", file=sys.stderr)
+        return 2
+    if args.drain_fast_poll_interval < SAS_FAST_POLL_INTERVAL_S:
+        print(f"--drain-fast-poll-interval {args.drain_fast_poll_interval} is "
+              f"below §12.2's {SAS_FAST_POLL_INTERVAL_S}s. This project has "
+              f"polled below the floor once and recorded it as a bug; it is "
+              f"not a knob.", file=sys.stderr)
+        return 2
+    if args.lab_auto_handpay_reset or args.lab_auto_aft_credit:
+        if not args.lab_ticket_authority:
+            print("--lab-auto-handpay-reset and --lab-auto-aft-credit both "
+                  "require --lab-ticket-authority.\n"
+                  "  Not bureaucracy: that file is what binds this run to one "
+                  "cabinet by serial (or asset, §4.4) and carries the expiry "
+                  "date.\n"
+                  "  Clearing handpays and pushing credits without a human are "
+                  "cash-dispensing defects on a floor, and an unbound flag is "
+                  "how one gets there.", file=sys.stderr)
+            return 2
+        if (args.lab_auto_handpay_reset
+                and args.lab_auto_handpay_reset < LAB_AUTO_HANDPAY_MIN_SECONDS):
+            print(f"--lab-auto-handpay-reset {args.lab_auto_handpay_reset:.0f} is "
+                  f"below the {LAB_AUTO_HANDPAY_MIN_SECONDS:.0f}s minimum. Below a "
+                  "minute you are not clearing an unattended lockup, you are "
+                  "racing the attendant walking towards the machine.",
+                  file=sys.stderr)
+            return 2
+        if args.lab_auto_aft_credit and args.lab_auto_aft_credit <= 0:
+            print("--lab-auto-aft-credit must be positive.", file=sys.stderr)
+            return 2
+        lab_auto = LabAutoConfig(
+            handpay_reset_after_s=args.lab_auto_handpay_reset,
+            aft_credit_cents=round(args.lab_auto_aft_credit * 100),
+            aft_floor_cents=round(args.lab_aft_credit_floor * 100),
+        )
+
 
     try:
-        client = connect_from_config(args.config)
+        client = connect_from_config(args.config, min_poll_interval=args.min_poll_interval)
     except SASPortCapabilityError as e:
         # Worth failing loudly at startup rather than logging endless
         # timeouts into the database: the adapter cannot carry SAS's
@@ -2606,7 +5998,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    conn = sqlite3.connect(args.db)
+    conn = open_gateway_db(args.db)
     conn.executescript(SCHEMA)
     migrate_epoch_columns(conn)
     conn.commit()
@@ -2627,7 +6019,186 @@ def main() -> int:
         f"last-accepted-bill poll {'enabled' if not args.skip_last_accepted_bill_poll else 'skipped'})."
     )
 
-    if not args.skip_ticket_out_backfill:
+    if args.lab_ticket_authority:
+        import datetime as _dt
+        from pathlib import Path as _Path
+        try:
+            from ticket_lab_authority import LAB_AUTHORITY_EXPIRES, load_tickets
+        except ImportError:
+            print("--lab-ticket-authority needs examples/ticket_lab_authority.py, "
+                  "which is not in this checkout. It is meant to be deleted before "
+                  "a gateway goes near a floor, so this is very likely correct.",
+                  file=sys.stderr)
+            return 2
+        today = _dt.date.today()
+        if today > LAB_AUTHORITY_EXPIRES:
+            print(f"The lab ticket authority expired on {LAB_AUTHORITY_EXPIRES}. "
+                  "That date is deliberate. Refusing to answer tickets.",
+                  file=sys.stderr)
+            return 2
+        try:
+            tickets, binding = load_tickets(_Path(args.lab_ticket_authority))
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            print(f"could not read {args.lab_ticket_authority}: {e}", file=sys.stderr)
+            return 2
+        state.ticket_authority = tickets
+        state.ticket_authority_binding = binding
+        state.ticket_authority_path = args.lab_ticket_authority
+        print("=" * 70)
+        print("  LAB TICKET AUTHORITY ACTIVE. This run will REDEEM tickets.")
+        print(f"  {len(tickets)} number(s) from {args.lab_ticket_authority}, "
+              f"bound to {binding.describe()}")
+        print(f"  Expires {LAB_AUTHORITY_EXPIRES}. Delete the file and "
+              "examples/ticket_lab_authority.py when the bench work is done.")
+        if lab_auto is not None and lab_auto.any_enabled():
+            print("-" * 70)
+            print("  THIS RUN ALSO ACTS ON MONEY BY ITSELF:")
+            if lab_auto.handpay_reset_after_s:
+                print(f"    LP 0x94 remote handpay reset after "
+                      f"{lab_auto.handpay_reset_after_s:.0f}s unattended.")
+                print("    §7.9: with W2-G Reset To Credit Meter off, this "
+                      "records the")
+                print("    jackpot as PAID TO A PLAYER who was never there.")
+            if lab_auto.aft_credit_cents:
+                print(f"    AFT push {lab_auto.aft_credit_cents / 100:,.2f} "
+                      f"cashable whenever the balance is at or below "
+                      f"{lab_auto.aft_floor_cents / 100:,.2f},")
+                print(f"    capped at {LAB_AUTO_AFT_MAX_PUSHES} pushes and "
+                      f"{LAB_AUTO_AFT_MAX_TOTAL_CENTS / 100:,.0f} total "
+                      f"for this run.")
+            print("    Every action lands in the lab_auto_actions table.")
+        print("=" * 70)
+
+    # BEFORE ANYTHING READS THE WIRE. A cabinet left in real time event mode
+    # by an unclean stop answers every general poll with its own address byte,
+    # and each mis-read poll eats one byte of a Table 12.5 frame and misframes
+    # the long polls after it. An interrogation run in that state produces
+    # identity and configuration readings that look fine and are not.
+    framing, probed_code = recover_stuck_rte(client)
+    print(f"  framing check: {framing}")
+    if probed_code is not None and probed_code != ExceptionCode.NONE:
+        # The probe consumed a real exception. It predates this run's
+        # reconciliation window, same as the startup drain below.
+        _dispatch_exception(client, conn, utc_now(), probed_code,
+                            source="startup-backlog", state=state)
+        _safe_commit(conn, utc_now())
+
+    if args.interrogate_on_connect:
+        print("Interrogating the machine (identity, features, every game, "
+              "ticket history)...")
+        # THE HEARTBEAT IS NOT OPTIONAL HERE, and this call used to omit it.
+        #
+        # interrogate()'s own docstring says so in as many words: ~150 long
+        # polls, "thirteen seconds of not draining the exception queue --
+        # longer than the queue takes to overflow on a machine being played.
+        # An interrogation that ran without draining would cause exactly the
+        # loss it exists to detect, and would do it silently, at the moment
+        # its output is most trusted." The comms_restored caller passed one;
+        # this one did not, so every run began with a blind window.
+        #
+        # Pacing made it worse rather than better. At the 88 ms a sweep
+        # measured, 150 polls is ~13s; at --min-poll-interval 0.3 it is ~45s,
+        # against a 20-deep queue (§2.2.1) that a played cabinet fills in
+        # roughly eight. Every soak since pacing landed therefore started by
+        # overflowing the queue and losing whatever was in it -- the first
+        # mechanism found here that DESTROYS events rather than merely
+        # delaying them.
+        #
+        # rte=False is correct: real time event reporting is enabled further
+        # down, after this returns, so the replies here are ordinary single
+        # bytes and general_poll_rte() would mis-frame them.
+        startup_codes: list = []
+        startup_heartbeat = _make_heartbeat(client, conn, utc_now(),
+                                            startup_codes, rte=False,
+                                            state=state)
+        try:
+            interrogate(client, conn, state, utc_now(), reason="first_connect",
+                        heartbeat=startup_heartbeat)
+        except SASError as e:
+            print(f"  interrogation failed: {type(e).__name__}: {e}", file=sys.stderr)
+            print("  Continuing; the cycle's own identity check still runs.",
+                  file=sys.stderr)
+        # Whatever the heartbeats drained predates the first meter baseline,
+        # so it carries the same source label as the startup backlog: real,
+        # recorded, and explicitly outside this run's reconciliation window.
+        if startup_codes:
+            drain_now = utc_now()
+            print(f"  {len(startup_codes)} event(s) drained by the interrogation's "
+                  "heartbeats; stored as source 'startup-backlog'.")
+            for code, hb_fields, _hb_source in startup_codes:
+                print(f"  exception 0x{code:02X} during interrogation: "
+                      f"{describe_exception(code)}")
+                _clarify = clarify_exception(code)
+                if _clarify:
+                    print(f"      ^ {_clarify}")
+                _dispatch_exception(client, conn, drain_now, code,
+                                    source="startup-backlog", state=state,
+                                    fields=hb_fields)
+
+    # Checked OUTSIDE the interrogation branch, because it used to live
+    # inside it: --no-interrogate-on-connect then silently disabled the one
+    # check that stops this file being used against the wrong cabinet. The
+    # binding is the authorisation; a flag about startup chatter must not be
+    # able to switch it off.
+    #
+    # THE UNREADABLE CASE IS A SEPARATE DECISION FROM THE MISMATCHED ONE, and
+    # conflating them cost a soak. The original check read
+    # ``if seen and seen.strip() != bound``, which fails OPEN: a cabinet whose
+    # LP 0x54 does not answer -- section 4.4 lets it refuse -- had no serial to
+    # compare, so the binding was not enforced and nothing said so. Replacing
+    # that with a bare refusal fixed the silence and broke every such cabinet,
+    # including this project's own lab EGM, which exits 2 at startup on a
+    # command line that worked ten minutes earlier.
+    #
+    # So: a MISMATCH is always fatal, because the machine has identified
+    # itself and it is the wrong one. An UNREADABLE serial is fatal by
+    # default, because an unenforceable binding is not a binding -- but the
+    # operator standing at the cabinet can overrule that with
+    # --ticket-authority-unverified-serial, which puts the decision in the
+    # command line and in the log instead of nowhere.
+    if state.ticket_authority is not None:
+        # Only worth a long poll if nothing has asked yet. An interrogation
+        # that ran and got None was already refused by the machine; asking
+        # again spends an exchange to be told the same thing.
+        if state.identity is None:
+            try:
+                state.identity = read_identity(client)
+            except SASError as e:
+                print(f"  could not read this cabinet's identity "
+                      f"({type(e).__name__}: {e})", file=sys.stderr)
+        verdict = ticket_authority_binding_verdict(
+            state.ticket_authority_binding, state.identity,
+            allow_unverified=args.ticket_authority_unverified_serial)
+        if verdict is not None:
+            reason, detail = verdict
+            if reason == "mismatch":
+                print(f"\n  WRONG CABINET: {detail}.", file=sys.stderr)
+                print("  Refusing to redeem tickets against it. No flag "
+                      "overrides this.", file=sys.stderr)
+                return 2
+            if reason == "unverifiable":
+                print(f"\n  CANNOT VERIFY WHICH CABINET THIS IS: {detail}.",
+                      file=sys.stderr)
+                print(f"  That binding is the only thing stopping "
+                      f"{args.lab_ticket_authority} redeeming tickets against "
+                      "a cabinet it was not issued for.", file=sys.stderr)
+                print("  Add machine_asset to the file if this cabinet reports "
+                      "an asset number — that is enforceable where a serial is "
+                      "not. Or, if you are at the cabinet and know it is the "
+                      "right one, say so deliberately:", file=sys.stderr)
+                print("    --ticket-authority-unverified-serial", file=sys.stderr)
+                return 2
+            if reason == "unbound":
+                print("\n  WARNING: the ticket file names no cabinet, so it "
+                      "will redeem against ANY machine this run talks to.",
+                      file=sys.stderr)
+            else:
+                print(f"\n  WARNING: {detail}; the binding is NOT being "
+                      "enforced. --ticket-authority-unverified-serial was "
+                      "given, so the run continues on the operator's word.",
+                      file=sys.stderr)
+
+    if not args.interrogate_on_connect and not args.skip_ticket_out_backfill:
         print("Reading the existing ticket-out buffer (indices 1-31, non-destructive)...")
         found = backfill_ticket_out_history(client, conn)
         print(f"  {found} ticket-out record(s) found and stored.")
@@ -2637,7 +6208,123 @@ def main() -> int:
         available = conn.execute("SELECT COUNT(*) FROM validation_pool WHERE status = 'available'").fetchone()[0]
         print(f"  validation_pool: added {added} test number(s), {available} available (lab numbers, not server-issued).")
 
+    # SIGTERM and SIGHUP must reach the teardown, not bypass it.
+    #
+    # Python does not raise on either by default: the process simply dies and
+    # no finally block runs. For an unattended overnight run that is the
+    # difference between a machine handed back in the ordinary polling mode
+    # and one left in real time event reporting -- where every other tool in
+    # this repository reads the Table 12.5 address byte as an exception code
+    # and sees a flood of phantom 0x01s, until someone power cycles the
+    # cabinet or runs exception_monitor.py --disable-rte against it.
+    #
+    # SIGHUP matters as much as SIGTERM here: it is what a dropped SSH
+    # session sends, which is exactly how a soak started from a terminal
+    # tends to end.
+    def _stop(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    for _sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if _sig is None:
+            continue
+        try:
+            # An INHERITED SIG_IGN is a deliberate instruction from whoever
+            # started us, and installing a handler over it silently revokes
+            # their protection. nohup sets exactly this for SIGHUP, so the
+            # first version of this block turned `nohup ... &` from "survives
+            # a dropped SSH session" into "stops cleanly on one" -- the exact
+            # opposite of why the handler was added, and invisible until an
+            # overnight run came back shorter than it should have been.
+            if signal.getsignal(_sig) == signal.SIG_IGN:
+                continue
+            signal.signal(_sig, _stop)
+        except (ValueError, OSError):
+            pass  # not the main thread, or a platform without it
+
+    rte_on = False
+    if args.rte:
+        # Enabling is the easy half. Guaranteeing it is turned off again is
+        # the half that matters: a machine left in real time event mode
+        # answers every later general poll with a Table 12.5 message, which a
+        # client expecting a single byte cannot frame at all -- so a crash
+        # here would leave the cabinet unreadable by this tool's own default
+        # mode until someone power-cycled it.
+        state.rte_wanted = True
+        try:
+            client.enable_real_time_events(True)
+            rte_on = True
+            state.rte_enabled = True
+            print("  RTE ENABLED (LP 0x0E): exceptions arrive as Table 12.5 events "
+                  "with data, stored in machine_events.rte_fields.")
+        except SASError as e:
+            print(f"  Could not enable RTE: {type(e).__name__}: {e}", file=sys.stderr)
+            print("  Starting in the ordinary polling mode and RETRYING every "
+                  "cycle. A cabinet that is still booting -- the usual case "
+                  "after a power cut, since the gateway comes back first -- "
+                  "will be switched over as soon as it answers.", file=sys.stderr)
+
+    # Drain whatever the machine had queued BEFORE this run, so the first
+    # meters_history row is a clean baseline.
+    #
+    # §2.2.1's queue is non-volatile and the machine fills it whether or not
+    # a host is listening. A cabinet played for ten minutes with no gateway
+    # attached hands the first poll a full queue -- and, if it overflowed
+    # while nobody was polling, a pending exception 0x70 that has nothing to
+    # do with this run's polling rate.
+    #
+    # Without this drain those events land in the first cycle, stamped with
+    # the first cycle's timestamp, and are then reconciled against a meter
+    # delta that begins after them. Measured on the lab cabinet: 13 games'
+    # worth of events arrived in cycle 1 against a window in which the meters
+    # moved 11 games, and the reconciliation reported 13 phantom "lost"
+    # events in a run that had lost nothing.
+    drained = 0
+    if rte_on or True:  # the queue predates the run in either mode
+        start_now = utc_now()
+        for _ in range(STARTUP_DRAIN_MAX):
+            try:
+                if rte_on:
+                    event = client.general_poll_rte()
+                    if event is None or int(event.code) == ExceptionCode.NONE:
+                        break
+                    code, fields = int(event.code), (event.fields or None)
+                else:
+                    code, fields = client.general_poll(), None
+                    if code == ExceptionCode.NONE:
+                        break
+            except SASError:
+                break
+            drained += 1
+            _dispatch_exception(client, conn, start_now, code,
+                                source="startup-backlog", state=state, fields=fields)
+        if rte_on:
+            for event in client.drain_rte_events():
+                drained += 1
+                _dispatch_exception(client, conn, start_now, int(event.code),
+                                    source="startup-backlog", state=state,
+                                    fields=(event.fields or None))
+        if drained:
+            print(f"  drained {drained} event(s) the machine had queued before this "
+                  f"run started; they are stored as source 'startup-backlog' and "
+                  f"are NOT part of this run's reconciliation window.")
+            if drained >= STARTUP_DRAIN_MAX:
+                print(f"  (hit the {STARTUP_DRAIN_MAX}-poll drain cap -- the machine "
+                      f"still had more queued. Anything left will arrive in cycle 1.)")
+
     print("Ctrl-C to stop." if args.cycles == 0 else f"Will stop after {args.cycles} cycle(s).")
+
+    # The run announces itself to the DATABASE, not just to stdout. See the
+    # poller_lifecycle comment in SCHEMA: a 'started' with no 'stopped' is
+    # what proves the process was killed rather than asked to stop.
+    _record_lifecycle(conn, "started", reason=None)
+    stop_reason = "end of run"
+    # The rate to go back to. Read off the transport, which is where pacing
+    # is enforced, rather than from args -- the thing restored must be the
+    # thing that was in force.
+    state.normal_poll_interval = getattr(
+        getattr(client, "transport", None), "_min_poll_interval", 0.0) or 0.0
+    state.baseline_capacity = (
+        1.0 / state.normal_poll_interval if state.normal_poll_interval else 0.0)
 
     cycle = 0
     try:
@@ -2654,14 +6341,33 @@ def main() -> int:
             table_c7_interval=args.table_c7_interval,
                 validation_meters_sweep=not args.skip_validation_meters_sweep,
                 heartbeat_every=args.heartbeat_every,
+                credit_poll_every=args.credit_poll_every,
+                serve_host_requests=args.serve_host_requests,
                 last_accepted_bill_poll=not args.skip_last_accepted_bill_poll,
                 interval=args.interval,
                 general_poll_retries=args.general_poll_retries,
                 pool_age_alert_hours=args.pool_age_alert_hours,
+                rte=rte_on,
+                comms_gap_seconds=args.comms_gap_seconds,
+                lab_auto=lab_auto,
+                drain_priority=args.drain_priority,
+                drain_fast_poll=args.drain_fast_poll,
+                drain_fast_poll_interval=args.drain_fast_poll_interval,
+                drain_fast_poll_fallback=args.drain_fast_poll_fallback,
             )
-            time.sleep(args.interval)
-    except KeyboardInterrupt:
-        print("\nStopped.")
+            # Under drain priority this is general polls, not sleep: the
+            # inter-cycle gap is the largest uninterrupted block of time in
+            # the loop, and during a burst it is the worst possible moment
+            # to stop collecting.
+            _drain_sleep(client, conn, state, args.interval, rte=rte_on)
+    except KeyboardInterrupt as e:
+        reason = f" ({e})" if str(e) else ""
+        # "signal 15" when logind, a supervisor or soak_cycle.sh asked;
+        # bare KeyboardInterrupt when a person pressed Ctrl-C. Different
+        # causes, and until now they were distinguishable only in a log
+        # file that outlived nothing.
+        stop_reason = str(e) or "KeyboardInterrupt (Ctrl-C)"
+        print(f"\nStopped{reason}.")
     except Exception as e:  # noqa: BLE001 - see below; must not end as a traceback
         # A USB-serial adapter that re-enumerates mid-run (unplugged,
         # power-saved, or a flaky cable) raises out of pyserial, not as a
@@ -2675,6 +6381,7 @@ def main() -> int:
         # which restarts from the config and so re-resolves the port by
         # name. Everything already committed to SQLite is safe; the
         # finally-block close below still runs.
+        stop_reason = f"{type(e).__name__}: {e}"
         print(f"\nPolling stopped: {type(e).__name__}: {e}", file=sys.stderr)
         print(
             "\nThe serial port failed mid-run. The usual cause is the adapter "
@@ -2685,6 +6392,40 @@ def main() -> int:
         )
         return 3
     finally:
+        # state.rte_enabled, NOT the startup-time rte_on: a run that enabled
+        # RTE on a later cycle (because the cabinet was still booting) must
+        # still disable it on the way out, or it is left in Table 12.5
+        # framing for the next tool to misread.
+        # BEFORE the RTE teardown, which is itself a long poll: a run that
+        # died mid-burst must not hand the cabinet back still being polled
+        # at 40 ms, and must not send its last messages at that rate either.
+        if state.fast_poll_active and state.normal_poll_interval > 0:
+            if _set_poll_interval(client, state.normal_poll_interval):
+                state.fast_poll_active = False
+                print(f"poll rate restored to "
+                      f"{state.normal_poll_interval:.3f}s on the way out.")
+        if state.rte_enabled or rte_on:
+            # Before the database closes, so a last interleaved event still
+            # lands, and before the port does, so the machine is handed back
+            # in the mode every other tool here expects.
+            try:
+                client.enable_real_time_events(False)
+                print("RTE disabled; exceptions are single-byte codes again.")
+            except SASError as e:
+                print(f"WARNING: could not disable RTE ({type(e).__name__}: {e}). "
+                      "This machine will keep answering general polls with Table "
+                      "12.5 messages until it is power cycled or "
+                      "'exception_monitor.py <port> --disable-rte' is run against "
+                      "it. §12 requires a power-up default of ordinary polling.",
+                      file=sys.stderr)
+            for event in client.drain_rte_events():
+                _dispatch_exception(client, conn, utc_now(), int(event.code),
+                                    source="rte-interleaved",
+                                    fields=(event.fields or None))
+        # LAST, so it is written even when the RTE teardown above fails --
+        # and so that a row recording "could not disable RTE" is impossible
+        # to confuse with no row at all.
+        _record_lifecycle(conn, "stopped", reason=stop_reason)
         conn.close()
     return 0
 

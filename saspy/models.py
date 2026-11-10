@@ -72,6 +72,30 @@ class EnabledFeatures:
     validation_extensions: bool
     validation_style: int  # 0=standard/none 1=system 2=secure enhanced 3=reserved
     ticket_redemption: bool
+    # --- Table 7.14d, Feature Codes 2 ---
+    meter_model: int  # 0=not specified 1=won credits metered when won
+                      # 2=metered when played or paid 3=reserved
+    tickets_in_total_drop: bool
+    extended_meters: bool
+    component_authentication: bool
+    advanced_funds_transfer: bool
+    multi_denom_extensions: bool
+    # --- Table 7.14e, Feature Codes 3 ---
+    #
+    # The bit that settles an argument. 7.14e bit 0 is the MACHINE's declared
+    # maximum polling rate, and the only two values are "not specified" and
+    # "40 milliseconds". It says what the machine will tolerate being polled
+    # at, not what the host must do: §2.3.3 forbids the host from polling a
+    # single machine faster than once per 200 ms, and §12.2 says the rate
+    # "can be increased to 40 ms in order to better approximate real time
+    # reporting" -- better LATENCY, optional. Retention is §2.2.1's FIFO
+    # queue of at least 20 elements, which §12 does not modify.
+    #
+    # 7.14e's own caveat matters when this reads False: machines older than
+    # SAS 6.01 may support 40 ms without setting the bit, so False means
+    # "not declared", never "not capable".
+    max_polling_rate_40ms: bool
+    multiple_sas_progressive_win_reporting: bool
 
 
 @dataclass(frozen=True)
@@ -382,6 +406,22 @@ class RealTimeEvent:
     description: str
     data: bytes
     fields: dict
+    # WHEN THE HOST READ IT OFF THE WIRE, not when a caller got round to
+    # storing it.
+    #
+    # §12.3 lets an event arrive in place of ANY long poll reply, so a
+    # sweep of seventy long polls collects events throughout the cycle.
+    # A caller that drains them at the end of the cycle and stamps them all
+    # with one time destroys the only record of when each actually landed --
+    # and with it the ability to tell a poller that stalled for a minute
+    # from one that was busy sweeping and collecting all the way through.
+    #
+    # That cost a real false alarm: a queue-safety check read "no event
+    # arrived during this 58-second gap" off cycle-stamped rows and reported
+    # six stalls on a soak that was running perfectly. None is the default
+    # so that older callers keep working; they simply cannot answer that
+    # question.
+    arrived_at: str | None = None
 
     @property
     def is_game_start(self) -> bool:

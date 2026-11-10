@@ -57,14 +57,26 @@ TICKET_TRANSFER_COMPLETE = 0x68
 PARSING = {0x00: "standard validation number (18 digits)"}
 
 # Table 15.12b machine status for the redemption cycle.
-REDEEM_STATUS = {
-    0x00: "ticket redeemed",
-    0x01: "ticket rejected -- not a valid ticket",
-    0x02: "ticket rejected -- ticket expired",
-    0x03: "ticket rejected -- validation number not in system",
-    0x80: "not in a redemption cycle / no ticket",
-    0xFF: "ticket in escrow, waiting for the host to authorise or deny",
-}
+# A PRIVATE COPY OF TABLE 15.12c, AND IT DISAGREED WITH THE REAL ONE.
+#
+# This dict used to live here with its own values, and three of them were
+# wrong in the direction that matters most: it called 0x01 and 0x02
+# REJECTIONS ("not a valid ticket", "ticket expired") when Table 15.12c
+# has them as SUCCESSES -- restricted and nonrestricted promotional ticket
+# redeemed. On 2026-11-08 the lab cabinet returned 0x02 for a ticket it had
+# just credited, and this tool would have reported it expired.
+#
+# It also had no 0x84, which is the single most interesting status this
+# project has seen: "transfer amount exceeded the gaming machine credit
+# limit" -- the cabinet naming the reason for a refusal that amendment A16
+# was written as though the machine never explained.
+#
+# saspy/constants.py already records this exact failure once, about 0x82
+# drifting away from the table it belonged to: "A constant and the table it
+# belongs to drifted apart because nothing checked they agreed; the test
+# now does." That test checked constants.py against itself and never saw
+# this second copy. A test now forbids any module keeping its own.
+from saspy.constants import TICKET_REDEMPTION_STATUS as REDEEM_STATUS
 
 # Meters that a redeemed ticket must move. Read before and after so the
 # question "did it actually credit?" is answered by the machine, not by the

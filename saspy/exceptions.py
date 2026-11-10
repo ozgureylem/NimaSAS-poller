@@ -71,3 +71,34 @@ class SASPortCapabilityError(SASError):
     parity bit to exist on. Raised instead of letting the underlying
     termios/pyserial exception crash the caller uncaught.
     """
+
+
+class SASPreempted(SASTimeoutError):
+    """A long poll was NACKed by §12.3 events more times than the budget allows.
+
+    NOT THE SAME THING AS A TIMEOUT, and conflating them is what made a
+    healthy cabinet look faulty.
+
+    §12.3 lets a machine answer any long poll with a queued event instead of
+    the reply, and §12.4 says the host then "considers the long poll NACKed
+    and reinserts the long poll into its transmit queue". Every reissue that
+    is pre-empted again has therefore COLLECTED A REAL EVENT: the exchange
+    did useful work, the queue is one shorter, and nothing was lost. A
+    timeout is the opposite -- silence, nothing learned, probably a cable.
+
+    Until 2026-11-06 both raised SASTimeoutError, so:
+
+      * the error census could not tell "the customer is mashing the cash
+        out button" from "the link is dying", and both read as a fault;
+      * 1,025 rows of the first kind sat in poll_errors looking like the
+        second, and the §12.3 diagnosis took a week.
+
+    Subclasses SASTimeoutError so existing `except SASTimeoutError` handlers
+    keep working. Catch this first where the difference matters.
+    """
+
+    def __init__(self, message: str, *, events_collected: int = 0,
+                 elapsed: float = 0.0):
+        super().__init__(message)
+        self.events_collected = events_collected
+        self.elapsed = elapsed

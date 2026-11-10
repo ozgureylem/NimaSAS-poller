@@ -45,7 +45,7 @@ import time
 from typing import Protocol
 
 from .constants import RTE_EVENT_IDENTIFIER
-from .exceptions import SASPortCapabilityError, SASTimeoutError
+from .exceptions import SASPreempted, SASPortCapabilityError, SASTimeoutError
 
 
 class SerialLike(Protocol):
@@ -85,6 +85,7 @@ class SASTransport:
         wake_byte: int | None = 0x80,
         wake_gap: float = 0.005,
         wake_after_idle: float = 0.0,
+        min_poll_interval: float = 0.2,
     ):
         """``wake_byte`` is a throwaway byte sent before a message when the
         line has been idle, to absorb the loss of the first byte after idle.
@@ -102,6 +103,36 @@ class SASTransport:
         reliably. Set ``wake_byte=None`` to switch it off on a link that
         does not need it.
 
+        ``min_poll_interval`` is §2.3.3's floor, enforced here because here
+        is the only place every message to the machine passes through:
+
+            "The host may not issue general polls or long polls to any
+            single gaming machine at a rate faster than once per 200 ms."
+
+        Both kinds, counted together, against one machine -- so a sweep that
+        interleaves heartbeat general polls between its long polls pays for
+        both out of the same budget. A 22-exchange sweep with a heartbeat
+        after every exchange measured 0.616 s on the lab EGT: 44 messages at
+        14 ms apart, fourteen times faster than the floor.
+
+        §12.2 relaxes it, and only this far: "the polling rate can be
+        increased to 40 ms in order to better approximate real time
+        reporting." Permission, not obligation, and 14 ms breaches that too.
+
+        There is no reason to use the relaxation. §12.3 delivers at most one
+        event per poll, so 200 ms is a ceiling of five events per second
+        against a measured play rate of about 0.85 -- roughly six times the
+        headroom. Polling faster cannot raise the event rate above what the
+        machine generates; it only spends gateway CPU. Set it to 0.04 if a
+        jurisdiction or a genuinely faster machine ever requires it, and 0
+        to disable pacing entirely (tests, replay, a simulated port).
+
+        Measured from the START of one message to the start of the next,
+        which is what §2.3.3 means: "The polling rate does not include the
+        gaming machine response time or the inter-byte delay time." An
+        exchange whose response already took 150 ms therefore waits only
+        50 ms more, not another full interval.
+
         ``wake_after_idle`` is how long the line must have been quiet
         before the wake byte is sent again. The default of 0.0 sends it
         before every message, which is the configuration actually measured
@@ -115,7 +146,23 @@ class SASTransport:
         self._wake_gap = wake_gap
         self._wake_after_idle = wake_after_idle
         self._last_tx: float | None = None
+        self._min_poll_interval = min_poll_interval
+        self._last_poll_start: float | None = None
         self._lock = threading.Lock()
+
+    def _pace(self) -> None:
+        """Hold off until §2.3.3's interval has passed since the last message.
+
+        The wake byte is deliberately not paced: it is a general poll to the
+        broadcast address 0, which is not "any single gaming machine", and
+        the machine does not answer it (0/20 measured). It is part of the
+        message that follows, not a poll of its own.
+        """
+        if self._min_poll_interval <= 0 or self._last_poll_start is None:
+            return
+        wait = self._min_poll_interval - (time.monotonic() - self._last_poll_start)
+        if wait > 0:
+            time.sleep(wait)
 
     def _wake_line(self) -> None:
         """Send the throwaway byte if the line has been idle long enough.
@@ -185,6 +232,8 @@ class SASTransport:
         """
         if not frame:
             return
+        self._pace()
+        self._last_poll_start = time.monotonic()
         try:
             self._wake_line()
             self._serial.parity = PARITY_MARK
@@ -263,6 +312,7 @@ class SASTransport:
         header_length: int = 3,
         crc_length: int = 2,
         max_requeue: int = 24,
+        max_requeue_seconds: float = 15.0,
     ) -> bytes:
         """A long poll that survives being pre-empted by a real time event.
 
@@ -289,10 +339,59 @@ class SASTransport:
 
         Pass ``response_length`` for a fixed-length reply, or leave it None
         for the length-prefixed shape.
+
+        EACH REISSUE GETS ITS OWN FULL TIMEOUT, and getting that wrong cost
+        this project a week. ``timeout`` used to be a single deadline for the
+        whole sequence, so the number of reissues that fitted depended on how
+        fast they could be sent -- which §2.3.3's pacing governs. The two
+        parameters silently multiplied:
+
+            14 ms pacing, 1.0 s budget  ->  ~24 reissues  ->  worked
+            300 ms pacing, 1.0 s budget ->  ~3 reissues   ->  ~94 timeouts/hour
+            300 ms pacing, 3.0 s budget ->  ~9 reissues   ->  zero
+
+        Nothing about link health had changed; the host had simply been given
+        a smaller allowance for draining a backlog, by a setting that was
+        supposed to be about politeness on the wire.
+
+        They are different questions and now have different parameters.
+        ``timeout`` is "how long may ONE response take", which is link health
+        and belongs near a second. ``max_requeue`` is "how deep a backlog will
+        I drain before giving up", which is about the machine's queue and has
+        nothing to do with pacing. A dead link still fails in one ``timeout``:
+        silence raises rather than reissuing, so only a genuine §12.3
+        pre-emption costs another attempt -- and each one of those carries a
+        real event away with it.
+
+        ``max_requeue_seconds`` is the backstop. A cabinet that pre-empts
+        every single attempt would otherwise hold the port for
+        ``max_requeue`` x ``timeout``, which on a busy floor is one machine
+        starving the rest of a sweep.
         """
         with self._lock:
-            deadline = time.monotonic() + timeout
+            started = time.monotonic()
+            preempted = 0
             for _ in range(max_requeue):
+                # §12.4 reinserts the poll into the transmit queue; it does
+                # not give the queue a shorter deadline each time round. The
+                # wall-clock guard below is the only thing bounding total
+                # time, and it is deliberately generous -- every attempt that
+                # ends here collected an event, so the time bought something.
+                if preempted and (time.monotonic() - started) >= max_requeue_seconds:
+                    raise SASPreempted(
+                        f"long poll pre-empted by a real time event "
+                        f"{preempted} time(s) over {max_requeue_seconds:.0f}s "
+                        f"(section 12.3). Each reissue collected a real event, "
+                        f"so this is a backlog being drained rather than a "
+                        f"fault -- but one machine may not hold the port "
+                        f"indefinitely. The events are not lost; collect them "
+                        f"with drain_rte_events(). §12.4: reinsert this poll "
+                        f"into the transmit queue and send it again later, "
+                        f"rather than treating it as failed.",
+                        events_collected=preempted,
+                        elapsed=time.monotonic() - started,
+                    )
+                deadline = time.monotonic() + timeout
                 self._serial.reset_input_buffer()
                 self.write_with_wakeup(frame)
 
@@ -316,6 +415,7 @@ class SASTransport:
                         code = self._read_exact(1, deadline)[0]
                         body = self._read_exact(data_len_for(code) + crc_length, deadline)
                         on_event(first + second + bytes([code]) + body)
+                        preempted += 1
                         continue
                     return first + second
 
@@ -324,17 +424,23 @@ class SASTransport:
                     code = self._read_exact(1, deadline)[0]
                     body = self._read_exact(data_len_for(code) + crc_length, deadline)
                     on_event(head + bytes([code]) + body)
+                    preempted += 1
                     continue  # 12.4: treat as a NACK and reissue
                 if response_length is not None:
                     return head + self._read_exact(response_length - 2, deadline)
                 header = head + self._read_exact(header_length - 2, deadline)
                 return header + self._read_exact(header[-1] + crc_length, deadline)
-            raise SASTimeoutError(
+            raise SASPreempted(
                 f"long poll pre-empted by a real time event {max_requeue} times "
-                f"in a row (section 12.3). Each retry collected a real event, so "
+                f"in a row (section 12.3). Each reissue collected a real event, so "
                 f"this is a backlog being drained rather than a fault -- the "
-                f"machine simply had more queued than one poll's retries. The "
-                f"events are not lost; collect them with drain_rte_events()."
+                f"machine simply had more queued than max_requeue={max_requeue} "
+                f"allows for. The exchange timeout is not the lever, because "
+                f"each reissue already gets its own. §12.4: reinsert this poll "
+                f"into the transmit queue and send it again later. The events "
+                f"are not lost; collect them with drain_rte_events().",
+                events_collected=max_requeue,
+                elapsed=time.monotonic() - started,
             )
 
     def general_poll_rte(

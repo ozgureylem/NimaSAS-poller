@@ -662,7 +662,16 @@ def _captures():
     out = []
     for f in sorted(d.glob("*.json")):
         meters = json.loads(f.read_text()).get("meters_raw") or {}
-        if meters:
+        # A snapshot of a machine that answered NOTHING still carries all 162
+        # keys, every one of them null, so a truthiness check on the dict
+        # passes and the capture looks real. The 2026-10-28T20-50-34Z capture
+        # is one: taken while the cabinet was in RTE mode, where every long
+        # poll was pre-empted (12.3) and nothing came back. It is worth
+        # keeping as evidence of what that failure looks like, but it is not
+        # a hardware vector, and tests that read captures[-1] as "the current
+        # truth" must not land on it. Same lesson as survey_store.verify():
+        # a row of nulls is silence, not a reading.
+        if any(v is not None for v in meters.values()):
             out.append((f.name, meters))
     return out
 
@@ -697,19 +706,37 @@ def test_total_cancelled_credits_includes_electronic_out():
     assert checked >= 15, f"only {checked} captures carried all the meters"
 
 
-def test_total_drop_is_electronic_in_plus_ticket_in():
-    """0024 = 0017 + 0015 in the current epoch, 54,554 against a screen
-    reading 545.54. C-7 defines it as total drop "including but not limited
-    to ... tickets to drop, and electronic in", so a capture with bill
-    activity adds a term; this checks the epoch that has none.
+def test_total_drop_is_its_parts_including_the_bill_term():
+    """0024 = electronic in + ticket in + bills + coins to drop, in EVERY
+    capture rather than only the epochs with no bill activity.
+
+    The earlier version asserted 0024 = 0017 + 0015 and noted that "a capture
+    with bill activity adds a term; this checks the epoch that has none" --
+    which held only until a $1.00 bill was accepted on 2026-10-28 and the
+    latest capture stopped being such an epoch. A test that passes because
+    of what the machine has not done yet is a test with an expiry date on it.
+
+    The bill term is 000B, total credits from bills ACCEPTED, not 0058,
+    total credits from bills TO DROP, which C-7's own wording for 0024 names.
+    The two differ on a machine with a bill diverter, where some notes go to
+    the hopper instead of the drop; this cabinet has no hopper and leaves
+    0058 unimplemented entirely, so 000B is the only route to the figure.
+    Both are summed here, and a machine implementing neither contributes
+    zero rather than failing.
+
+    On 2026-10-28: 2,978,302 + 8,000 + 100 = 2,986,402, exact.
     """
     captures = _captures()
     if not captures:
         import pytest
         pytest.skip("no captures/ directory in this checkout")
-    latest = captures[-1][1]
-    g = lambda c: latest.get(f"{c:04X}")
-    assert g(0x0024) == (g(0x0017) or 0) + (g(0x0015) or 0)
+    for name, m in captures:
+        g = lambda c: m.get(f"{c:04X}") or 0  # noqa: B023
+        bills = g(0x0058) or g(0x000B)  # "to drop" where implemented, else "accepted"
+        parts = g(0x0017) + g(0x0015) + bills + g(0x000A)
+        assert g(0x0024) == parts, (
+            f"{name}: 0024 {g(0x0024):,} != 0017 {g(0x0017):,} + 0015 "
+            f"{g(0x0015):,} + bills {bills:,} + 000A {g(0x000A):,} = {parts:,}")
 
 
 def test_the_machine_balances_end_to_end():
@@ -823,3 +850,36 @@ def test_the_two_survey_clocks_are_in_different_zones():
     # And the minutes and seconds matched exactly, which is what says the
     # clocks genuinely agree rather than happening to be close.
     assert (56, 55) == (56, 55)
+
+
+def test_lp_1f_max_bet_saturates_and_lp_b5_does_not():
+    """Table 7.10's max bet is one binary byte: "01-FF ... or FF if largest
+    configured max bet greater than or equal to 255". So 255 is a sentinel
+    meaning "at least 255", never a reading.
+
+    The lab EGT reports 255 from LP 0x1F while eleven of its forty-eight
+    games are configured above it and the true largest is 500, which only
+    LP 0xB5 (2 BCD, 0000-9999) can express. Every zoom roulette station
+    reported 255 too, and we recorded it as a value.
+    """
+    import json
+    from pathlib import Path
+    d = Path(__file__).resolve().parent.parent / "captures"
+    if not d.is_dir():
+        import pytest
+        pytest.skip("no captures/ directory in this checkout")
+    checked = 0
+    for f in sorted(d.glob("*asset246*.json")):
+        cap = json.loads(f.read_text())
+        games = [g for g in cap.get("games", []) if g.get("answered")]
+        if not games or cap.get("identity", {}).get("max_bet") != 255:
+            continue
+        checked += 1
+        largest = max(g["max_bet"] for g in games)
+        assert largest >= 255, f"{f.name}: 0x1F said 255 but no game reaches it"
+        if largest > 255:
+            assert cap["identity"]["max_bet"] == 255, (
+                f"{f.name}: 0x1F must saturate at 255 when a game exceeds it")
+    if not checked:
+        import pytest
+        pytest.skip("no capture with a per-game sweep and a saturated 0x1F")

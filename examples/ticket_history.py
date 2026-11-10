@@ -72,27 +72,11 @@ BUFFER_INDICES = range(0x01, 0x20)   # 1-31, per §15.10
 # ticket_redeem.py and ticket_in_watch.py carry: one byte, one vocabulary,
 # so a refusal reads the same whichever tool reports it. The top three bits
 # give the category and the whole byte gives the reason.
-REDEEM_STATUS = {
-    0x00: "cashable ticket redeemed",
-    0x01: "restricted promotional ticket redeemed",
-    0x02: "nonrestricted promotional ticket redeemed",
-    0x20: "waiting for long poll 71",
-    0x40: "ticket redemption PENDING (not complete)",
-    0x80: "ticket rejected by host, or unknown",
-    0x81: "validation number does not match",
-    0x82: "not a valid transfer function",
-    0x83: "not a valid transfer amount (non-BCD)",
-    0x84: "transfer amount exceeded the gaming machine credit limit",
-    0x85: "transfer amount not an even multiple of the machine denomination",
-    0x86: "transfer amount does not match ticket amount",
-    0x87: "gaming machine unable to accept transfer at this time",
-    0x88: "ticket rejected due to timeout",
-    0x89: "ticket rejected due to comm link down",
-    0x8A: "ticket redemption disabled",
-    0x8B: "ticket rejected due to validator failure",
-    0xC0: "not compatible with the current redemption cycle (ignored)",
-    0xFF: "no validation information available",
-}
+# Table 15.12c lives in saspy/constants.py and nowhere else. A private
+# copy here disagreed with it about 0x82 for weeks -- see the comment on
+# TICKET_REDEMPTION_STATUS -- and tests/test_one_table_per_fact.py now
+# forbids a second copy of any canonical SAS table.
+from saspy.constants import TICKET_REDEMPTION_STATUS as REDEEM_STATUS
 REDEEM_CATEGORY = {0b000: "SUCCESS", 0b001: "waiting", 0b010: "pending",
                    0b100: "FAILED", 0b110: "incompatible",
                    0b111: "no information"}

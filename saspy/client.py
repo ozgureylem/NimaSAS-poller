@@ -31,6 +31,8 @@ from .constants import (
     rte_data_length,
 )
 from .exceptions import SASAddressMismatchError, SASCommandNackedError, SASEncodingError, SASError
+from datetime import datetime, timezone
+
 from .framing import build_command, parse_response
 from .transport import SASTransport
 
@@ -171,6 +173,11 @@ class SASClient:
                 description=describe_exception(code),
                 data=bytes(payload[2:]),
                 fields=decode_rte_event_fields(code, bytes(payload[2:])),
+                # Stamped HERE, where the bytes came off the wire. The
+                # caller drains these at the end of its cycle, which on a
+                # full Table C-7 sweep is up to a minute later and identical
+                # for every event in the batch.
+                arrived_at=datetime.now(timezone.utc).isoformat(),
             )
         )
 
@@ -817,8 +824,8 @@ class SASClient:
         raw = self._exchange_fixed(frame, response_length=12, timeout=self.timeout)
         payload = self._strip(raw)
         features1 = payload[3]
-        # features2 (payload[4]) and features3 (payload[5]) are not yet exposed
-        # on EnabledFeatures — add fields there if a caller needs them.
+        features2 = payload[4]
+        features3 = payload[5]
         return models.EnabledFeatures(
             game_number=decode_bcd(payload[1:3]),
             jackpot_multiplier=bool(features1 & 0b00000001),
@@ -831,6 +838,16 @@ class SASClient:
             # which reads the wrong two bits entirely. Needs explicit grouping.
             validation_style=(features1 & 0b01100000) >> 5,
             ticket_redemption=bool(features1 & 0b10000000),
+            # Table 7.14d
+            meter_model=features2 & 0b00000011,
+            tickets_in_total_drop=bool(features2 & 0b00000100),
+            extended_meters=bool(features2 & 0b00001000),
+            component_authentication=bool(features2 & 0b00010000),
+            advanced_funds_transfer=bool(features2 & 0b01000000),
+            multi_denom_extensions=bool(features2 & 0b10000000),
+            # Table 7.14e
+            max_polling_rate_40ms=bool(features3 & 0b00000001),
+            multiple_sas_progressive_win_reporting=bool(features3 & 0b00000010),
         )
 
     # -- AFT register gaming machine (0x73, Table 8.1a/8.1b) ----------------

@@ -112,10 +112,15 @@ def save_config(config: GatewayConfig, path: str | Path) -> None:
         parser.write(f)
 
 
-def connect_from_config(path: str | Path):
+def connect_from_config(path: str | Path, *, min_poll_interval: float = 0.2):
     """Open the serial port a config file describes and return a ready-to-use
     SASClient. Kept out of client.py to avoid importing pyserial (via
     serial_port.py) anywhere that only needs the protocol logic.
+
+    ``min_poll_interval`` is §2.3.3's floor, passed through to the transport
+    where it is enforced. The default is the specification's own 200 ms. See
+    SASTransport for why going faster buys nothing and why §12.2's 40 ms
+    relaxation is a permission rather than a target.
     """
     from .client import SASClient
     from .serial_port import open_serial_port
@@ -123,5 +128,6 @@ def connect_from_config(path: str | Path):
 
     config = load_config(path)
     serial_port = open_serial_port(config.port, baudrate=config.baudrate)
-    transport = SASTransport(serial_port, byte_timeout=config.timeout)
+    transport = SASTransport(serial_port, byte_timeout=config.timeout,
+                             min_poll_interval=min_poll_interval)
     return SASClient(transport, config.address, timeout=config.timeout)

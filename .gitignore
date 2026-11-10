@@ -103,12 +103,51 @@ venv.bak/
 # mypy
 .mypy_cache/
 
-# Machine state snapshots from examples/meter_snapshot.py.
-#
-# Ignored HERE, in the public mirror, on purpose. A snapshot carries a
-# machine's asset number, serial number and complete accounting history, which
-# is operator business data. It belongs in the private repository, which does
-# NOT ignore this folder. The warning in meter_snapshot.py's docstring says the
-# same thing; this is the part that survives a copy-paste mirror of the
-# examples/ directory.
-captures/
+# Real ticket validation numbers for the lab ticket authority. They identify
+# tickets issued by a real property, so they are operational data: keep them
+# local. lab_tickets.example.json carries placeholders and is committed.
+lab_tickets.json
+
+# Derived from survey/*.json by examples/survey_store.py. Regenerate it
+# rather than committing a binary that grows with every survey.
+survey/*.sqlite3
+survey/survey.log
+survey/.survey-seq
+survey/.no-poweroff
+
+# Any SQLite database is derived -- rebuild it from the JSONs or the poller.
+*.sqlite3
+
+# -- found by deploy/mirror_to_public.py's "not in either list" report on the
+# -- lab gateway, 2026-11-02. All four sat untracked and UNIGNORED, so a plain
+# -- `git add -A` would have committed them.
+
+# SQLite's sidecar files. "*.sqlite3" above does NOT match these: the suffix
+# comes AFTER the extension. The -wal in particular holds committed
+# transactions not yet folded into the database -- real meter rows and events,
+# 4 MB of them when this was found.
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+
+# A ticket file under a name the rule above does not catch: "lab_tickets.json"
+# is a literal, and this is not it. Same contents, same reason.
+tickets.json
+
+# ...and neither does it catch lab_tickets.json.bak, which
+# examples/ticket_file_add.py writes itself every time it edits the file. Found
+# as the only untracked file on the gateway, 2026-11-03. "lab_tickets.json*"
+# does NOT match lab_tickets.example.json, which stays committed.
+lab_tickets.json*
+
+# Any editor or tool backup. Same contents as whatever it backs up, and the
+# same reason not to commit it.
+*.bak
+
+# Handpay queue dumps from examples/handpay_queue_drain.py: amounts, levels
+# and reset ids read off a real cabinet.
+handpay-queue-*.json
+survey/screens/
+survey/screens/
+survey/screens/
+survey/screens/

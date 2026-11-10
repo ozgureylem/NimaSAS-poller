@@ -1,727 +1,182 @@
-# NimaSAS-poller
+# NimaSAS poller
 
-A clean-room Python client for the GSA/IGT **SAS 6.02** slot accounting
-system protocol — the SAS-side of the gateway software this project is
-building, for stress-testing on real hardware and in your own lab
-environments.
+A clean-room SAS 6.02 host implementation and the gateway that runs it: one
+poll loop, one SQLite database, on a Linux micro-PC wired to one gaming
+machine's serial port.
 
-This repo is deliberately code-only: no protocol spec, no project
-background, no vendor tooling. Full documentation and project context are
-being shared with the team by email — this is the thing to actually run.
+This is the **code-only mirror**. The private repository it is generated
+from also carries floor captures, machine serials, per-property survey data
+and the lab apparatus used to measure all of it. None of that is here, and
+the absence is deliberate — see *What is deliberately missing*, below,
+before concluding a tool is lost.
 
-See **[MANUAL.md](MANUAL.md)** for the full user manual: a section per
-tool below (simple explanation first, technical detail after), plus a
-step-by-step guide to structuring a local SQL layer around a poller.
+## Start here
 
-## What's here
+| | |
+|---|---|
+| **`MANUAL.md`** | what every tool does, and how to put a SQL layer around a poller |
+| **`examples/sql_poll_logger.py`** | the gateway itself. If you read one file, read this one |
+| **`saspy/`** | the SAS 6.02 client: framing, CRC, long polls, meters, RTE |
+| **`gateway/`** | the gateway↔server link (spec §10). Frame codec and HMAC |
+| **`tests/`** | ~1,000 tests, no hardware required |
 
-- **`saspy/`** — the client itself: CRC-16, BCD/binary field codecs, frame
-  building/parsing, a wakeup-bit-aware serial transport, a `SASClient`
-  covering general poll plus the long polls listed below, and a
-  `.ini`-based gateway config (`saspy/config.py`) so connection details
-  don't need to be hardcoded.
-- **`tests/`** — 297 tests, all against fake serial ports; run them with
-  no hardware attached to confirm your environment is set up right before
-  you touch real wiring.
-- **`examples/connectivity_check.py`** — point this at a real port and
-  address and it general-polls, then tries a few read-only long polls.
-  Changes nothing on the machine by default. Start here for
-  wiring/connectivity checks:
-  ```
-  python3 examples/connectivity_check.py /dev/ttyUSB0 --address 1
-  ```
-  `--test-shutdown` opts into round-tripping LP 0x01/0x02 (Shutdown
-  then Startup) against the address — a real state change, unlike
-  everything else this script does — with a confirmation prompt
-  (`--yes` to skip it) and a Startup attempt no matter how the
-  Shutdown call itself went, so a flaky exchange can't leave the
-  machine disabled:
-  ```
-  python3 examples/connectivity_check.py /dev/ttyUSB0 --address 1 --test-shutdown
-  ```
-- **`examples/wire_diagnostics.py`** — run this first on a machine you
-  have never polled before. Read-only: it answers three questions in the
-  order they block you — does a plain general poll work, does a `0x80`
-  sync byte before each poll help/hurt/do nothing (and does the gap after
-  it matter), and do **long polls** work. That last one is separate on
-  purpose: every long poll is a multi-byte frame, which exercises a
-  parity transition a single-byte general poll never touches, so a bus
-  that general-polls perfectly can still fail every long poll. Every
-  condition runs the same counted harness, because a loop that stops at
-  its first failure and one that counts failures are not comparable
-  evidence.
-  ```
-  python3 examples/wire_diagnostics.py /dev/ttyS0 --address 1
-  ```
-- **`examples/wakeup_probe.py`** — read-only follow-up for when a bare
-  general poll gets no answer but one preceded by a `0x80` does. Changing
-  parity calls `tcsetattr` with `TCSANOW`, which reconfigures the port
-  immediately, so a byte written straight afterwards may be the one that
-  gets damaged — meaning a leading `0x80` can work by absorbing that
-  damage rather than by being a sync. The two explanations lead to
-  opposite fixes, so this measures which one holds: it polls with parity
-  set once and never touched again, which only succeeds under the second.
-  ```
-  python3 examples/wakeup_probe.py /dev/ttyS0 --address 1
-  python3 examples/wakeup_probe.py /dev/ttyS0 --address 1 --watch   # swing the slot door
-  ```
-- **`examples/preamble_probe.py`** — read-only. Once a preamble is known
-  to be needed, this says *what it is*: whether any throwaway byte works
-  (a link-layer fault — the far end needs the line driven before it reads)
-  or only `0x80` does (protocol), and how long the line may be quiet
-  before a bare poll stops being answered. Both answers feed straight into
-  `SASTransport(wake_byte=..., wake_after_idle=...)`.
-  ```
-  python3 examples/preamble_probe.py /dev/ttyS0 --address 1
-  ```
-- **`examples/poll_test_tool.py`** — a bench tool for trying long polls
-  against a real EGM and watching what comes back. Serves a small local
-  web UI: one panel lists every long poll this client implements, tagged
-  in plain language ("Total value of bills in"), built from
-  `saspy.constants` so it can't drift from the code; the other is a
-  free-form hex box for codes found in a forum post or vendor doc — it
-  shows the exact bytes (CRC computed for you), sends, and decodes the
-  reply as far as it structurally can, flagging whether the CRC checks
-  out. When an unknown code turns out to work, that exchange is the
-  test vector for adding it to `saspy` properly.
-  Runs on Linux, Windows and macOS, either on a laptop with the adapter
-  plugged into it, or on the gateway with a laptop's browser pointed at
-  it. `--list-ports` finds the port name on any OS.
-  ```
-  python3 examples/poll_test_tool.py --list-ports                  # COM3? /dev/cu.usbserial-*?
-  python3 examples/poll_test_tool.py /dev/ttyUSB0 --address 1      # then open localhost:8080
-  python3 examples/poll_test_tool.py /dev/ttyUSB0 --bind 0.0.0.0   # on the gateway, browse from a laptop
-  python3 examples/poll_test_tool.py --simulate                    # explore the UI, no hardware
-  ```
-  ⚠ **Lab gateways only — read
-  [POLL_TEST_TOOL_WARNING.md](POLL_TEST_TOOL_WARNING.md) before running
-  it**, and [POLL_TEST_TOOL_MANUAL.md](POLL_TEST_TOOL_MANUAL.md) for how
-  to use it. It sends whatever you tell it to: SAS long polls are not
-  all reads — some move funds (`0x72`), pay out a ticket (`0x71`), or
-  take the machine out of service (`0x01`). Recovering a stuck machine
-  often ends in a **RAM clear, which permanently zeroes that machine's
-  meters**. This must never be installed on a gateway serving live
-  machines, and must be erased and verified gone before a lab gateway is
-  redeployed to a floor.
-
-  Every command is classified read / state-change / custom, and anything
-  that isn't a known-safe read needs a typed confirmation the
-  **backend** enforces, not just the UI. `--lab-mode` drops that
-  confirmation for a bench where a locked machine is a non-event — a
-  deliberate startup flag, never the default.
-- **`examples/exception_monitor.py`** — read-only. General-polls and names
-  what comes back in plain language, so somebody can play the machine and
-  watch events scroll: `0x7E` **game has started**, `0x7F` **game has
-  ended**, doors, bills, cashout button, handpays. The full Appendix A
-  table (114 codes) lives in `saspy.constants`, so a raw `0x84` reads as
-  "self test or operator menu has been entered". On exit it summarises what
-  was seen.
-  ```
-  python3 examples/exception_monitor.py /dev/ttyS0 --address 1
-  ```
-  **On RTE (real time event reporting):** codes for reel stops, cards held,
-  draw-card requests and coin/credit wagered are sent *only* with RTE on,
-  which the host enables with long poll `0x0E` (§12.1). **This library does
-  not implement `0x0E`, deliberately** — §12.5 says that once RTE is on
-  "gaming machines no longer report exceptions as single byte codes": every
-  exception arrives as `address, FF, code, data…, CRC`, §12.3 lets an event
-  pre-empt a long poll's response, and §12.4 requires the host to treat that
-  as a NACK and re-queue. So enabling RTE breaks this client everywhere at
-  once — `general_poll()` reads exactly one byte, and any long poll may come
-  back as an event. `poll_test_tool.py` will happily send `0x0E 01`; if
-  someone does, the machine looks dead and the fix is
-  `exception_monitor.py --disable-rte`, or a power cycle (the spec requires
-  machines to default to non-RTE on power up). That recovery exists as its
-  own flag because a machine stuck in RTE cannot be recovered by the tools
-  that assume it is not.
-  Game start/end need none of this.
-
-  **§12.4 is handled.** Every long poll goes through one place in the client,
-  so while RTE is on a reply whose second byte is the `FF` identifier is
-  recognised as an event rather than decoded as meter data: the poll is
-  reissued (§12.4 — "the host… considers the long poll NACKed and reinserts
-  the long poll into its transmit queue") and the event is **kept**, not
-  dropped. Discarding it would reintroduce the very exception loss RTE is
-  being used to avoid. Collect them with `drain_rte_events()`.
-
-  **`wager_cents` is the field to reconcile against meters.** §12.5.3's
-  `credits_wagered` is in *game credits*, "independent of any denomination",
-  while the `total_coin_in` beside it is in SAS accounting units — so on a
-  multi-denom machine the two disagree by a factor that changes per game.
-  The client decodes Table C-4 and computes `wager_cents = credits_wagered ×
-  denomination`, verified on an EGT Premier across six consecutive games at
-  four denominations, where the coin-in delta equalled it every time. A host
-  using `credits_wagered` directly would under-report wager by 2×–10×
-  depending on which game was selected. Table C-4's codes are **hex**, so a
-  machine reporting decimal `23` means `0x17`, two cents — and read as a
-  decimal row number, 23 lands in the reserved range, so the error is silent.
-
-  `--credits` adds the machine's credit meter to each GAME HAS ENDED line.
-  Table 12.5.4 carries only the game win, so that is a separate LP `0x1A`
-  read — and it is exactly the read §12.3 can pre-empt, which is why the
-  above had to exist first.
-
-  `--rte` enables it for one run and turns it back off on exit, inside a
-  `finally` so a crash or Ctrl-C cannot leave the machine in a mode the
-  ordinary poll loop mis-frames; if the restore itself fails it says so
-  loudly, because nothing else will.
-- **`examples/aft_push_credits.py`** — **moves money.** Puts cashable
-  credits on a machine by AFT (Table 8.3d type `00`, in-house host→machine,
-  full transfer only). Registration is not needed: Table 8.3a states
-  "registration key (0 = registration not required)" and §8.1 that "a POS ID
-  is never required for in-house transfers". It pre-checks the things that
-  otherwise come back as a status code to look up — AFT and in-house enabled,
-  transfer-to-machine currently available (all-zero is usually the operator
-  menu or an open door, §8.3, and becomes status `87`), the amount against
-  the machine's limit (`84`), the asset number read from the machine rather
-  than guessed (`93`), and a transaction ID unique per run (`81`) — then
-  reads Table C-7 meters `00A0`/`00A1` before and after, because the status
-  byte is what the machine decided and the deltas are what happened.
-  ```
-  python3 examples/aft_push_credits.py /dev/ttyS0 --address 1 --amount 20.00
-  python3 examples/aft_push_credits.py /dev/ttyS0 --address 1 --restricted 5.00 --pool-id 1
-  ```
-  `--restricted` and `--nonrestricted` push **promotional** credits. Three
-  things the spec makes non-obvious: restricted credits are not redeemable
-  for cash and must be wagered; they are played **before** any cashable
-  credits already on the machine (§8 fixes the order restricted →
-  nonrestricted → cashable); and a machine already holding restricted
-  credits **from a different pool** rejects the transfer with status `8F`, so
-  the tool pre-checks the pool ID reported by `0x74`. Expiration is accepted
-  but, per §8, a machine must not refuse a transfer because the date has
-  already passed — it only governs cashing out later. All three amount types'
-  meters (`00A0`–`00A5`) are read before and after every push, so a
-  promotional transfer proves what did *not* move as well as what did.
-  A transfer answered with **pending** status `0x40` is not finished, and
-  leaving it unacknowledged is not harmless: §8.8 requires the machine to
-  issue exception `0x69` on completion and "reissue exception 69 **every 15
-  seconds** until the host polls for and acknowledges the completion status".
-  Measured on an EGT Premier at 15.2s, indefinitely — and `0x69` is a
-  *priority* exception, so it is delivered ahead of anything queued. The tool
-  therefore follows up with the Table 8.3b interrogation poll automatically.
-  To clear a machine already stuck in that loop, without moving money:
-  ```
-  python3 examples/aft_push_credits.py /dev/ttyS0 --address 1 --acknowledge-only
-  ```
-- **`examples/poll_gap_probe.py`** — read-only. Finds what causes exception
-  `0x70`, buffer overflow. Measured on an EGT Premier at turbo play: ~2.4
-  exceptions/sec against a monitor polling 4.5/sec, with **zero** overflow —
-  so a fast player does not outrun a loop that is actually polling, and
-  raising the poll rate is not the fix. What matters is the **budget**: at
-  2.4/sec a ~35-deep queue is about **15 seconds** of not polling. The usual
-  culprit on a gateway is its own long polls — one general poll per cycle,
-  then a meter sweep of dozens of exchanges during which nothing drains the
-  queue. This times the real sweep (it imports `sql_poll_logger`'s own
-  `_poll_all_meters` rather than imitating it) in each `--skip-*`
-  configuration and converts each duration into exceptions accumulated.
-  ```
-  python3 examples/poll_gap_probe.py /dev/ttyS0 --address 1
-  ```
-- **`examples/exception_buffer_probe.py`** — read-only. Measures how many
-  exceptions a machine really buffers. §2.2.1 requires "a first in/first out
-  (FIFO) exception queue of **at least 20 elements** in non-volatile
-  memory", discards the **oldest** on overrun, and requires exception `0x70`
-  to report any loss — which contradicts the common belief that SAS holds
-  only one pending exception. Since a general poll pulls exactly one
-  exception, the queue can only be filled while nobody polls: the tool
-  drains it, stops polling while you cycle the slot door a known number of
-  times, then polls flat out and counts what returns.
-  ```
-  python3 examples/exception_buffer_probe.py /dev/ttyS0 --address 1 --cycles 15
-  ```
-  The diagnostic value is in `0x70`'s absence as much as its presence: a
-  gateway losing exceptions that never sees `0x70` is not losing them to
-  queue overrun, and the cause is elsewhere.
-- **`examples/host_cashout.py`** — **moves money, off the machine.** The
-  other half of `aft_push_credits`: watches for exception `0x6A` (AFT
-  request for host cashout, raised when a player presses cash out and host
-  cashouts are enabled) and answers it with a `0x72` transfer of type `0x80`
-  — the mechanism behind a card-removal flow returning credits to an
-  account. §8.7's sentinel is `9999999999` **with partial transfer allowed**,
-  which together mean "take whatever is there" — and therefore **a host
-  cashout succeeds with status `0x01`, not `0x00`**. Asking for more than
-  the machine holds and receiving the balance *is* a partial transfer. A
-  host testing `status == 0x00` would read every cashout as a failure and
-  might retry one that had already moved the money; Table 8.3e's top-three-
-  bits category is the defence, and `describe_aft_transfer_status()` applies
-  it.
-  ```
-  python3 examples/host_cashout.py /dev/ttyS0 --address 1 --deny   # watch, take nothing
-  python3 examples/host_cashout.py /dev/ttyS0 --address 1
-  ```
-  Three timings shape it: the machine reissues `0x6A` every **800 ms**, gives
-  the host **8 seconds** before running its own recovery, and `0x74` resets
-  the 800 ms timer but not the deadline. So nothing slow runs between seeing
-  the exception and replying — meters are read before the watch and after the
-  transfer, never in between. **In soft mode a missed deadline is silent**:
-  the machine cashes out by its own means and nothing looks wrong, so absence
-  of a transfer is not proof the exchange worked. `--deny` sends a zero
-  transfer, which §8.7 defines as telling the machine to cash out by its own
-  means — a real answer, **but not necessarily the gentle one**. "Its own
-  means" is whatever cashout device the machine has, and on a cashless
-  machine with no printer there isn't one: the cashout becomes a **handpay**,
-  locking the machine with "Call Attendant" until somebody with a reset key
-  arrives. Observed exactly that on an EGT Premier — a declined $37.47
-  cashout produced `0x51`, and it sat locked until a `0x52` reset two minutes
-  later. So without a printer, declining is the *more* disruptive choice and
-  taking the money to the host is the clean path; the pre-flight checks
-  Table 8.2b's available-transfers bit 2 and says which case applies. When a
-  handpay does occur the tool reads LP `0x1B` for the amount and the
-  available reset method, rather than just announcing the exception.
-- **`examples/accounting_summary.py`** — read-only. Prints the machine's
-  accounting figures as SAS reports them, grouped the way the machine's own
-  Machine Accounting screen groups them, and **recomputes that screen's
-  Cashless In/Out subtotals** from the component meters — so a match
-  confirms the *mapping*, not just the individual numbers.
-  ```
-  python3 examples/accounting_summary.py /dev/ttyS0 --address 1
-  ```
-  The mapping the wording inverts, established by pushing and cashing out
-  each amount type and watching which line moved:
-
-  | machine's screen | SAS / Table C-7 |
-  |---|---|
-  | Cashable Electronic In / Out | `002E` / `0032` |
-  | **Promotional** Electronic In / Out | `0030` / `0034` — SAS **NONrestricted** |
-  | **Non-cashable** Electronic In / Out | `002F` / `0033` — SAS **RESTRICTED** |
-
-  Read the other way round — "promotional" meaning restricted-promotional,
-  which the words invite — and the two categories swap. Both are
-  promotional, so neither figure then looks obviously wrong.
-
-  It also closes each promotional ledger — everything that came in either
-  went back out or was wagered (`in = out + played`) — which is the one
-  check here that needs no second screen to read. On an EGT Premier both
-  closed to the cent: non-cashable `21.00 in = 15.60 out + 5.40 played`,
-  promotional `3.00 in = 3.00 out + 0.00 played`. That third term is what
-  makes a cashout explicable: a machine holding `7.00` restricted
-  transferred `6.60` of it to the host, because `0.40` had been wagered in
-  a game played in between.
-- **`examples/meter_crosscheck.py`** — read-only (meter polls plus one
-  query-only `0x74`). Answers "which of these figures is the machine
-  already reporting, and which is only the gateway's arithmetic?" — because
-  a computed figure is right only as long as its component list is, and one
-  unimplemented component turns the whole sum into a silent `n/a`.
-  ```
-  python3 examples/meter_crosscheck.py /dev/ttyS0 --address 1
-  ```
-  Two natives are deliberately **wider** than the sum the gateway computes,
-  per Table C-7's own wording: `0017` counts electronic transfers to the
-  credit meter *or to a ticket*, and `0018` counts transfers to host
-  *including win amounts*. A positive delta there is expected, not a fault,
-  and the tool measures `00A8+00AA+00AC` first so it can say whether the one
-  difference `0017`'s wording permits is actually present.
-
-  Two others the spec defines *as* a sum, so a delta is a real
-  disagreement between two of the machine's own meters: `0022` is "total
-  won credits (**sum of total coin out and total jackpot**)" and `0023` is
-  "total hand paid credits (**sum of** total hand paid cancelled credits
-  **and total jackpot**)". A screen line labelled Total Won is `0022`, not
-  `0001` — `0001` is coin out, and on a machine that pays jackpots the two
-  differ by every jackpot it has ever paid.
-
-  Whether the screen's two headline totals have a native meter is a property
-  of the **machine**, not of SAS, so it is measured rather than assumed:
-  `0024` is "total drop, including but not limited to coins to drop, bills
-  to drop, tickets to drop, **and electronic in**", which on a cashless
-  machine with no coin acceptor and no ticket drop counts exactly what the
-  screen's Total In counts. On the EGT Premier it matched exactly, twice,
-  across a 3.00 transfer — as did `0004` against Total Out.
-
-  One figure has no native meter anywhere: the **nonrestricted balance**.
-  C-7 stops at `000C` and `001B`, and `000C - 001B` is cashable and
-  nonrestricted *together*, so no subtraction recovers it. `LP 0x74`
-  reports all three balances as separate native fields in one poll, and is
-  the only source for the third. `000C` itself is the whole balance on the
-  EGT Premier — a report of `50.00` against a screen showing `57.00` came
-  from a tool printing `0x74`'s *cashable field alone*, not from any meter
-  disagreeing.
-- **`examples/wager_categories.py`** — read-only. Per-wager-category
-  theoretical payback and Coin In, read raw from LP `0xB4`. This is the
-  other route section 7.24 describes to the payback figure, for machines
-  that decline meter `007F` — which §7.24.1 explicitly permits ("may …
-  choose to not support meter 007F for that paytable"), and which the lab
-  machine does while still showing 95.82% on its own screen.
-  ```
-  python3 examples/wager_categories.py /dev/ttyS0 --address 1
-  python3 examples/wager_categories.py /dev/ttyS0 --address 1 --weighted-average
-  ```
-  It does **not** form the weighted average by default, which is the point.
-  An average computed at the gateway is correct only until a Coin In meter
-  rolls over: past that the meter has dropped its high-order digits, the
-  gateway holds no record of how many times it wrapped, and the figure
-  drifts with nothing to show that it has. Reconstructing wrapped digits is
-  the CMS's job, because the CMS holds the history to do it with.
-
-  So what the tool contributes is not the percentage but the raw figures
-  plus each meter's **declared width** — LP `0xB4` carries a Coin In meter
-  size byte (0–9 BCD bytes), so the wrap ceiling is the machine's own
-  statement rather than an assumption. Any meter past 90% of its ceiling is
-  flagged, since that is the one downstream consumers need warning about.
-  `--weighted-average` computes it anyway for cross-checking, with the
-  caveat attached; it will not print a bare number.
-
-  Table 7.24b's "not supported" answer — an all-null payback with size `0` —
-  is reported as such rather than as a supported category sitting at zero.
-  Those two are indistinguishable without the size byte, which the client
-  previously parsed and discarded.
-- **`examples/ticket_history.py`** — read-only, and non-destructively so.
-  The machine's own record of every ticket it printed and every ticket it took.
-  ```
-  python3 examples/ticket_history.py /dev/ttyS0 --address 1
-  ```
-  Long poll `0x4D` is walked by buffer **index** (`01`–`1F`), which §15.10
-  leaves the read/unread pointer alone — function code `00` returns the next
-  unread record and marks it read, which is how a gateway drains the buffer and
-  exactly what must not happen when the point is to look. A poller can be
-  stopped, this run, and the poller restarted having lost nothing.
-
-  Two independent views. The 31 buffer records carry a validation type that
-  distinguishes direction (Table 15.13c: `00`–`04` printed, `80`–`82`
-  redeemed, `10`–`60` handpay receipts), so "ticket history" is shown as the
-  two opposite things it actually means. LP `0x50`'s per-type meters carry
-  everything since the last RAM clear. The two agreeing cross-checks a ring
-  buffer against counters the machine keeps separately; the two differing is
-  how a wrapped buffer announces itself, and the tool says so.
-- **`examples/meter_snapshot.py`** — read-only. Writes one machine's whole
-  readable state — identity, every Table C-7 meter this client knows, and
-  `0x74`'s three balances — to a single committable JSON file, values raw in
-  accounting units exactly as the machine reported them. One file per
-  snapshot, so `git log` on the folder is the machine's history and
-  `git diff` between two of them is precisely what moved. Meters the machine
-  does not implement are recorded as `null` and listed, since that is a fact
-  about the machine rather than a gap to fill.
-  ```
-  python3 examples/meter_snapshot.py /dev/ttyS0 --address 1 --note "after a 3.00 promo push"
-  ```
-  **Commit snapshots to the private repository only.** A snapshot carries the
-  machine's asset number, serial number and complete accounting history, which
-  is operator business data; a public repo is indexed and forked, and removing
-  a file later does not remove it from the history. `captures/` is in this
-  mirror's `.gitignore` for that reason — the warning in the tool's docstring
-  is advice, the ignore rule is what survives a copy-paste of `examples/`.
-- **`examples/capture_diff.py`** — offline; compares two snapshot files and
-  touches no hardware.
-  ```
-  python3 examples/capture_diff.py captures/BEFORE.json captures/AFTER.json
-  ```
-  `git diff` already shows which numbers changed, but as four-digit hex codes
-  and raw units — not a form anyone reads a test result out of. This names
-  each meter and prints the delta, and **re-checks every identity on both
-  ends**, because the case worth catching is not a meter that moved but an
-  identity that held before and stopped after. That is how `0004` was caught
-  passing for the screen's Total Out until an attendant first paid a win.
-
-  Counts print as counts: Table C-7 mixes money and quantities freely and the
-  wire says nothing about which is which, so dividing everything by 100 turns
-  665,755 games played into a plausible-looking `6,657.55`. Ledgers print in
-  **raw accounting units** — a ledger is held against itself, and dividing by
-  100 adds an assumption it does not need; `--raw` applies that to the whole
-  diff.
-
-  Ledgers also net off credit still **on** the machine, which has not left by
-  any route yet. Without that the shortfall moves every time money is pushed
-  or spent and tells you nothing; with it, the remainder is what is genuinely
-  unattributable and should stay still between runs.
-- **`examples/soak_report.py`** — read-only; reads a soak's SQLite database
-  and says whether the link held. It buckets failures by hour and minute
-  and reports the worst minute alongside the mean, because the failure mode
-  that matters is a **bursty** one: 43 failures over four hours is 0.18/min
-  — a "99.97% success rate" — and is an outage if 37 of them land in the
-  same minute. A single percentage describes neither case. Also checks that
-  no cumulative meter ever decreased, flags any stall in the snapshot
-  cadence (with the timestamp, so it can be cross-referenced against the
-  errors), and prints the current meters as dollars for comparison against
-  the machine's own accounting screen.
-
-  The monotonicity check excludes columns that are **not** cumulative. On
-  its first real soak it flagged five decreases and all five were correct
-  behaviour: current credits is a *balance* that falls on every wager, the
-  "games since" counters reset to zero by definition when a door closes or
-  power cycles, stacker levels drop when the cashbox is emptied, and the
-  selected game number is an identifier rather than a meter. A check wrong
-  five times out of five is worse than none — it teaches the reader to skim
-  past the one that matters.
-  ```
-  python3 examples/soak_report.py soak.db
-  ```
-  Safe to run while a soak is in progress — it opens the database read-only,
-  and is the reliable way to check a backgrounded run is working. (The
-  poller line-buffers its own stdout for the same reason: block-buffered,
-  a `nohup … > soak.log` log stays empty for minutes after a perfectly
-  healthy start, which is indistinguishable from a failure to start.)
-- **`examples/aft_status.py`** — read-only AFT interrogation: long polls
-  `0x73` and `0x74` with their query-only codes (`0xFF`, "report state,
-  change nothing"). Answers whether a host is registered, what the machine's
-  transfer limit is, and what credits are on it — before anyone sends
-  `0x72`, which is the one command in this library that moves money and has
-  never run against hardware.
-  ```
-  python3 examples/aft_status.py /dev/ttyS0 --address 1
-  ```
-- **`examples/commission_gateway.py`** — run this once when a gateway is
-  attached to a new EGM: scans ports/addresses, confirms a find by
-  querying the machine's SAS version and serial number, and writes a
-  `gateway.ini` the other tools can load. Optional — a config file can
-  always be hand-written.
-- **`examples/sql_poll_logger.py`** — one poll loop, one SQLite database:
-  a wide, deliberately redundant meter sweep (259+ columns across every
-  meter long poll this client implements — core, ticket, last-accepted-
-  bill info, ~39 single-meter polls, essentially the rest of Table C-7
-  via chunked extended-meter reads, and per-validation-type meters;
-  `--skip-full-meter-sweep`/`--skip-table-c7-sweep`/
-  `--skip-validation-meters-sweep`/`--skip-last-accepted-bill-poll` to
-  lighten or work around any of them), immediate re-poll on a failed general poll and a
-  validation-pool age alert (Decisions Annex D-09/D-16), full
-  ticket-out history (buffer backfill at startup plus live capture),
-  read-only ticket-in capture plus a `ticket_in_history` view
-  correlating each insertion with how its redemption cycle ended, and
-  gateway-local cashout validation
-  against a seeded local pool, all from a single general-poll stream
-  (deliberately one program — see the module docstring for why). A
-  runnable starting point for stress-testing over time or prototyping a
-  persistence layer — see MANUAL.md §4/§6 for the schema and reasoning.
-
-  **Every exception is recorded, not just the actionable ones.** An
-  18-hour soak produced 81 core-meter timeouts and a 116-second stall with
-  nothing in the database to explain either; the explanation turned out to be
-  in the machine's own event log, read off its screen afterwards — a
-  technician had the slot door open for most of the run and entered the
-  attendant menu twice. The poller had been told all of that over the wire,
-  as exceptions `0x11`, `0x12`, `0x82` and `0x83`, and discarded it because
-  it only acted on tickets and cashouts. A failure log without the machine's
-  own state beside it cannot be read. Everything now lands in
-  `machine_events`, and `soak_report.py` flags them under two headings —
-  **someone was at the machine** (every door and access panel in Appendix A,
-  not just the slot door, plus the attendant and operator menus) and **the
-  machine was interrupted** (AC power, RAM errors, buffer overflow). Those
-  are separated because they invalidate a stability number differently: one
-  is a machine being serviced, the other is a machine that was off. It turns
-  "the loop stalled, investigate" into "the power went out at 02:57".
-
-  Worth knowing when reading those events: on the EGT Premier the **bill
-  validator door reports as `0x1D`/`0x1E`**, which Appendix A names "belly
-  door". Expect that kind of mapping to vary by model.
-
-  **The meter sweep interleaves general polls.** A cycle used to issue one
-  general poll and then 73 long-poll exchanges, leaving the machine's
-  exception queue unattended throughout. Measured on an EGT Premier: the
-  sweep takes 6.07s and the gap between general polls was **7.12s**
-  (observed 7.122 and 7.072) — against a queue about 35 deep which, at the
-  ~2.4 exceptions/sec one player generates in turbo mode, fills in roughly
-  15 seconds. That spent half the queue every cycle for no reason but
-  ordering, and `0x70` buffer overflow is what a machine reports once it is
-  gone. A heartbeat general poll now runs every `heartbeat_every` exchanges
-  (default 8 → 9 per sweep → a **~0.6s** gap). Codes are collected and
-  dispatched after the sweep rather than acted on inside it, since issuing a
-  ticket or cashout long poll from within the long-poll loop would nest one
-  sweep in another; one sweep of latency is well inside the 30s §15.12
-  allows for a validation response. A heartbeat that fails is ignored — the
-  cycle's own general poll has its own retry path, and draining is
-  best-effort.
-
-  **An unsupported meter does not abort a cycle.** §4.4 requires a machine
-  that doesn't support a long poll to ignore it silently, so a single-meter
-  poll returns a timeout for "unsupported" and a timeout for "no answer" —
-  the same bytes for two different facts. Treating both as fatal meant a
-  cashless machine (no hopper, so LP `0x2C` never answers) abandoned **every**
-  cycle's meter write, which is what the first EGT Premier did: zero meter
-  rows and one `poll_errors` row per cycle, indefinitely. The distinction is
-  now made over time — a poll that has *never* answered is taken as
-  unsupported and its column left NULL, while one that answered before and
-  then goes silent is still a real failure and still aborts. A
-  permanently-NULL column doesn't misrepresent "as of `polled_at`" (the
-  machine has no such meter); one populated yesterday and missing today
-  does. Only a timeout qualifies — a checksum error is a link fault whatever
-  the machine supports.
-- **`legacy/`** — an earlier Python 2 implementation, kept for reference.
-  **It has known, confirmed bugs** (wrong byte offsets, a fabricated
-  field on a fund-transfer command, crashes on certain inputs) — don't
-  use it as a second source of truth, and don't build on it. It's here
-  purely as command-coverage history. `legacy/pre_pollcode_expansion/`
-  is unrelated: a frozen snapshot of `saspy/constants.py`, `client.py`,
-  and `models.py` from just before LP 2F/6F/4C/4D/7B were added, kept
-  as a fast rollback path during live floor testing — see its own
-  `README.md`.
-
-## Setup
-
-```
-pip install -e ".[dev]"
-pytest
+```bash
+python3 -m pytest tests/ -q
 ```
 
-Requires Python 3.10+ and `pyserial`. Works on Linux, and should work
-unmodified on Windows/macOS too — the serial handling goes entirely
-through pyserial's cross-platform API, nothing Linux-specific.
+## Bringing a gateway up
 
-## Long polls implemented
+In this order. Each step refuses rather than guessing, and the refusals are
+the useful part.
 
-This covers every data-returning long poll in the SAS 6.02 spec's own
-Appendix B (Table B-1) — the complete, authoritative command list — that
-is realistically relevant to a TITO/AFT/meters gateway. See
-`saspy/client.py` and `saspy/constants.py` — every method and constant
-cites the spec table it was built from, and `constants.py`'s module
-docstring explains the scope boundary below.
+1. **`examples/connectivity_check.py`** — is anything on the wire?
+2. **`examples/address_scan.py`** — which SAS address answers?
+3. **`examples/commission_gateway.py`** — writes `gateway.ini`
+4. **`deploy/commission_machine.py`** — the floor ceremony (below)
+5. **`deploy/nimasas-poller.service`** — run it under systemd
 
-- **General poll** (0x80/addr).
+### Commissioning, and key provisioning
 
-**Link note — the wake byte.** `SASTransport` sends a throwaway `0x80`
-before each message by default (`wake_byte`, `wake_gap`,
-`wake_after_idle`), and `wake_byte=None` switches it off.
+`deploy/commission_machine.py` is the one place a gateway is bound to a
+cabinet and to the server. It does these in this order and stops at the
+first thing that is wrong:
 
-It is there because on the first EGT machine tested, a general poll after
-~0.5s of silence was answered **0/20** while the identical poll preceded
-by `0x80` and 5 ms was answered **20/20** — the preamble's own reply
-discarded, so the reply provably belonged to the real poll.
+1. read the EGM's identity off the serial line
+2. **check it against the roster** — before any key is installed
+3. set the hostname (`RamSys` + the asset zero-padded to six digits)
+4. install the per-gateway **HMAC key** and the server's **Ed25519 public
+   key**
+5. write `gateway.json`, including the protocol state the link starts from
+6. append a record of the ceremony
 
-**But that is not a settled result.** A later run measured the same bare
-poll at **13/20**, and bare polls at **20/20** across every silence from
-5 ms to 1 s. Something on this link is intermittent, and until it is
-characterised the wake byte stays on because it has never made anything
-worse — not because it is known to be required. It is an empirical
-workaround in any case, not SAS: the spec asks for nothing of the kind.
+Two keys, and they are not halves of each other:
 
-Two things follow. Do **not** raise `wake_after_idle` off a run that had
-a preamble present throughout — that measures the gap a preamble works
-across, not whether the line stays warm without one. And treat any
-condition measured as a *block* of attempts with suspicion on this link:
-`examples/preamble_probe.py` interleaves and rotates its conditions, and
-reports how each one's successes split across the first and second half
-of the run, precisely so drift cannot pose as a property of the byte.
-- **Enable/disable** (0x01/0x02): remote shutdown ("lock out play") and
-  startup, the only command/control long polls this project wants to
-  send remotely — see "Deliberately not implemented" below for why
-  every other one (sound, bill acceptor, maintenance mode, ...) isn't
-  here. `send_shutdown()`/`send_startup()` raise `SASCommandNackedError`
-  if the machine rejects the command (Table 7.4b's NACK) rather than
-  returning silently — an ACK means only that the command was accepted,
-  not that a shutdown has actually finished happening on the machine yet.
-- **Meters**: core (0x0F, 0x19, 0x1C — see `constants.py` for why 0x1C
-  isn't literally "11 through 15" despite an earlier misleading name),
-  single-meter reads (0x10-0x18, 0x1A, 0x20, 0x2A-0x2C, bill/stacker
-  meters 0x31-0x4A) via `send_meter()`, selected/extended meters (0x2F,
-  0x6F, 0xAF — 0x6F/0xAF reach essentially the whole of Table C-7, 162
-  codes, including ticket meters such as Cashable Tickets In that the
-  core-meter polls cannot reach at all), per-game meters and
-  configuration (0x52, 0x53), hand-paid cancelled credits (0x2D), total
-  bill meters (0x1E), current hopper status (0x4F), last accepted bill
-  information (0x48), per-validation-type validation meters (0x50).
-- **Machine identity/config**: gaming machine ID (0x1F), SAS version and
-  serial (0x54), enabled features (0xA0), token denomination (0xB3),
-  selected/enabled game numbers (0x55, 0x56), games implemented (0x51),
-  wager category info (0xB4), extended game info (0xB5), current
-  date/time (0x7E), physical reel stops (0x8F).
-- **AFT**: register (0x73), lock/status (0x74), transfer funds (0x72).
-- **Real time event reporting** (0x0E): `enable_real_time_events()` plus
-  `general_poll_rte()`, which returns a `RealTimeEvent` decoded per Tables
-  12.5.1–12.5.8, or `None` for no activity (§12.6 makes silence the idle
-  signal in this mode, the opposite of `general_poll()`). Table 12.5 has no
-  length field, so `RTE_EVENT_DATA_BYTES` **is** the framing: a wrong entry
-  desynchronises the stream rather than spoiling one field. The reason to
-  turn it on is usually §12.5.3 — game start carries the total coin in meter
-  *after* the wager, so a session's wager reconciles from its boundary events
-  rather than from separate meter reads. §12.7's ROM-signature response
-  (which omits the `FF` identifier) raises rather than being parsed as a
-  bogus exception code.
-- **Ticketing**: secure enhanced validation ID (0x4C), enhanced
-  validation information / ticket-out history (0x4D), extended
-  validation status (0x7B), ticket validation data (0x70), redeem ticket
-  (0x71, plus the short-form, read-only status query), validation number
-  (0x58), pending cashout info (0x57), cash-out ticket info (0x3D),
-  handpay information (0x1B).
+- `--hmac-key` is **symmetric**, per gateway, HMAC-SHA256 (§10.3). The
+  server holds the same secret. Minted by the server at the moment of
+  commissioning and entered on the device; never transmitted.
+- `--pool-key` is the **public** half of the server's Ed25519 signing pair
+  (§7.3). The server keeps the private half, which is what stops a
+  compromised gateway minting its own validation numbers.
 
-**Deliberately not implemented**, and why: every other command/control
-poll (sound on/off, bill acceptor enable/disable, maintenance mode,
-delay game, enable/disable game, remote handpay reset, jackpot-reset-
-method/auto-rebet enable, receive-progressive/date-time/ticket-data
-setters) — a scope decision, not an oversight: this project explicitly
-does not want to override machine setup remotely beyond the enable/
-disable pair above. Progressive jackpots,
-tournament mode, legacy bonusing, and card/reel-stop data — out of this
-project's stated TITO/AFT/meters scope; long poll 0x8B (multiplied
-jackpots) specifically because the spec itself recommends against
-implementing it. Component authentication (0x6E, Section 17) and the
-multi-denom preamble (0xB0, a request-wrapping mechanism rather than a
-standalone poll) — real gaps, not scoped out, just not yet built.
+**Neither is accepted on the command line** — arguments are visible in the
+process table and land in shell history. Both are read from a file or stdin.
 
-`MeterCode` (in `constants.py`) covers essentially the whole of Table
-C-7 — 162 codes: the ticket meters, the core/extended/bill-denomination
-range, SAS-validation-specific meters, and AFT-specific meters — every
-assigned code except the table's own reserved gaps. All transcribed
-directly from the spec's own table, not from any secondary source — an
-earlier project planning document had the ticket-meter codes wrong (off
-by more than a naming slip: 0x1A/0x1B are unrelated meters in the real
-table), which is worth knowing if you're cross-checking against project
-docs rather than the spec itself. `examples/sql_poll_logger.py` reads
-essentially all of it every cycle by default (`--skip-table-c7-sweep`
-to opt out) via `send_extended_meters()` (LP 0x6F), 12 codes per
-exchange. The 12 validation-type meters at Table C-7 codes 0x80+ are
-also independently readable one at a time via LP 0x50
-(`send_validation_meters()`) — explicitly redundant with the Table C-7
-sweep per the spec's own note, and read that way too by default
-(`--skip-validation-meters-sweep` to opt out); no batching on 0x50, so
-it's the most expensive of the sweeps per meter actually obtained.
+```bash
+sudo python3 deploy/commission_machine.py /dev/ttyS0 --scan \
+    --roster floor.csv --machine 7 --client-id TROP-042 \
+    --hmac-key-file /run/key.hex --pool-key-file /run/pool.pub
+```
+
+Add `--dry-run` to see every step without changing anything. A gateway that
+is already commissioned is **refused** unless you pass `--replace-keys`:
+re-keying invalidates the key the server holds, and §10.5's reassignment is
+unassign-then-assign.
+
+## The gateway↔server link
+
+`gateway/frame.py` implements the §10.1 wire frame and §10.3
+authentication:
+
+```
+[length:4][version:1][client_id:24][message_type:1][seq:8][JSON:n][HMAC:16]
+```
+
+The processing order in `decode()` is the security property, not an
+implementation detail — length before allocation, client_id before key
+lookup, HMAC before the sequence check, message type after verification,
+and the JSON parser last. The tests assert the order, including that the
+key store is *not* consulted for a malformed client_id.
+
+**What is not built yet:** the TCP client, the 15-second heartbeat, the
+server-invited drain, pool epochs and signature verification, and key
+rotation. Eight tables carry a `synced_at` column and nothing sets one. The
+gateway accumulates correctly and cannot yet hand anything over.
+
+## The tools
+
+### THE PRODUCT
+
+the gateway itself. Without these there is nothing to run.
+
+- **`deploy/commission_machine.py`** — the floor ceremony: verify identity against the roster, set the hostname, install keys, write client_id, log it
+- **`deploy/nimasas-poller.service`** — runs it under systemd, so it survives a reboot (C3)
+- **`examples/commission_gateway.py`** — finds the port and SAS address and writes gateway.ini, which the poller loads
+- **`examples/sql_poll_logger.py`** — THE gateway. One poll loop, one SQLite database. Everything else in this tree exists around it
+- **`examples/verify_identity.py`** — after a RAM clear: did the technician type the serial in correctly? A gateway keyed to the wrong cabinet reports someone else's money
+
+### THE CMS INTERFACE
+
+how RamSys talks to a gateway. The pool goes in, ticket detail comes out, and WfA pulls run through here.
+
+- **`examples/host_cashout.py`** — answer a machine's request to cash out to the host
+- **`examples/pool_replace.py`** — the server issues validation numbers into the gateway's pool. The pool exists so the CMS network is never inside §15.7's ten seconds -- dispense is deliberately local-only
+- **`examples/ticket_history.py`** — the WfA pull run STANDALONE, when no poller holds the port. Walks LP 0x4D by INDEX, which leaves the read/unread pointer alone, so a cashier can trigger it without disturbing the drain the server is consuming
+- **`examples/ticket_redeem.py`** — act as the host for one redemption by hand -- the path the poller automates, exercised directly
+- **`examples/wfa_request.py`** — the SERVER side of a WfA pull, and the first thing in this project that asks the gateway to do something. Writes a row into host_requests and waits; the poller services it at a poll-slot boundary. It never opens the serial port -- one port, one master -- which is the whole reason an inbound table exists rather than a second tool talking to the cabinet
+
+### BRINGING A GATEWAY UP
+
+run once per cabinet, in this order, before trusting a poll loop on it.
+
+- **`examples/address_scan.py`** — who is on this cable, at which address
+- **`examples/connectivity_check.py`** — is anything there, and is RTE off? The first thing to run and the thing to run after any bad stop
+- **`examples/polling_capability.py`** — what polling rate the machine declares, beside what the spec requires
+- **`examples/wire_diagnostics.py`** — settle how THIS machine wants to be polled before trusting any poll loop on it -- cabinets differ
+
+### OPERATING AND DIAGNOSING
+
+the floor's day-to-day: money paths, lockups, and reading what a machine says about itself.
+
+- **`examples/accounting_summary.py`** — the accounting figures as SAS reports them, grouped the way an operator reads them
+- **`examples/aft_cashout.py`** — take credits off electronically
+- **`examples/aft_push_credits.py`** — put credits on by AFT, checks first
+- **`examples/aft_status.py`** — what AFT would do, before asking it to
+- **`examples/bill_in_watch.py`** — every note taken, with the currency the machine thinks it is -- and the context that tells a rejected BILL from a returned TICKET
+- **`examples/exception_monitor.py`** — watch exceptions in plain language while somebody plays. Also carries --disable-rte, the recovery path after a bad stop
+- **`examples/handpay_clear.py`** — what the pending handpay is, and clearing it without a reset key
+- **`examples/handpay_queue_drain.py`** — read the handpay queue the §7.8.1 way, one entry at a time -- several lockups can be waiting
+- **`examples/meter_snapshot.py`** — one machine's complete readable state, to a file
+- **`examples/ticket_in_watch.py`** — watch a ticket go in and read what the machine says
+
+### PROOF
+
+how a developer checks our claims instead of believing them. These are the acceptance criteria made runnable.
+
+- **`deploy/sql_samples.py`** — every table and view in the gateway database, as CSV: the last N rows of each, and a header for EVERY table including the empty ones, because "exists and is empty" and "does not exist" are different facts. Validation numbers are replaced with a pseudonym shared across tables, so a pool number and the ticket printed with it still line up and neither leaves the gateway
+- **`examples/outage_loss.py`** — what an outage COST: credits played while nobody was polling, against the events the cabinet could still hand back. The recovery is bounded by §2.2.1's queue rather than by the length of the gap, so a long outage loses nearly all of it however fast the host polls afterwards -- which is the number §19 is about (A1, C2, C4)
+- **`examples/queue_safety.py`** — could the queue have overflowed, and was the gateway why (C5). Overflow is acceptable only when the link was lost
+- **`examples/rte_reconcile.py`** — five detectors: did RTE lose anything, and do the meters and the events agree, award side included (C2, C4)
+- **`examples/unwanted_handpays.py`** — the migration's own scorecard. 0x66 -> 0x57 -> 0x51 with no ticket printed is a handpay the HOST caused by not answering §15.7's ten seconds. Reads the cause off the wire, so no ticket-out limit has to be configured and a jackpot -- which raises no validation request -- cannot appear
+
+### THE BENCH
+
+for finding long polls we have not needed yet. Ships so other developers can experiment on their own projects.
+
+- **`examples/poll_test_tool.py`** — fire any long poll at an EGM and watch what comes back. How other developers find the polls their own projects need
+
+## What is deliberately missing
+
+The private repository sorts every tool into tiers, and one of them is
+**lab-only**: soak drivers, floor-survey apparatus, one-question probes, and
+a ticket authority that redeems real tickets. 28 tools. They answer
+questions about one cabinet on one bench and would be noise — or a hazard —
+in a repository meant for building a product.
+
+They are excluded by that classification rather than by hand, so a tool
+classified lab-only tomorrow stops being published without anyone editing a
+list. Tests whose *subject* is a lab tool go with it; tests that merely
+reference one stay and skip.
+
+Also absent: floor captures, survey data, machine serials, the licensed
+specification, and `legacy/sas.py` — the Python 2 predecessor this was
+cleaned from, which stays private so the clean-room separation keeps
+meaning something. `legacy/meter_snapshot-2026-11-08-pre-probe-table.py` is
+here, because surveys taken before that date were taken with it and a
+snapshot can only be read against the tool that wrote it.
 
 ## Verified against real hardware
 
-`tests/test_hardware_vectors.py` is built from one EGT Premier (SAS version
-602, serial 000106719, paytable MGDJE3), and each value in it was read over
-SAS and then found on that machine's own Machine Accounting display, to the
-cent:
-
-| SAS field (LP `0x0F`) | read | machine's own screen |
-|---|---|---|
-| `total_coin_in` | 21387723 | Total Bet (Coin In) 213,877.23 USD |
-| `total_coin_out` | 20718334 | Total Won 207,183.34 USD |
-| `total_drop` | 6408958 | Total In 64,089.58 USD |
-| `total_cancelled_credits` | 5739569 | Total Cancelled Credits 57,395.69 USD |
-| `games_played` | 665524 | Total Games Played 665,524 |
-
-Every other test here is derived from the spec tables, so it proves the code
-matches somebody's reading of the document. These prove it matches a gaming
-machine — which is a different claim, and the only one that catches a field
-**order** slip: swapping two meters still decodes to plausible numbers and
-still passes every spec-derived test.
-
-One value is recorded as observed rather than verified. LP `0x1F` reported
-`max_bet=255`, which is a legitimate figure and also `0xFF`, the saturation
-value a too-narrow or unsupported field produces. Check it against the
-machine's own max-bet setting before relying on it.
-
-## Multi-version SAS (6.0 / 6.01 / 6.02)
-
-The long polls implemented here are all from the command set that's been
-stable across the whole 6.x line, and the protocol itself is designed for
-mixed-version fleets: a machine that doesn't support a poll simply
-doesn't answer it, and the intended way to discover what a given machine
-supports is long poll 0xA0 (Send Enabled Features), not a version check
-up front. One thing to know if your lab includes machines on meaningfully
-different SAS revisions: `send_enabled_features()` currently assumes an
-exact response length — if you hit a machine where that assumption
-breaks, that's the first place to look.
-
-## What this is for
-
-Two things this repo is built to support:
-
-1. **Connectivity and stress testing** — run this against real EGMs
-   across whatever environments you've got, at whatever concurrency and
-   duration makes sense for your lab. If something breaks, the client
-   raises typed exceptions (`SASTimeoutError`, `SASChecksumError`,
-   `SASAddressMismatchError`) rather than failing silently or crashing on
-   a bad value — that's deliberate, and worth preserving in whatever you
-   build on top.
-2. **Architecture prototyping** — this library only does the wire
-   protocol; it holds no state beyond one exchange and writes nothing to
-   disk. That's the intended seam: plug your own persistence layer in
-   above `SASClient` (a poll loop that calls its methods and writes
-   results to SQL, run on the gateway) to prototype the actual gateway
-   architecture.
-
-## Reporting issues
-
-Findings from stress testing — timeouts, unexpected responses, anything
-that doesn't match a spec table — are genuinely useful upstream. Please
-include the exact long poll, the raw bytes on the wire if you can capture
-them, and what you expected instead.
+Every meter claim in `tests/test_hardware_vectors.py` was read over SAS from
+an EGT Premier and then found on that machine's own accounting display, to
+the cent. Where this project's documents and the specification disagree, the
+disagreement is written down with the measurement that settled it.

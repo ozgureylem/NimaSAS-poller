@@ -856,9 +856,48 @@ def rte_data_length(code: int) -> int:
     return RTE_EVENT_DATA_BYTES.get(code, 0)
 
 
+# Exception names Table A-1 gives that MISLEAD A READER, with what each one
+# actually means. The spec name is never replaced -- GENERAL_POLL_EXCEPTIONS
+# records what the standard calls the code, and anyone cross-referencing the
+# SAS document must find the same words there. This is the second column.
+#
+# Each entry was earned by someone on this project reaching the wrong
+# conclusion from the first column, and the cost was days rather than
+# minutes. A gateway logs the spec name; anything a HUMAN reads should carry
+# this beside it.
+EXCEPTION_CLARIFICATIONS: dict[int, str] = {
+    0x2B: ("may be a RETURNED TICKET, not a banknote -- the bill acceptor and "
+           "the ticket reader are one device. Check for a 0x67 in the "
+           "preceding 60s (§15.12)"),
+    0x51: ("an unreported HANDPAY QUEUE ENTRY, not necessarily a live lockup. "
+           "Reissued every 15s until LP 0x1B reads it (§7.8.1)"),
+    0x68: ("the redemption cycle ENDED -- stacked or returned. It does NOT "
+           "mean the ticket was accepted. Read LP 0x71/FF for the outcome "
+           "(§15.12b)"),
+    0x70: ("events were LOST. The machine's §2.2.1 queue overflowed and the "
+           "oldest exceptions were discarded"),
+}
+
+
 def describe_exception(code: int) -> str:
-    """Plain-language name for a general poll exception code."""
+    """Plain-language name for a general poll exception code.
+
+    This is Table A-1's own wording, deliberately. A log that renames a spec
+    code cannot be cross-referenced against the specification, and four
+    different people reading four different names for 0x68 is worse than one
+    misleading name everybody knows is misleading. See clarify_exception()
+    for the part a human needs.
+    """
     return GENERAL_POLL_EXCEPTIONS.get(code, f"unknown/unassigned code 0x{code:02X}")
+
+
+def clarify_exception(code: int) -> str | None:
+    """What a Table A-1 name gets wrong, for the codes where it matters.
+
+    Returns None for the great majority of codes, whose spec name is simply
+    correct. Only the ones that have actually misled somebody are listed.
+    """
+    return EXCEPTION_CLARIFICATIONS.get(code)
 
 
 # --- Table 8.3e: AFT transfer status codes --------------------------------
@@ -929,6 +968,261 @@ AFT_STATUS_CATEGORIES = {
 # Each entry is (total, components, declared). A single component means the
 # two meters are interchangeable; several mean the total is their sum, and it
 # equals any one of them only while the others are zero.
+# --- Table C-7 meter names ------------------------------------------------
+#
+# Every meter code in Table C-7 with the name the specification gives it,
+# transcribed from docs/spec/SAS602.pdf pages C-9 through C-16.
+#
+# This table arrived late. For a long time the project had only
+# METER_CODE_SIZES_BCD -- how wide each meter is -- and named meters by
+# matching a reading against a photograph of the machine's screen, or by
+# arguing from C-7's "[same as meter ...]" relationships. Both of those are
+# still here and still useful: a screen label is what THIS cabinet calls the
+# meter, which is what an operator reconciles against, and a derived label
+# tells you which meters are the same figure. But neither was ever a
+# substitute for the name, and a floor survey that reported 40 meters with
+# real values and no names was the evidence of that.
+#
+# The transcription is checked, not trusted: every size parsed out of the
+# table alongside these names matched METER_CODE_SIZES_BCD, which was entered
+# independently and by hand. 162 of 162. A test asserts the two agree, so a
+# future edit to either one that breaks the correspondence fails loudly.
+#
+# Names are the specification's own wording, including its bracketed
+# "[same as meter ...]" notes, which are the source METER_RELATIONS encodes.
+METER_NAMES: dict[int, str] = {
+    0x0000: "Total coin in credits",
+    0x0001: "Total coin out credits",
+    0x0002: "Total jackpot credits",
+    0x0003: "Total hand paid cancelled credits",
+    0x0004: "Total cancelled credits",
+    0x0005: "Games played",
+    0x0006: "Games won",
+    0x0007: "Games lost",
+    0x0008: "Total credits from coin acceptor",
+    0x0009: "Total credits paid from hopper",
+    0x000A: "Total credits from coins to drop",
+    0x000B: "Total credits from bills accepted",
+    0x000C: "Current credits",
+    0x000D:
+        "Total SAS cashable ticket in, including nonrestricted tickets (cents) "
+        "[same as meter 0080 + 0084]",
+    0x000E:
+        "Total SAS cashable ticket out, including debit tickets (cents) [same "
+        "as meter 0086 + 008A]",
+    0x000F: "Total SAS restricted ticket in (cents) [same as meter 0082]",
+    0x0010: "Total SAS restricted ticket out (cents) [same as meter 0088]",
+    0x0011:
+        "Total SAS cashable ticket in, including nonrestricted tickets "
+        "(quantity) [same as meter 0081 + 0085]",
+    0x0012:
+        "Total SAS cashable ticket out, including debit tickets (quantity) "
+        "[same as meter 0087 + 008B]",
+    0x0013: "Total SAS restricted ticket in (quantity) [same as meter 0083]",
+    0x0014: "Total SAS restricted ticket out (quantity) [same as meter 0089]",
+    0x0015:
+        "Total ticket in, including cashable, nonrestricted and restricted "
+        "tickets (credits)",
+    0x0016:
+        "Total ticket out, including cashable, nonrestricted, restricted and "
+        "debit tickets (credits)",
+    0x0017:
+        "Total electronic transfers to gaming machine, including cashable, "
+        "nonrestricted, restricted and debit, whether transfer is to credit "
+        "meter or to ticket (credits)",
+    0x0018:
+        "Total electronic transfers to host, including cashable, nonrestricted, "
+        "restricted and win amounts (credits)",
+    0x0019: "Total restricted amount played (credits)",
+    0x001A: "Total nonrestricted amount played (credits)",
+    0x001B: "Current restricted credits",
+    0x001C:
+        "Total machine paid paytable win, not including progressive or external "
+        "bonus amounts (credits)",
+    0x001D: "Total machine paid progressive win (credits)",
+    0x001E: "Total machine paid external bonus win (credits)",
+    0x001F:
+        "Total attendant paid paytable win, not including progressive or "
+        "external bonus amounts (credits)",
+    0x0020: "Total attendant paid progressive win (credits)",
+    0x0021: "Total attendant paid external bonus win (credits)",
+    0x0022: "Total won credits (sum of total coin out and total jackpot)",
+    0x0023:
+        "Total hand paid credits (sum of total hand paid cancelled credits and "
+        "total jackpot)",
+    0x0024:
+        "Total drop, including but not limited to coins to drop, bills to drop, "
+        "tickets to drop, and electronic in (credits)",
+    0x0025: "Games since last power reset",
+    0x0026: "Games since slot door closure",
+    0x0027: "Total credits from external coin acceptor",
+    0x0028: "Total cashable ticket in, including nonrestricted promotional tickets (credits)",
+    0x0029: "Total regular cashable ticket in (credits)",
+    0x002A: "Total restricted promotional ticket in (credits)",
+    0x002B: "Total nonrestricted promotional ticket in (credits)",
+    0x002C: "Total cashable ticket out, including debit tickets (credits)",
+    0x002D: "Total restricted promotional ticket out (credits)",
+    0x002E:
+        "Electronic regular cashable transfers to gaming machine, not including "
+        "external bonus awards (credits)",
+    0x002F:
+        "Electronic restricted promotional transfers to gaming machine, not "
+        "including external bonus awards (credits)",
+    0x0030:
+        "Electronic nonrestricted promotional transfers to gaming machine, not "
+        "including external bonus awards (credits)",
+    0x0031: "Electronic debit transfers to gaming machine (credits)",
+    0x0032: "Electronic regular cashable transfers to host (credits)",
+    0x0033: "Electronic restricted promotional transfers to host (credits)",
+    0x0034: "Electronic nonrestricted promotional transfers to host (credits)",
+    0x0035: "Total regular cashable ticket in (quantity)",
+    0x0036: "Total restricted promotional ticket in (quantity)",
+    0x0037: "Total nonrestricted promotional ticket in (quantity)",
+    0x0038: "Total cashable ticket out, including debit tickets (quantity)",
+    0x0039: "Total restricted promotional ticket out (quantity)",
+    0x003E:
+        "Number of bills currently in the stacker (Issue exception 7B when this "
+        "meter is reset)",
+    0x003F:
+        "Total value of bills currently in the stacker (credits) (Issue "
+        "exception 7B when this meter is reset)",
+    0x0040: "Total number of $1.00 bills accepted",
+    0x0041: "Total number of $2.00 bills accepted",
+    0x0042: "Total number of $5.00 bills accepted",
+    0x0043: "Total number of $10.00 bills accepted",
+    0x0044: "Total number of $20.00 bills accepted",
+    0x0045: "Total number of $25.00 bills accepted",
+    0x0046: "Total number of $50.00 bills accepted",
+    0x0047: "Total number of $100.00 bills accepted",
+    0x0048: "Total number of $200.00 bills accepted",
+    0x0049: "Total number of $250.00 bills accepted",
+    0x004A: "Total number of $500.00 bills accepted",
+    0x004B: "Total number of $1,000.00 bills accepted",
+    0x004C: "Total number of $2,000.00 bills accepted",
+    0x004D: "Total number of $2,500.00 bills accepted",
+    0x004E: "Total number of $5,000.00 bills accepted",
+    0x004F: "Total number of $10,000.00 bills accepted",
+    0x0050: "Total number of $20,000.00 bills accepted",
+    0x0051: "Total number of $25,000.00 bills accepted",
+    0x0052: "Total number of $50,000.00 bills accepted",
+    0x0053: "Total number of $100,000.00 bills accepted",
+    0x0054: "Total number of $200,000.00 bills accepted",
+    0x0055: "Total number of $250,000.00 bills accepted",
+    0x0056: "Total number of $500,000.00 bills accepted",
+    0x0057: "Total number of $1,000,000.00 bills accepted",
+    0x0058: "Total credits from bills to drop",
+    0x0059: "Total number of $1.00 bills to drop",
+    0x005A: "Total number of $2.00 bills to drop",
+    0x005B: "Total number of $5.00 bills to drop",
+    0x005C: "Total number of $10.00 bills to drop",
+    0x005D: "Total number of $20.00 bills to drop",
+    0x005E: "Total number of $50.00 bills to drop",
+    0x005F: "Total number of $100.00 bills to drop",
+    0x0060: "Total number of $200.00 bills to drop",
+    0x0061: "Total number of $500.00 bills to drop",
+    0x0062: "Total number of $1000.00 bills to drop",
+    0x0063: "Total credits from bills diverted to hopper",
+    0x0064: "Total number of $1.00 bills diverted to hopper",
+    0x0065: "Total number of $2.00 bills diverted to hopper",
+    0x0066: "Total number of $5.00 bills diverted to hopper",
+    0x0067: "Total number of $10.00 bills diverted to hopper",
+    0x0068: "Total number of $20.00 bills diverted to hopper",
+    0x0069: "Total number of $50.00 bills diverted to hopper",
+    0x006A: "Total number of $100.00 bills diverted to hopper",
+    0x006B: "Total number of $200.00 bills diverted to hopper",
+    0x006C: "Total number of $500.00 bills diverted to hopper",
+    0x006D: "Total number of $1000.00 bills diverted to hopper",
+    0x006E: "Total credits from bills dispensed from hopper",
+    0x006F: "Total number of $1.00 bills dispensed from hopper",
+    0x0070: "Total number of $2.00 bills dispensed from hopper",
+    0x0071: "Total number of $5.00 bills dispensed from hopper",
+    0x0072: "Total number of $10.00 bills dispensed from hopper",
+    0x0073: "Total number of $20.00 bills dispensed from hopper",
+    0x0074: "Total number of $50.00 bills dispensed from hopper",
+    0x0075: "Total number of $100.00 bills dispensed from hopper",
+    0x0076: "Total number of $200.00 bills dispensed from hopper",
+    0x0077: "Total number of $500.00 bills dispensed from hopper",
+    0x0078: "Total number of $1000.00 bills dispensed from hopper",
+    0x007F:
+        "Weighted average theoretical payback percentage in hundredths of a "
+        "percent (see note below)",
+    0x0080: "Regular cashable ticket in (cents)",
+    0x0081: "Regular cashable ticket in (quantity)",
+    0x0082: "Restricted ticket in (cents)",
+    0x0083: "Restricted ticket in (quantity)",
+    0x0084: "Nonrestricted ticket in (cents)",
+    0x0085: "Nonrestricted ticket in (quantity)",
+    0x0086: "Regular cashable ticket out (cents)",
+    0x0087: "Regular cashable ticket out (quantity)",
+    0x0088: "Restricted ticket out (cents)",
+    0x0089: "Restricted ticket out (quantity)",
+    0x008A: "Debit ticket out (cents)",
+    0x008B: "Debit ticket out (quantity)",
+    0x008C: "Validated cancelled credit handpay, receipt printed (cents)",
+    0x008D: "Validated cancelled credit handpay, receipt printed (quantity)",
+    0x008E: "Validated jackpot handpay, receipt printed (cents)",
+    0x008F: "Validated jackpot handpay, receipt printed (quantity)",
+    0x0090: "Validated cancelled credit handpay, no receipt (cents)",
+    0x0091: "Validated cancelled credit handpay, no receipt (quantity)",
+    0x0092: "Validated jackpot handpay, no receipt (cents)",
+    0x0093: "Validated jackpot handpay, no receipt (quantity)",
+    0x00A0: "In-house cashable transfers to gaming machine (cents)",
+    0x00A1: "In-House transfers to gaming machine that included cashable amounts (quantity)",
+    0x00A2: "In-house restricted transfers to gaming machine (cents)",
+    0x00A3: "In-house transfers to gaming machine that included restricted amounts (quantity)",
+    0x00A4: "In-house nonrestricted transfers to gaming machine (cents)",
+    0x00A5:
+        "In-house transfers to gaming machine that included nonrestricted "
+        "amounts (quantity)",
+    0x00A6: "Debit transfers to gaming machine (cents)",
+    0x00A7: "Debit transfers to gaming machine (quantity)",
+    0x00A8: "In-house cashable transfers to ticket (cents)",
+    0x00A9: "In-house cashable transfers to ticket (quantity)",
+    0x00AA: "In-house restricted transfers to ticket (cents)",
+    0x00AB: "In-house restricted transfers to ticket (quantity)",
+    0x00AC: "Debit transfers to ticket (cents)",
+    0x00AD: "Debit transfers to ticket (quantity)",
+    0x00AE: "Bonus cashable transfers to gaming machine (cents)",
+    0x00AF: "Bonus transfers to gaming machine that included cashable amounts (quantity)",
+    0x00B0: "Bonus nonrestricted transfers to gaming machine (cents)",
+    0x00B1: "Bonus transfers to gaming machine that included nonrestricted amounts (quantity)",
+    0x00B8: "In-house cashable transfers to host (cents)",
+    0x00B9: "In-house transfers to host that included cashable amounts (quantity)",
+    0x00BA: "In-house restricted transfers to host (cents)",
+    0x00BB: "In-house transfers to host that included restricted amounts (quantity)",
+    0x00BC: "In-house nonrestricted transfers to host (cents)",
+    0x00BD: "In-house transfers to host that included nonrestricted amounts (quantity)",
+}
+
+
+# The specification's own footnotes on individual meters, kept apart from the
+# names so a report can show a name without a paragraph attached.
+METER_NOTES: dict[int, str] = {
+    0x0017:
+        "external bonus awards are metered as game win, and not as electronic "
+        "transfers to gaming machine",
+    0x007F:
+        "The exact meaning of the weighted average theoretical payback "
+        "percentage is based on jurisdictional requirements. For paytables "
+        "which have a difference between the minimum and maximum theoretical "
+        "payback, the weighted average theoretical payback percentage is "
+        "calculated based on actual coin in at each different theoretical "
+        "base payback percentage for the particular paytable. The value is "
+        "returned as a percentage in hundredths of a percent. See Section "
+        "7.24.1 for details.",
+}
+
+
+def meter_name(code: int) -> str:
+    """Table C-7's name for a meter code, or "" if the code is not in it.
+
+    Codes 00BE-FFFF are reserved in 6.02, so an empty string here means the
+    machine answered a code the specification does not define -- worth
+    reporting rather than silently labelling.
+    """
+    return METER_NAMES.get(code, "")
+
+
 METER_RELATIONS: tuple[tuple[int, tuple[int, ...], bool], ...] = (
     # Declared outright in C-7's own text.
     (0x000D, (0x0080, 0x0084), True),
@@ -1151,3 +1445,219 @@ def describe_denomination(code: int) -> str:
     if code in DENOMINATION_SUB_CENT:
         return f"{DENOMINATION_SUB_CENT[code]} cent"
     return f"unassigned code 0x{code:02X}"
+
+
+# --- Table 15.12 / 15.12c: ticket redemption ------------------------------
+#
+# These lived in examples/ticket_lab_authority.py until 2026-11-06, which was
+# an accident of where they were first needed, not a decision. The poller
+# imported them from there, so the product depended at runtime on a module
+# whose whole purpose is to stand in for a server that is not there -- and
+# the public mirror could not drop the lab scaffolding without breaking the
+# gateway. They are spec tables. They belong here.
+
+# Table 15.12, the transfer code in LP 0x71's reply: what KIND of credit the
+# host is telling the machine this ticket is worth.
+TICKET_TRANSFER_CODES: dict[str, int] = {
+    "cashable": 0x00,
+    "restricted": 0x01,
+    "nonrestricted": 0x02,
+}
+
+# §15.12a, HOST -> MACHINE. The host's way of saying "I do not know this
+# number", which is a refusal rather than an error: the ticket is handed
+# back. NOT the same as 0x82 in TICKET_REDEMPTION_STATUS below, which is
+# the machine's reply in the opposite direction and means "not a valid
+# transfer function". The byte is shared; the meaning is not.
+TICKET_NOT_IN_SYSTEM = 0x82
+
+# Table 15.12c, the machine's redemption status in full.
+TICKET_REDEMPTION_STATUS: dict[int, str] = {
+    0x00: "cashable ticket redeemed",
+    0x01: "restricted promotional ticket redeemed",
+    0x02: "nonrestricted promotional ticket redeemed",
+    0x20: "waiting for long poll 71",
+    0x40: "ticket redemption PENDING (not complete)",
+    0x80: "ticket rejected by host, or unknown",
+    0x81: "validation number does not match",
+    # 0x82 TRAVELS IN BOTH DIRECTIONS AND MEANS DIFFERENT THINGS.
+    #
+    # It was missing from this table until 2026-11-06. The fix then saw
+    # TICKET_NOT_IN_SYSTEM = 0x82 three lines above and folded THAT meaning
+    # in -- but TICKET_NOT_IN_SYSTEM is what the HOST sends in LP 0x71 to
+    # refuse a ticket it does not recognise (§15.12a, host -> machine),
+    # while this table is what the MACHINE reports back (§15.12c, machine
+    # -> host). Same byte, opposite directions, different meanings, and the
+    # fix merged one into the other.
+    #
+    # Caught 2026-11-09 by a test comparing this table against the private
+    # copies in ticket_history.py and ticket_redeem.py, which had carried
+    # the correct machine-side value all along. The previous fix's own
+    # comment -- "a constant and the table it belongs to drifted apart
+    # because nothing checked they agreed" -- was right about the mechanism
+    # and then repeated it.
+    0x82: "not a valid transfer function",
+    0x83: "not a valid transfer amount (non-BCD)",
+    0x84: "transfer amount exceeded the gaming machine credit limit",
+    0x85: "transfer amount not an even multiple of the machine denomination",
+    0x86: "transfer amount does not match ticket amount",
+    0x87: "gaming machine unable to accept transfer at this time",
+    0x88: "ticket rejected due to timeout",
+    0x89: "ticket rejected due to comm link down",
+    0x8A: "ticket redemption disabled",
+    0x8B: "ticket rejected due to validator failure",
+    0xC0: "not compatible with the current redemption cycle (ignored)",
+    0xFF: "no validation information available",
+}
+
+# THE TOP THREE BITS ARE THE ANSWER, and the low bits only say why.
+#
+# Testing a redemption status for equality with 0x00 is wrong and passed for
+# weeks on this project: 0x01 and 0x02 are also successes, and every code
+# from 0x80 up is a failure whatever its reason. The category is `status >> 5`
+# and it is the only thing a caller should branch on.
+TICKET_REDEMPTION_CATEGORY: dict[int, str] = {
+    0b000: "SUCCESS",
+    0b001: "waiting",
+    0b010: "pending",
+    0b100: "FAILED",
+    0b110: "incompatible",
+    0b111: "no information",
+}
+
+
+def redemption_category(status: int) -> int:
+    """The three-bit category of a Table 15.12c status. Branch on this."""
+    return status >> 5
+
+
+def describe_redemption_status(status: int) -> str:
+    return (f"{TICKET_REDEMPTION_CATEGORY.get(status >> 5, 'unknown category')}: "
+            f"{TICKET_REDEMPTION_STATUS.get(status, 'unassigned code')}")
+
+
+# --- Identity: values that mean "no identifier", not an identifier ---------
+#
+# §4.4 lets a machine ignore LP 0x54, and a serial is typed in by a technician
+# during the RAM clear rather than burned in, so "the machine reported a
+# serial" and "the machine reported a REAL serial" are different facts. A
+# gateway keyed to "0" or "n/a" authenticates perfectly and reports someone
+# else's money.
+PLACEHOLDER_IDENTIFIERS: frozenset[str] = frozenset({
+    "", "0", "00000000", "000000000", "n/a", "N/A", "none", "NONE",
+    "unknown", "UNKNOWN", "-",
+})
+
+
+def is_placeholder_identifier(value: str | None) -> bool:
+    """True when ``value`` is an absence dressed up as an identifier.
+
+    Case-insensitive, and that is the point of having the function: callers
+    were writing `value.lower() in {p.lower() for p in PLACEHOLDER_IDS}` at
+    each site, which is a comparison anyone can get subtly wrong once.
+    """
+    if value is None:
+        return True
+    stripped = str(value).strip()
+    if not stripped:
+        return True
+    return stripped.lower() in {p.lower() for p in PLACEHOLDER_IDENTIFIERS}
+
+
+# --- Naming a headless gateway --------------------------------------------
+#
+# A technician plugs a gateway into a cabinet with no screen and no keyboard.
+# It has to name itself, because the switch page is the only place anyone
+# will ever see which box is which.
+#
+# THE ORDER IS A PREFERENCE, NOT A TIE-BREAK. Asset first because it is what
+# the floor already uses to refer to a machine and it is unique nationally
+# by operator policy. Serial second because it identifies the CABINET rather
+# than its position, so a swapped machine keeps its name and that is
+# confusing but not wrong. MAC last and only as a refusal to collide: it
+# names the GATEWAY and says nothing about the cabinet, so a box called
+# after its MAC is a box nobody has finished commissioning.
+# RamSys, and SIX digits. Operator, 2026-11-10: "naming is going to be
+# RamSys# (# will be 6 digits filled with zeros at the beginning of the
+# asset number) So; ie RamSys000246". Was RamSYS and five digits.
+HOSTNAME_PREFIX = "RamSys"
+HOSTNAME_ASSET_DIGITS = 6
+HOSTNAME_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,62}$")
+
+
+def gateway_hostname(prefix: str = HOSTNAME_PREFIX, *, asset=None,
+                     serial: str | None = None, mac: str | None = None) -> str:
+    """RamSys<asset zero-padded to 6>, falling back to serial, then MAC.
+
+    NO SEPARATOR. commission_machine.py has produced 'RamSys<asset>' since it
+    was written and a floor may already carry boxes named that way; a
+    cosmetic change here would split the fleet into two conventions, which
+    is worse than either. Only the FALLBACK CHAIN is new.
+
+    Raises ValueError when none of the three is usable, rather than
+    inventing a name. 'RamSys-0' on every unconfigured cabinet collides
+    across the whole floor and is worse than having no hostname at all --
+    the hostname exists precisely so the switch page can tell the boxes
+    apart. Zero is the asset field's UNSET value, not an asset number.
+
+    Placeholder identifiers are absences: §4.4 lets a machine ignore LP
+    0x54, and both the serial and the asset are TYPED IN by a technician
+    during the RAM clear -- this project's own lab cabinet was once left
+    with a blank serial. So "the machine reported a serial" and "the machine
+    reported a real serial" are different facts, and is_placeholder_identifier
+    decides which this is.
+    """
+    if asset not in (None, 0, "", "0") and not is_placeholder_identifier(str(asset)):
+        try:
+            # SIX DIGITS, ZERO-PADDED. RamSys000246, not RamSys246.
+            #
+            # A fixed width is what makes a list of hostnames sort and read
+            # like a list of asset numbers: RamSys7, RamSys70 and RamSys700
+            # sort into each other's company on a switch page, while
+            # RamSys000007, RamSys000070 and RamSys000700 do not.
+            #
+            # An asset WIDER than six digits is never truncated -- a
+            # truncated asset number is a different machine's name, which is
+            # the one mistake this whole naming scheme exists to prevent.
+            candidate = f"{prefix}{int(asset):0{HOSTNAME_ASSET_DIGITS}d}"
+        except (TypeError, ValueError):
+            candidate = None
+        if candidate and HOSTNAME_RE.match(candidate):
+            return candidate
+
+    if not is_placeholder_identifier(serial):
+        cleaned = "".join(ch for ch in str(serial).strip()
+                          if ch.isalnum())
+        candidate = f"{prefix}{cleaned}"
+        if cleaned and HOSTNAME_RE.match(candidate):
+            return candidate
+
+    if not is_placeholder_identifier(mac):
+        # Dashes and colons both appear depending on where a MAC is read
+        # from; neither belongs in the label.
+        cleaned = "".join(ch for ch in str(mac) if ch.isalnum()).upper()
+        candidate = f"{prefix}{cleaned}"
+        if cleaned and HOSTNAME_RE.match(candidate):
+            return candidate
+
+    # A BAD PREFIX IS NOT A MISSING IDENTIFIER, and the first version of
+    # this function conflated them: given prefix="-bad-" and a perfectly
+    # good asset it fell through to the serial, then the MAC, and finally
+    # reported "no usable identifier". A reader would go and look at the
+    # cabinet, where nothing is wrong. Say which fault it is.
+    had_identifier = any(
+        not is_placeholder_identifier(v)
+        for v in (None if asset in (None, 0, "", "0") else str(asset),
+                  serial, mac))
+    if had_identifier:
+        raise ValueError(
+            f"an identifier was available but {prefix!r} does not make a "
+            f"valid hostname label with it. A DNS label is letters, digits "
+            f"and hyphens, starting with a letter or digit, at most 63 "
+            f"characters. Fix the prefix: the cabinet is fine.")
+    raise ValueError(
+        "no usable identifier: the cabinet reports no asset number and no "
+        "serial, and no MAC address was supplied. A hostname cannot be "
+        "invented -- every unconfigured box would get the same one and "
+        "collide across the floor. Enter the asset number at the machine, "
+        "or pass an explicit hostname.")

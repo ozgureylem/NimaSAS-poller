@@ -8,6 +8,8 @@ length cannot frame the response at all. That is what these pin.
 
 from __future__ import annotations
 
+from pathlib import Path as _P
+REPO = _P(__file__).resolve().parent.parent
 import sys
 from pathlib import Path
 
@@ -304,3 +306,60 @@ def test_the_denomination_table_is_indexed_in_hex():
     assert denomination_cents(0x02) == 5
     assert denomination_cents(0x03) == 10
     assert denomination_cents(23) == 2, "decimal 23 IS 0x17"
+
+
+# --- when an event arrived, not when it was stored ----------------------
+
+def test_an_rte_event_carries_the_time_it_came_off_the_wire():
+    """§12.3 lets an event arrive in place of ANY long poll reply, so a
+    seventy-poll sweep collects events throughout the cycle. The poller
+    drains them at the END of that cycle, so stamping them with the drain
+    time gives forty-odd events one identical timestamp and destroys the
+    record of when each landed.
+
+    That cost a real false alarm: a queue-safety check read "no event
+    arrived during this 58-second gap" off cycle-stamped rows and reported
+    six stalls on a soak that was running perfectly. The absence was
+    guaranteed by the stamping, not by anything the gateway did."""
+    import time
+    from saspy.client import SASClient
+
+    class _T:
+        def __init__(self):
+            self.calls = []
+
+    client = SASClient.__new__(SASClient)
+    client._pending_rte_events = []
+    client._rte_active = True
+    client._strip = lambda raw: raw
+
+    # Two events captured a moment apart, as they would be inside one sweep.
+    client._capture_rte_event(bytes([0x01, 0x7E, 0x00, 0x00]))
+    time.sleep(0.01)
+    client._capture_rte_event(bytes([0x01, 0x7F, 0x00, 0x00]))
+
+    first, second = client.drain_rte_events()
+    assert first.arrived_at is not None
+    assert second.arrived_at is not None
+    assert first.arrived_at < second.arrived_at, \
+        "two events captured at different moments must not share a timestamp"
+
+
+def test_the_poller_stamps_interleaved_events_with_their_arrival():
+    """The call site is the thing that was wrong, and no unit test looked at
+    call sites -- the same shape as the `interrogate(first_connect)` bug in
+    HANDOVER section 8. So this asserts the source."""
+    import re
+    poller = (REPO / "examples" / "sql_poll_logger.py").read_text()
+    block = poller[poller.index("interleaved = client.drain_rte_events()"):]
+    block = block[:block.index("if interleaved:")]
+    assert "event.arrived_at or now" in block, \
+        "interleaved events must be stamped with their own arrival time"
+    assert not re.search(r"_dispatch_exception\(client, conn, now,[^)]*"
+                         r"rte-interleaved", block, re.S)
+
+
+def test_arrived_at_defaults_to_None_so_older_callers_still_work():
+    from saspy.models import RealTimeEvent
+    e = RealTimeEvent(code=0x7E, description="x", data=b"", fields={})
+    assert e.arrived_at is None

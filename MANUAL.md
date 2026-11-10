@@ -1,12 +1,18 @@
 # NimaSAS User Manual
 
 This is the manual for everything runnable in this repository: the
-`saspy` library itself, and the three example tools built on top of it
-(`connectivity_check.py`, `commission_gateway.py`, `sql_poll_logger.py`).
-Each section starts with a plain-language explanation of what the tool
-is for and how to run it, then goes deeper into flags, internals, and
-troubleshooting. Read as far as you need and stop — you don't have to
-read the technical part of a section to use the tool.
+`saspy` library itself, and the example tools built on top of it —
+`connectivity_check.py`, `commission_gateway.py` and `sql_poll_logger.py`
+in depth, and the single-purpose diagnostic tools in §8. Each section
+starts with a plain-language explanation of what the tool is for and how
+to run it, then goes deeper into flags, internals, and troubleshooting.
+Read as far as you need and stop — you don't have to read the technical
+part of a section to use the tool.
+
+§8 is different in kind: it records **what the machines actually
+reported** between 26 and 30 October 2026, and the tools written to
+settle each question. Where it disagrees with a planning document, the
+measurement is the thing to trust.
 
 The last part of this manual is a step-by-step guide to giving a poller
 its own local SQL database, using `sql_poll_logger.py` as a worked
@@ -493,11 +499,13 @@ the host doesn't drain it fast enough the next exception silently
 overwrites it — "the mirror of ghost redemption," a real event that
 leaves no trail at all. Setting `--general-poll-retries 1` disables the
 extra attempts and restores the plain one-shot behavior. "Immediate" is
-paced, not zero-delay: SAS 6.02 §2.3.3 forbids polling a single machine
-faster than once per 200 ms, so a retry that fails fast (not a timeout
-— a checksum error, say) still waits out whatever's left of that
-window before trying again; a retry that already took 200 ms or more
-(a timeout, typically) fires again with no extra wait. Once a poll
+paced, not zero-delay, and since 30 Oct 2026 the pacing is enforced in
+the transport rather than by each caller — see §5.5. SAS 6.02 §2.3.3
+forbids issuing **general polls or long polls** to a single machine
+faster than once per 200 ms, both kinds out of one budget, so a retry
+that fails fast (a checksum error, say) waits out whatever is left of
+that window; a retry that already took 200 ms or more fires with no
+extra wait. Once a poll
 succeeds (first attempt or a later one), its exception code is
 dispatched exactly as before:
 
@@ -659,9 +667,13 @@ actively harmful on machines that don't support `0x48`.
 
 **Is 73 exchanges a cycle actually fast enough on real hardware?**
 This manual won't guess — every cycle's own log line answers it
-directly: `meter_poll=X.XXXs/N polls` is measured wall-clock time
+directly: `meter_poll=X.XXXs/Nlp+Mgp` is measured wall-clock time
 against whatever `sql_poll_logger.py` is actually talking to, not a
-theoretical wire-speed calculation. Run it against your lab's real
+theoretical wire-speed calculation. `N` is the long polls the cycle
+sent and `M` the heartbeat general polls it sent between them; §2.3.3
+counts both against one budget, which is why both are printed. Both are
+counts of what *happened*, so a Table C-7 sweep that `--table-c7-interval`
+left for a later cycle does not inflate them. Run it against your lab's real
 EGM(s) and read that number back; if it's a meaningful fraction of
 `--interval`, you'll also get an unmissable `WARNING: meter poll took
 X.XXXs ... at or above --interval Ns` line the moment the sweep alone
@@ -944,7 +956,7 @@ meters = client.send_meters_10_through_15()
   (response came from a different address than expected),
   `SASEncodingError` (malformed BCD/ASCII field in a response),
   `SASPortCapabilityError` (the serial port/driver couldn't do
-  something the protocol needs — see §5.5).
+  something the protocol needs — see §5.6).
 
 ### 5.4 The wakeup bit, briefly
 
@@ -957,9 +969,56 @@ you never need to touch parity settings directly through the normal
 port/driver that actually supports mark/space parity. Most real
 USB-to-RS232 and RS485 adapters do; some virtual or exotic ports don't,
 and a port that can't is checked for at open rather than at first write
-— see §5.5, including the case that check cannot detect.
+— see §5.6, including the case that check cannot detect.
 
-### 5.5 `SASPortCapabilityError`
+### 5.5 The polling floor
+
+`SASTransport` paces every message it sends. SAS 6.02 §2.3.3:
+
+> "The host may not issue **general polls or long polls** to any single
+> gaming machine at a rate faster than once per 200 ms. The slowest
+> allowable polling rate is 5000 ms."
+
+Both kinds, counted together, against one machine — so a meter sweep that
+interleaves heartbeat general polls between its long polls pays for both out
+of one budget. That is how this came to be broken: a 22-exchange sweep with a
+heartbeat after every exchange measured 0.616 s on the lab EGT, which is 44
+messages **14 ms apart, fourteen times over the floor**. Trimming the sweep
+made it worse, not better — the untrimmed 73-exchange sweep sat near 159 ms
+and was nearly compliant by accident.
+
+§12.2 relaxes the floor, and only this far: *"the polling rate can be
+increased to 40 ms in order to better approximate real time reporting."*
+14 ms breaches that too, and the relaxation is one with nothing to buy:
+§12.3 delivers **at most one event per poll**, so 200 ms already allows five
+events a second against a measured play rate near 0.85. Polling faster cannot
+raise the event rate above what the machine generates; it only spends gateway
+CPU, which on the 32-bit Class A units is the scarce resource.
+
+```python
+SASTransport(port, min_poll_interval=0.2)   # the default
+SASTransport(port, min_poll_interval=0.04)  # §12.2's RTE relaxation
+SASTransport(port, min_poll_interval=0)     # simulated ports only
+```
+
+The interval is measured from the **start of one send to the start of the
+next**, because §2.3.3 says "the polling rate does not include the gaming
+machine response time or the inter-byte delay time". An exchange whose reply
+already took 150 ms therefore waits 50 ms more, not another full interval.
+
+`sql_poll_logger.py` exposes it as `--min-poll-interval`. Raising it is the
+interesting direction: the ceiling is 5000 ms and the general poll must stay
+inside it, so `--min-poll-interval × (--heartbeat-every + 1)` has to remain
+under 5 s.
+
+One consequence worth knowing: under RTE a long poll can be pre-empted by an
+event (§12.3) and reissued (§12.4), and with pacing each retry now costs a
+poll slot. A long poll pre-empted repeatedly therefore runs out of time before
+it runs out of retries, and says so — rather than decaying into `got 0/2
+bytes before timeout`, which names neither the pre-emption nor the events
+that were collected along the way.
+
+### 5.6 `SASPortCapabilityError`
 
 If the underlying port rejects the parity change the wakeup bit needs,
 `saspy` raises `SASPortCapabilityError` (a subclass of `SASError`)
@@ -993,7 +1052,7 @@ A loopback or simulator rig (a pty pair, for instance) can opt out with
 bench harnesses only — against a real machine the probe is the thing
 standing between you and an afternoon of chasing the wrong fault.
 
-### 5.6 What's implemented vs. not, and multi-version SAS
+### 5.7 What's implemented vs. not, and multi-version SAS
 
 This library targets SAS 6.02, and was built and verified against the
 6.02 spec. SAS is designed to be substantially backward compatible —
@@ -1012,25 +1071,22 @@ from `saspy/client.py` and `tests/test_client.py`, since it's the part
 of this project most likely to grow; this manual won't try to keep a
 duplicate list in sync.
 
-### 5.7 `legacy/` is not a tool
+### 5.8 `legacy/` is not a tool
 
-`legacy/sas.py` and `legacy/test_sas.py` are the original
-pre-clean-room implementation, kept in the repo as reference only —
-they have known bugs (documented in their own header comments) and are
-not exercised by anything else here. This manual intentionally doesn't
-give them a usage section, because they aren't meant to be used.
+`legacy/` here carries one file: `meter_snapshot.py` exactly as it stood
+before the probe table was added, with its own `README`. It is kept
+because every survey taken between 2026-10-27 and 2026-11-05 was taken
+with THAT version, and a snapshot can only be read against the tool that
+wrote it. It is not maintained and not a second implementation to build
+against.
 
-`legacy/pre_pollcode_expansion/` is a different, unrelated thing: a
-frozen snapshot of `saspy/constants.py`, `client.py`, and `models.py`
-taken immediately before LP 2F/6F, 4C, 4D, 7B and
-`redeem_ticket_status()` were added, kept purely as a fast, file-level
-rollback path during live floor testing (alongside ordinary git
-history). See its own `README.md` for what it covers and how to use
-it. It is not maintained going forward and is not a second
-implementation to build against.
+The Python 2 predecessor this project was cleaned FROM is **not** in this
+repository, deliberately. Publishing it would weaken the clean-room
+separation that makes the frozen `ozgureylem/saspy` a credible reference
+for what was written from the specification rather than from the earlier
+code.
 
 ---
-
 ## 6. Structuring a SQL layer around a poller: step by step
 
 `sql_poll_logger.py` (§4) is a complete, runnable example of everything
@@ -1661,7 +1717,7 @@ reason a match cannot be claimed is that two meters hold the same number.
 Three meters reading 25.00 against a screen line reading 25.00 name nothing:
 any of the three could be that line.
 
-    python3 examples/meter_fingerprint.py /dev/ttyS0 --address 1
+    [meter_fingerprint.py is lab-only and is not in this repository -- see NimaSAS]
 
 reads every C-7 code and reports the groups: every set of meters currently
 indistinguishable from each other, the meters sitting at zero (which no
@@ -1949,102 +2005,225 @@ is still a split, and it is the kind that only bites people who use both.
 
 ### 7.7 Surveying machines on a live floor, headless
 
-The goal: carry the gateway to a cabinet, plug it into the SAS port, plug in
-power, wait under a minute, unplug both, move on — with no keyboard, no
-screen, no network and no login. Collect identity and every meter, change
-nothing.
+The headless floor-survey apparatus -- a wrapper script and a systemd
+unit that read a cabinet on boot and then power the gateway off, so an
+operator can walk a floor with no keyboard and no screen -- is lab-only
+and is not in this repository.
 
-That is buildable, and `deploy/` has the two pieces:
+One fact from it applies to a tool that IS here, and is worth keeping:
+`meter_snapshot.py` sends long polls only and **never a general poll**,
+so it cannot consume a queued exception even while it is connected. It
+sends no AFT transfer, no handpay reset, no validation answer and no
+enable/disable. That is what makes it safe to point at a cabinet with a
+player on it.
+## 8. What the machines settled, and the tools that settled it
 
-```bash
-sudo cp deploy/nimasas-floor-survey.service /etc/systemd/system/
-sudo systemctl enable nimasas-floor-survey     # enable, NOT start
+Everything in this section was read off hardware between 26 and 30 October
+2026 — the lab EGT Premier (asset 246, SAS 6.02, 48 games) and a fourteen-
+cabinet floor survey. Where a claim here disagrees with a planning document,
+the measurement is the thing to trust and the document is the thing to
+correct. The private repo carries the evidence trail in
+`docs/project/HANDOVER.md`.
+
+### 8.1 The meter mapping, proved three ways
+
+```
+[ticket_meter_identities.py is lab-only and is not in this repository -- see NimaSAS]
 ```
 
-On every boot from then on the gateway reads the machine, writes a JSON
-keyed by the machine's own serial and asset number, syncs, and **powers
-itself off**. The power light going out is the "done" signal — which is also
-what makes it safe to pull the plug, because the filesystem is unmounted
-before the operator touches it. Without a screen there is no other way to
-know, and yanking power mid-write is how a card gets corrupted.
+Read-only. Three independent checks, because a meter mapping is the one part
+of an accounting system that cannot be caught by testing the system against
+itself — a code tagged with the wrong name produces a number that is
+internally consistent, reconciles against itself, and is wrong.
 
-`sudo systemctl disable nimasas-floor-survey` gives the gateway back. Left
-enabled, every boot ends in a poweroff, which makes it very hard to log into.
+1. **The ten identities Table C-7 states in the meters' own descriptions.**
+   Definitional, so a failure is the machine contradicting the specification.
+2. **The same codes through LP `0x2F` and LP `0x6F`.** If both encodings
+   agree, no choice of long poll can rescue a wrong code and the tagging is
+   the only thing left that can be wrong.
+3. **The all-source block against its SAS-only counterpart.** Reported
+   AGREE/DIFFER rather than PASS/FAIL, because Table C-7's note makes a
+   difference there a fact about the floor, not a fault in the meter.
 
-#### What you get per cabinet
+Result on the lab cabinet: 10/10, 14/14, 8/8 twins, 4/4 aggregates, **zero
+failures**.
 
-Everything asked for, and it is already what `meter_snapshot.py` collects:
+Two things worth carrying into any CMS work:
 
-| | source |
-|---|---|
-| serial number, SAS version | LP `0x54` |
-| asset number, all three balances | LP `0x74` |
-| game ID, additional ID, denomination code, max bet, games implemented | LP `0x1F` |
-| per-game name, paytable, max bet, progressive group, wager categories | LP `0xB5` per game — 48 of them on the lab EGT |
-| every Table C-7 meter it implements, and which it does not | LP `0x6F`/`0xAF` |
-| the machine's own date and time | LP `0x7E` |
+- **`001A`–`001D` are play and win meters, not ticket meters.** `001C` is
+  machine-paid paytable win; on a cabinet that had printed three tickets it
+  read 16,222,006.
+- **"Cashable tickets in" has three defensible definitions** differing by 40%
+  on the lab machine: `000D` includes nonrestricted, `0029`/`0080` are regular
+  cashable only, `0015` includes restricted too.
 
-That last one is not padding. A gateway carried round a floor has no network
-and may have a flat RTC battery, so its own clock can be arbitrarily wrong —
-and then every file's `taken_at_utc` is wrong together while looking
-perfectly fine. The EGM keeps its own time, so the survey records both and
-their disagreement tells you later which clock to distrust.
+### 8.2 Coin in includes promotional play
 
-**The two are in different time zones**, which is worth knowing before anyone
-subtracts one from the other. `taken_at_utc` is UTC; the machine reports its
-own *local* time. Measured on the lab cabinet: `taken_at_utc` 17:56:55
-against `machine_time` 115655, i.e. 11:56:55 CST — the same instant, six
-hours apart on the page. SAS does not report the cabinet's configured offset,
-so the conversion is something you have to know rather than something the
-data carries.
+Controlled test, not an identity: machine at zero credits, 20.00 nonrestricted
+pushed, 10 games played. `0000` moved +500 and `001A` moved +500. The cabinet
+held no cashable credit and SAS mandates restricted→nonrestricted→cashable
+order, so every one of those 500 was promotional.
 
-#### The part that needs care, and it is not technical
+Lifetime on that cabinet, `0019` + `001A` were $29,193.51 of a $190,251.10
+coin in — **15.3% house money**. "Cashable played" has no meter of its own;
+compute it as `0000` − `0019` − `001A`.
 
-**Never plug into a SAS port that a live host is already driving.** Two
-masters on one RS-485 line collide electrically; both sides see CRC failures
-and timeouts, and the casino's system starts logging faults against a machine
-that is fine. If the cabinet is wired to a CMS, the cable has to be swapped,
-not shared — and that is an operations decision, not a technical one.
+Also worth knowing because it inverts: on this cabinet's own accounting
+screen, **"Promotional" means SAS *nonrestricted* and "Non-cashable" means SAS
+*restricted*.** Confirmed on six rows across three independent events. A CMS
+mapped from screen labels rather than codes gets these backwards, and they are
+the two that behave differently at cashout.
 
-**Survey idle cabinets.** This is the constraint most likely to be missed.
-§2.2.1 requires a FIFO exception queue "of at least 20 elements in
-non-volatile memory", and says that "in the event of exception queue
-overrun, the oldest exception is lost". While the CMS cable is unplugged
-nothing is draining that queue. On an idle machine almost nothing is
-generated and a 90-second swap costs the CMS nothing. On a machine being
-played, a single player generates around 2.4 exceptions a second — so a
-20-element queue fills in about eight seconds, and the host gets exception
-`0x70`, buffer overflow, plus a hole in its accounting when the cable goes
-back.
+### 8.3 Real time events, and how slowly you can poll
 
-So the rule is: **nobody playing, cable swapped rather than shared, back
-within the minute.** None of that is about this software being unsafe — it
-is about what any second host on a SAS line costs the first one.
+```
+python3 examples/polling_capability.py /dev/ttyS0 --address 1
+python3 examples/rte_reconcile.py gateway.sqlite3
+```
 
-What this survey genuinely cannot do to a machine is worth stating too.
-`meter_snapshot.py` sends long polls only and **never a general poll**, so it
-cannot consume a queued exception even while it is connected. It sends no
-AFT transfer, no handpay reset, no validation answer, and no enable/disable.
-`tests/test_deploy_floor_survey.py` asserts the wrapper cannot be edited into
-calling a tool that would.
+The first reads LP `0xA0` and reports Table 7.14e bit 0 — whether the machine
+*declares* 40 ms capability — alongside the four spec passages that say what
+that declaration does and does not mean. The second audits a soak database
+four independent ways: `0x70` buffer overflow, game-start continuity through
+§12.5.3's running `total_coin_in`, bill continuity through §12.5.1, and meter
+reconciliation.
 
-#### Timing
+Two soaks, 11.5 h and 41.5 h, 16,536 game starts between them, at median
+cycles of 9.75 s and ~12.6 s: **zero events lost, no buffer overflow during
+either run.** The one `0x70` on record was drained from the machine's queue at
+connect, left over from a power outage with no host attached — §2.2.1 reports
+it "at the next opportunity", which is exactly where it appeared.
 
-The boot dominates. A full sweep is a few seconds; a micro-PC takes 20–40s
-to reach the unit. Budget a minute per cabinet and measure the first one
-against a watch before planning a route round the floor. If boot is the
-bottleneck, that is a systemd problem (`systemd-analyze blame`) rather than
-a SAS one.
+A caution the reconciler's own output states, and which it is worth reading
+before concluding anything: **if the events exceed the meters, nothing was
+lost** — events are being counted that the meter window never covered, which
+is a windowing problem and not a protocol one. Run soaks with `--mode append`
+so `meters_history` covers the whole run; the default ring keeps 200 rows and
+will silently truncate a long one.
 
-The script's own ceiling is `NIMASAS_BUDGET_SECONDS`, 90 by default, so a
-cabinet that does not answer — wrong address, dead cable — gives up and
-powers off instead of holding the operator there. The log in the survey
-directory distinguishes "timed out" from "could not open the port" from
-"failed", which is the only diagnosis available after the fact when there was
-never a screen.
+### 8.4 Handpays
 
-## 8. Where to go next
+```
+python3 examples/handpay_queue_drain.py /dev/ttyS0 --address 1 --dry-run
+```
 
+§7.8.1 specifies an n-entry FIFO handpay queue, **minimum five**, and *"if the
+handpay queue is already full, the oldest handpay record will be lost."* LP
+`0x1B` returns the oldest **unreported** entry, marked reported only when the
+response is acknowledged — and exception `0x52`, the only confirmation that a
+handpay was resolved, is gated on that acknowledgement.
+
+So a host that never drains the queue never learns a handpay was paid,
+receives `0x51` every fifteen seconds forever, and eventually **destroys the
+oldest records**. Measured on the lab cabinet: 250 × `0x51` in 64 minutes and
+zero `0x52`, with handpays physically cleared inside that window, while the
+queue head was a stale record masking two live lockups.
+
+The tool records each entry durably **before** acknowledging it, because the
+acknowledgement is what makes it unreadable again, and verifies the queue
+actually advanced rather than assuming it did.
+
+Confirmation that a handpay was paid comes from **Δ`0003`**, not from watching
+the credit meter. During a lockup `000C` holds the full amount and `0003` is
+still zero; `0003` moves at the attendant's reset. A counter waits for you, a
+gauge transition does not.
+
+### 8.5 Bills and currency
+
+```
+python3 examples/bill_in_watch.py /dev/ttyS0 --address 1
+```
+
+The cumulative bill meters are by **face value only** — Table C-7's `0059` is
+"Total number of $1.00 bills to drop" and names no currency — so on a floor
+accepting more than one, those counters cannot be separated afterwards. The
+only per-note currency tag in SAS 6.02 is the country code in LP `0x48`, and
+§7.11 keeps just the most recently accepted bill: *"It is up to the host to
+request the bill information in a timely manner."* This tool reads it on the
+bill-accepted exception rather than on a meter cadence, and says so out loud
+when a second note arrives before the read.
+
+**Do not use LP `0x1E` as a bill record.** It has fields for
+$1/$5/$10/$20/$50/$100 only. Six test notes ($2, $5, $10, $20, $50, $100)
+moved five of its counters; the $2 note had nowhere to land. Table C-7
+`0040`–`0057` covers every denomination and recorded it correctly.
+
+And one argument in RTE's favour, which is easy to miss after a day spent on
+RTE causing trouble: §12.5.1's Bill Accepted event carries country code,
+denomination code and count **inline**. On a mixed-currency floor that is the
+only mode where per-note currency cannot be lost to a slow host.
+
+### 8.6 When a long poll will not parse
+
+```
+[enabled_features_probe.py is lab-only and is not in this repository -- see NimaSAS]
+```
+
+A fixed-length read reports a count and throws the bytes away: `got 5/12 bytes
+before timeout` says nothing about what the machine actually sent. This reads
+until the line goes quiet instead, then finds where the frame really ends by
+walking every prefix and testing its last two bytes as a CRC over the rest —
+the one check a plausible misreading of the wrong bytes cannot pass.
+
+It exists because of a specific trap. A CRC-valid frame with `FF` in the
+second byte is a Table 12.5 real-time event, which means **RTE is enabled on
+the machine**; varying answers across attempts look identical to a
+desynchronised stream, and the two have opposite remedies. A stream that has
+lost sync does not produce valid CRCs, so the positive evidence is tested
+first.
+
+The related symptom, worth recognising instantly: **a general poll returning a
+byte equal to the machine's own address.** On address 1 that is `0x01`, and
+Table A-1 defines no exception `0x01` at all. It means the Table 12.5 address
+byte is being read as an exception code — RTE is on, and every tool that
+assumes ordinary framing will mis-read everything. Recovery is
+`exception_monitor.py --disable-rte`, or a machine power cycle.
+
+**RTE state lives in the EGM, not the gateway**, and survives a gateway
+reboot. §12's "default to the ordinary mode on initial power up" is the
+machine's power.
+
+### 8.7 Validation pool replacement
+
+```
+python3 examples/pool_replace.py gateway.sqlite3 --count 50 --max-age-hours 36
+```
+
+Works on a live database while the poller runs — no restart, no signal. The
+poller selects `WHERE status = 'available'` at the moment it answers a `0x57`,
+and both tools open the database through `open_gateway_db()`: WAL mode so a
+reader is never blocked by the writer, and a 30-second busy timeout so a
+replacement waits out the poller's 5–7 second cycle instead of failing.
+
+Neither pragma was set before 2026-11-01, while this manual asserted the first
+of them. A pool replacement attempted against a running soak failed with
+`database is locked`. A database created before that change converts to WAL
+the next time the poller starts.
+
+**A top-up is not a replacement**, and the difference is mechanical: the
+pool-age alert reads `MIN(issued_at)` over *available* rows, so adding fresh
+numbers beside stale ones can never move it. Only retiring the old rows does.
+
+Three rules it enforces, each a way this goes wrong quietly: `assigned` rows
+are never touched because they are printed tickets; revoked rows stay in the
+table because deleting them destroys the evidence the gateway ever held the
+number; and revoke and re-issue are one transaction, because a revoke that
+committed while the mint failed would leave the gateway unable to dispense and
+turn the next cashout into a handpay.
+
+---
+
+## 9. Where to go next
+
+- `COMMANDS.md` — every command that has actually run against a machine,
+  with the ones that did not and why, in section 6. Kept current; it is
+  the operational reference this manual explains.
+- `docs/project/HANDOVER.md` — **private repo only.** The evidence trail
+  behind §8, the open questions, and the floor-survey findings. Start
+  there if you are picking this project up.
+- `docs/project/MIGRATION-SPEC-AMENDMENTS.md` — **private repo only.** A
+  section-by-section redline against the Linux migration technical
+  specification, from the same evidence.
 - `README.md` — repository layout and the licensing note on
   `docs/spec/` and `docs/sastest/` (private repo only — not present in
   the public code-only repo).
@@ -2056,7 +2235,7 @@ never a screen.
 
 ---
 
-## 9. `poll_test_tool.py` — lab gateways only
+## 10. `poll_test_tool.py` — lab gateways only
 
 > ⚠ **Do not run this before reading
 > [POLL_TEST_TOOL_WARNING.md](POLL_TEST_TOOL_WARNING.md) and

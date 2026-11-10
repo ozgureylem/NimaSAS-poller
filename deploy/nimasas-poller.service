@@ -1,0 +1,124 @@
+# The gateway poller as a service, so it survives its own reboot.
+#
+#   sudo cp deploy/nimasas-poller.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nimasas-poller
+#   journalctl -fu nimasas-poller
+#
+# PATHS HERE MATCH THE LAB GATEWAY AS IT IS: the repository in the nima-sas
+# home directory, the config beside it, the system python3 (there is no venv
+# on that box -- pytest is not even installed). A floor install belongs in
+# /opt/nimasas with its database in /var/lib/nimasas; the three paths below
+# and ProtectHome are what change.
+#
+# `nohup ... &` is a bench technique. It does not survive a reboot, a crash,
+# or a dropped SSH session that arrives before nohup's SIGHUP protection, and
+# on 2026-11-01 a gateway reboot ended a soak exactly that way. A floor
+# gateway has nobody logged in to restart it.
+#
+# WHAT THIS UNIT IS NOT: it carries no --lab-ticket-authority. That file makes
+# a gateway an authority on what tickets are worth, which has no place on a
+# floor -- delete it and examples/ticket_lab_authority.py before a gateway
+# goes near one. See HANDOVER.md §9 item 8.
+
+[Unit]
+Description=NimaSAS gateway poller (SAS 6.02 host, meters + real time events)
+Documentation=file:/home/nima-sas/NimaSAS/MANUAL.md
+# The serial port must exist before we open it. For a USB adapter use
+# dev-ttyUSB0.device, and prefer a udev SYMLINK so a re-enumeration cannot
+# silently point the gateway at a different cabinet (MANUAL.md §4.6).
+After=dev-ttyS0.device
+Wants=dev-ttyS0.device
+After=local-fs.target
+Requires=local-fs.target
+
+[Service]
+Type=simple
+User=nima-sas
+# dialout owns the serial device on Debian. Without it the open fails with
+# EACCES, which reads like a missing port rather than a missing group.
+Group=dialout
+SupplementaryGroups=dialout
+WorkingDirectory=/home/nima-sas/NimaSAS
+
+# --mode ring, NOT append. Append is the audit/stress setting and grows
+# meters_history without bound; ring caps it at a decoupled write cadence,
+# which is what the flash on a gateway micro-PC needs to survive years of
+# 7-second cycles (MANUAL.md §5.9). Use append for a soak, never for a floor.
+#
+# --min-poll-interval 0.2 is §2.3.3's own floor and the default. Do not lower
+# it: §12.2's 40ms relaxation buys nothing, because §12.3 delivers at most one
+# event per poll and 200ms already allows five a second against a measured
+# play rate near 0.85.
+ExecStart=/usr/bin/python3 /home/nima-sas/NimaSAS/examples/sql_poll_logger.py \
+    /home/nima-sas/gateway.ini \
+    --db /home/nima-sas/NimaSAS/gateway.sqlite3 \
+    --rte \
+    --mode ring \
+    --min-poll-interval 0.2 \
+    --heartbeat-every 1 \
+    --interval 2.0 \
+    --table-c7-interval 300 \
+    --skip-full-meter-sweep \
+    --skip-validation-meters-sweep \
+    --db-size-warning-mb 512
+
+# A SIGKILLed or power-cut poller leaves REAL TIME EVENT REPORTING ENABLED in
+# the cabinet, and the next start's general_poll() then reads Table 12.5's
+# address byte as an exception code -- on address 1, a phantom "exception
+# 0x01" every poll plus misframed long polls. systemd's own stop is SIGTERM,
+# which the teardown catches (confirmed twice on 2026-11-01), so this only
+# matters after a hard kill. The leading '-' makes it advisory: if the port is
+# busy or the disable is itself pre-empted, the service still starts.
+ExecStartPre=-/usr/bin/python3 /home/nima-sas/NimaSAS/examples/exception_monitor.py /dev/ttyS0 --address 1 --disable-rte
+
+# SIGTERM is what the teardown listens for: it disables RTE, flushes the last
+# interleaved event, and closes the database. SIGKILL cannot be caught by
+# anything, so give the teardown room rather than letting systemd escalate.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+# Restart=always, and deliberately WITHOUT a start limit.
+#
+# The tempting setting is RestartPreventExitStatus=2, since exit 2 is a
+# deliberate refusal (expired ticket file, wrong cabinet, port already held)
+# that a restart cannot fix. It is the wrong trade here: the realistic exit 2
+# on a floor is a port briefly held during maintenance, and a gateway that
+# gives up permanently at 3am is worse than one that retries noisily.
+#
+# StartLimitIntervalSec=0 disables systemd's "too many restarts, give up"
+# entirely, for the same reason. The cost is that a genuine misconfiguration
+# loops every 10 seconds; the symptom is unmistakable in `journalctl -u
+# nimasas-poller`, and it prints its own reason each time.
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=0
+
+# The journal rotates; a redirected file does not, and an unattended gateway
+# that fills its partition with its own log loses the data the log was about.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nimasas-poller
+
+# This process needs one serial port and one directory. Nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# ProtectHome=yes was here and is WRONG for this layout: it hides
+# /home/nima-sas, which is where the repository, the config and the database
+# all live, so the service would fail to start with a file-not-found on its
+# own code. On a floor install under /opt and /var/lib, turn it back on --
+# that is the better arrangement and this line is the cost of not having it
+# yet.
+ProtectHome=no
+ReadWritePaths=/home/nima-sas/NimaSAS
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# No network: the poller talks to a serial port and a local file. Remove this
+# line if and when the AFT bridge gives it a reason to listen (see
+# docs/project/AFT-BRIDGE-DESIGN.md).
+PrivateNetwork=yes
+
+[Install]
+WantedBy=multi-user.target

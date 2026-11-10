@@ -1,11 +1,17 @@
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+from types import SimpleNamespace
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
+
+from conftest import requires_lab_file
 
 from examples.sql_poll_logger import (
     ALL_METER_FIELDS,
@@ -21,13 +27,24 @@ from examples.sql_poll_logger import (
     HistoryConfig,
     PollState,
     _db_file_size_bytes,
+    _dispatch_exception,
+    _general_poll_with_retry,
     _insert_ticket_out_record,
     _pool_age_hours,
     _safe_commit,
     _sas_poll_interval,
     backfill_ticket_out_history,
+    interrogate,
+    migrate_epoch_columns,
     poll_and_log,
     seed_validation_pool,
+    ticket_authority_binding_verdict,
+    game_config_diff,
+    identity_changed,
+    machine_key,
+    usable_asset,
+    usable_serial,
+    _check_pool_age,
 )
 from saspy.constants import ExceptionCode, LongPoll, MeterCode, ValidationType
 from saspy.exceptions import SASTimeoutError
@@ -908,7 +925,7 @@ def test_meter_poll_timing_is_reported(capsys):
         + TABLE_C7_CHUNK_COUNT
         + len(VALIDATION_METER_TYPES)  # LP 0x50, one exchange per validation type
     )
-    assert f"meter_poll=2.500s/{full_count}polls" in capsys.readouterr().out
+    assert f"meter_poll=2.500s/{full_count}lp+" in capsys.readouterr().out
 
 
 def test_meter_poll_count_reflects_skip_full_meter_sweep(capsys):
@@ -920,7 +937,7 @@ def test_meter_poll_count_reflects_skip_full_meter_sweep(capsys):
     poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), full_meter_sweep=False)
     # single-meter sweep skipped; LP 0x48, C-7 sweep, and validation-meters sweep still on
     expected_count = GROUPED_METER_POLL_COUNT + 1 + TABLE_C7_CHUNK_COUNT + len(VALIDATION_METER_TYPES)
-    assert f"meter_poll=0.050s/{expected_count}polls" in capsys.readouterr().out
+    assert f"meter_poll=0.050s/{expected_count}lp+" in capsys.readouterr().out
 
 
 def test_meter_poll_count_reflects_skip_table_c7_sweep(capsys):
@@ -932,10 +949,70 @@ def test_meter_poll_count_reflects_skip_table_c7_sweep(capsys):
     poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), table_c7_sweep=False)
     # C-7 sweep skipped; LP 0x48, single-meter sweep, and validation-meters sweep still on
     expected_count = GROUPED_METER_POLL_COUNT + 1 + len(SINGLE_METER_COLUMNS) + len(VALIDATION_METER_TYPES)
-    assert f"meter_poll=0.050s/{expected_count}polls" in capsys.readouterr().out
+    assert f"meter_poll=0.050s/{expected_count}lp+" in capsys.readouterr().out
 
 
-def test_meter_poll_at_or_above_interval_warns(capsys):
+def test_meter_poll_count_excludes_a_c7_sweep_that_was_not_due(capsys):
+    """The count must report what the cycle DID, not what the flags allow.
+
+    --table-c7-interval 300 means the C-7 sweep runs on roughly one cycle in
+    150. The count keyed off ``table_c7_sweep`` (C-7 enabled at all) instead
+    of ``c7_due`` (this cycle ran one), so on the other 149 it added 13
+    exchanges that never happened: "22polls" for a cycle that made 9. That
+    number is what a human reads when deciding whether the sweep is too heavy
+    for the --interval, so the exaggeration argued for cutting a sweep that
+    was not the cost.
+    """
+    conn = make_db()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters(), make_meters()])
+    clock = iter([0.0, 0.05, 1.0, 1.05]).__next__
+    # First cycle: last_c7_sweep is None, so the sweep is due and counted.
+    poll_and_log(client, conn, state, history, monotonic_fn=clock,
+                 full_meter_sweep=False, validation_meters_sweep=False,
+                 table_c7_interval=3600)
+    due = GROUPED_METER_POLL_COUNT + 1 + TABLE_C7_CHUNK_COUNT
+    assert f"meter_poll=0.050s/{due}lp+" in capsys.readouterr().out
+    # Second cycle, one second later: not due, so those 13 must not appear.
+    poll_and_log(client, conn, state, history, monotonic_fn=clock,
+                 full_meter_sweep=False, validation_meters_sweep=False,
+                 table_c7_interval=3600)
+    not_due = GROUPED_METER_POLL_COUNT + 1
+    assert f"meter_poll=0.050s/{not_due}lp+" in capsys.readouterr().out
+
+
+def test_meter_poll_count_reports_the_heartbeat_general_polls(capsys):
+    """Section 2.3.3 counts general polls and long polls against one budget,
+    so a label that counts only long polls understates the cycle."""
+    conn = make_db()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()])
+    times = iter([0.0, 0.05])
+    poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times),
+                 full_meter_sweep=False, validation_meters_sweep=False,
+                 table_c7_sweep=False, heartbeat_every=2)
+    out = capsys.readouterr().out
+    lp = GROUPED_METER_POLL_COUNT + 1
+    # heartbeat_every=2 over 9 long polls: at least a few, and never zero.
+    import re as _re
+    m = _re.search(rf"meter_poll=0\.050s/{lp}lp\+(\d+)gp", out)
+    assert m is not None, out
+    assert int(m.group(1)) > 0
+
+
+def test_a_sweep_over_the_interval_but_INSIDE_THE_QUEUE_is_a_note_not_a_warning(capsys):
+    """Changed 2026-11-09, on the operator's objection to a line that fired
+    on every single full sweep.
+
+    "Longer than the sleep" was never the question worth asking. A 60s
+    sweep is FINE at 0.91 events/s, because the cabinet's queue survives
+    74s at that rate -- and four times too long at 4.31/s. The old line
+    could not tell those apart and fired identically on all three, which
+    made it background rather than a warning. §8 already records that
+    mistake once, in the pool-age alert.
+    """
     conn = make_db()
     state = PollState()
     history = HistoryConfig(mode="ring")
@@ -943,12 +1020,64 @@ def test_meter_poll_at_or_above_interval_warns(capsys):
     times = iter([0.0, 2.5])
     poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), interval=2.0)
     out = capsys.readouterr().out
-    full_count = (
-        GROUPED_METER_POLL_COUNT + 1 + len(SINGLE_METER_COLUMNS) + TABLE_C7_CHUNK_COUNT + len(VALIDATION_METER_TYPES)
-    )
-    assert f"WARNING: meter poll took 2.500s across {full_count} long-poll exchanges" in out
-    assert "--interval 2.0s" in out
+    assert "WARNING: the sweep OUTLASTS THE QUEUE" not in out, (
+        "a quiet cabinet must not raise a queue warning")
+    assert "note: sweep 2.5s over --interval 2.0s" in out
 
+
+def test_a_cycle_that_LOST_EVENTS_warns(capsys):
+    """The only two witnesses a host ever gets, and both are evidence
+    rather than a model: the cabinet's own 0x70, and §12.5.3's arithmetic
+    on the coin-in carried inside each game start.
+
+    This replaced a warning of mine that computed `queue_depth / rate` and
+    called it "the time the queue survives". `rate` is the rate this
+    poller COLLECTED events, and a collected event is not in the queue --
+    so the formula divided the queue depth by the rate it was being
+    EMPTIED. It fired on hardware at 00:41:43 on a cycle that was draining
+    1.71/s while collecting 1.66/s, with nothing lost at all.
+
+    THE ARRIVAL RATE IS NOT OBSERVABLE. Any warning resting on it rests on
+    a number we do not have, however reasonable the formula looks.
+    """
+    conn = make_db()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()])
+    state.overflows_this_cycle = 3
+    state.gaps_this_cycle = 1
+    times = iter([0.0, 10.0])
+    poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), interval=2.0)
+    out = capsys.readouterr().out
+    assert "WARNING: EVENTS WERE LOST IN THIS CYCLE" in out
+    assert "3 buffer overflow(s)" in out and "1 stream gap(s)" in out
+    assert "--drain-priority" in out, "the remedy must name the fix we built"
+    assert "larger --interval is NOT the remedy" in out
+
+
+def test_a_long_sweep_that_LOST_NOTHING_is_only_a_note(capsys):
+    """A 60-second sweep is a COST, not a fault: it buys 154 Table C-7
+    meters and 39 single ones. The first version of this line fired on
+    every full sweep and became background; §8 records the same mistake in
+    the pool-age alert."""
+    conn = make_db()
+    state = PollState()
+    history = HistoryConfig(mode="ring")
+    client = ScriptedClient([make_meters()])
+    times = iter([0.0, 10.0])
+    poll_and_log(client, conn, state, history, monotonic_fn=lambda: next(times), interval=2.0)
+    out = capsys.readouterr().out
+    assert "WARNING" not in out
+    assert "note: sweep 10.0s over --interval 2.0s" in out
+    assert "nothing reported lost" in out
+
+
+def test_the_warning_NEVER_divides_the_queue_by_the_COLLECTION_rate():
+    """Structural, because the formula looked right and shipped."""
+    src = (ROOT / "examples" / "sql_poll_logger.py").read_text()
+    body = src[src.index("def poll_and_log("):]
+    assert "MEASURED_LAB_QUEUE_DEPTH / rate" not in body
+    assert "queue that survives" not in body
 
 def test_meter_poll_under_interval_does_not_warn(capsys):
     conn = make_db()
@@ -1240,10 +1369,15 @@ def test_poll_and_log_captures_ticket_in_on_exception():
     assert rows == [(2500,)]
 
 
-def test_poll_and_log_ignores_ticket_in_exception_when_nothing_in_escrow():
-    """A rare race: the exception fired, but by the time we read LP 70 the
-    ticket is no longer in escrow (already returned to the player, e.g.).
-    Must not create a phantom row.
+def test_poll_and_log_records_a_ticket_in_exception_with_nothing_in_escrow():
+    """0x67 fired and LP 0x70 reports no escrow, every time we ask.
+
+    This used to assert the opposite -- "must not create a phantom row" --
+    and that silence is what hid the tool's most visible defect. The row is
+    not a phantom: exception 0x67 really did fire, we really did decline to
+    answer, and the machine really will hand the ticket back after §15.12's
+    thirty seconds. The player sees a rejection. Recording nothing made that
+    unexplainable from the database afterwards.
     """
     conn = make_db()
     clock = FakeClock()
@@ -1252,10 +1386,13 @@ def test_poll_and_log_ignores_ticket_in_exception_when_nothing_in_escrow():
     client = ScriptedClient(
         [make_meters()],
         exception_script=[ExceptionCode.TICKET_INSERTED],
-        ticket_script=[make_ticket_in(ticket_in_escrow=False, amount_cents=0)],
+        ticket_script=[make_ticket_in(ticket_in_escrow=False, amount_cents=0)] * 8,
     )
     poll_and_log(client, conn, state, history, monotonic_fn=clock)
-    assert conn.execute("SELECT COUNT(*) FROM ticket_in_events").fetchone()[0] == 0
+    rows = conn.execute(
+        "SELECT authority_decision FROM ticket_in_events").fetchall()
+    assert len(rows) == 1
+    assert "no ticket in escrow" in rows[0][0]
 
 
 def test_poll_and_log_detects_ticket_in_meter_rollover_during_105_dollar_ticket_capture():
@@ -2275,8 +2412,13 @@ def test_a_ram_clear_while_the_gateway_was_stopped_is_still_detected():
 
 
 def test_a_cleared_asset_number_is_not_mistaken_for_a_cabinet_swap():
-    """A RAM clear wipes the operator-entered asset number. The serial is
-    burned in and survives, so serial is what identifies the cabinet."""
+    """A RAM clear can wipe the operator-entered asset number while the
+    serial is re-entered unchanged, so serial is what identifies the cabinet.
+
+    NOT because the serial is burned in -- it is typed in at configuration
+    too, and this project has seen one typed wrong. The asymmetry this test
+    protects is narrower: an asset that moves while the serial holds is a
+    reconfiguration, not a swap."""
     conn, state = _epoch_conn(), _logger.PollState()
     _logger.maintain_epoch(conn, _FakeIdentityClient(serial="S", asset=246),
                            state, _meters(10), "T0")
@@ -2409,7 +2551,8 @@ def test_documented_meter_frames_match_what_the_client_sends(manual):
     from saspy.binary import encode_binary_le
     from saspy.framing import build_command
 
-    frames = _documented_frames(Path(__file__).resolve().parent.parent / manual)
+    frames = _documented_frames(requires_lab_file(
+        Path(__file__).resolve().parent.parent / manual))
     assert frames, f"no meter frames found in {manual}"
     for code, documented in frames.items():
         body = encode_bcd(0, 2) + encode_binary_le(code, 2)
@@ -2425,7 +2568,8 @@ def test_documented_meter_labels_match_the_verified_map(manual):
     """The table's labels and meter_snapshot's SCREEN_VERIFIED are the same
     claim written twice. They must not disagree about what this machine
     proved."""
-    text = (Path(__file__).resolve().parent.parent / manual).read_text()
+    text = requires_lab_file(
+        Path(__file__).resolve().parent.parent / manual).read_text()
     for code, label in _snapshot.SCREEN_VERIFIED.items():
         if f"`{code:04X}`" in text:
             assert label in text, (
@@ -2436,6 +2580,22 @@ def test_documented_meter_labels_match_the_verified_map(manual):
 # --- The lab ticket authority must not outlive the bench -------------------
 
 _LAB_AUTHORITY = Path(__file__).resolve().parent.parent / "examples" / "ticket_lab_authority.py"
+
+
+def _lab_authority_or_skip():
+    """ticket_lab_authority.py is lab-only apparatus and is NOT published to
+    the public mirror (tool_tree.py's tier, honoured by mirror_to_public.py
+    since 2026-11-10). Four tests here already checked it existed before
+    importing it; three more did not, and they failed the moment the
+    mirrored suite was first run as the dev team would run it.
+
+    Skip rather than return: a test that quietly passes when its subject is
+    absent is the "absence read as a measurement" shape this project has
+    now hit five times."""
+    if not _LAB_AUTHORITY.exists():
+        pytest.skip("ticket_lab_authority.py is lab-only, not in this checkout")
+    import examples.ticket_lab_authority as _lab
+    return _lab
 
 
 def test_the_lab_ticket_authority_has_not_outlived_its_expiry():
@@ -2453,9 +2613,7 @@ def test_the_lab_ticket_authority_has_not_outlived_its_expiry():
     not, and that is the option this removes.
     """
     import datetime as _dt
-    if not _LAB_AUTHORITY.exists():
-        return  # deleted, as intended -- nothing left to guard
-    import examples.ticket_lab_authority as _lab
+    _lab = _lab_authority_or_skip()
     assert _dt.date.today() <= _lab.LAB_AUTHORITY_EXPIRES, (
         f"ticket_lab_authority.py expired on {_lab.LAB_AUTHORITY_EXPIRES}. "
         "Delete examples/ticket_lab_authority.py and the ticket file, or move "
@@ -2470,10 +2628,10 @@ def test_the_lab_ticket_authority_refuses_unparseable_validation_numbers():
         return
     import json as _json
     import tempfile
-    import examples.ticket_lab_authority as _lab
+    _lab = _lab_authority_or_skip()
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
-        _json.dump({"tickets": {"01-2259-6416": {"as": "cashable",
+        _json.dump({"tickets": {"00-0000-0000": {"as": "cashable",
                                                  "amount": 1.0}}}, fh)
         bad = fh.name
     with pytest.raises(ValueError, match="18-digit"):
@@ -2483,11 +2641,9 @@ def test_the_lab_ticket_authority_refuses_unparseable_validation_numbers():
 def test_the_lab_ticket_authority_normalises_printed_dashes():
     """The number is copied off a ticket, where it is printed with dashes, and
     arrives from the machine as 18 BCD digits. Those must meet."""
-    if not _LAB_AUTHORITY.exists():
-        return
-    import examples.ticket_lab_authority as _lab
-    assert _lab.normalise("01-2259-6416-1772-0146") == "012259641617720146"
-    assert len(_lab.normalise("01-2259-6416-1772-0146")) == 18
+    _lab = _lab_authority_or_skip()
+    assert _lab.normalise("00-0000-0000-0000-0003") == "000000000000000003"
+    assert len(_lab.normalise("00-0000-0000-0000-0003")) == 18
 
 
 def test_an_unedited_example_file_says_so_rather_than_implying_a_swap():
@@ -2495,9 +2651,7 @@ def test_an_unedited_example_file_says_so_rather_than_implying_a_swap():
     and it happened on the first real run. The generic 'if the bench machine
     really changed' message sent the reader looking for a problem that was not
     there, so the placeholder case is detected and named."""
-    if not _LAB_AUTHORITY.exists():
-        return
-    import examples.ticket_lab_authority as _lab
+    _lab = _lab_authority_or_skip()
     # The placeholder carries no digits; a real serial is all digits.
     assert _lab.normalise("PUT-THE-BENCH-MACHINE-SERIAL-HERE") == ""
     assert _lab.normalise("000106719") == "000106719"
@@ -2713,13 +2867,73 @@ def test_handpay_read_failure_is_logged_not_fatal():
     assert ("send_handpay_information",) in rows
 
 
-def test_the_poller_never_resets_a_handpay_itself():
-    """0x94 moves money and belongs to a human. The logger reads and records;
-    it must not clear the lockup on its own initiative.
+def test_the_poller_never_resets_a_handpay_by_default():
+    """0x94 moves money and belongs to a human. --lab-auto-handpay-reset can
+    license it on a cabinet bound by a lab ticket file; absent that, a lockup
+    of any age must be left alone.
+
+    This test used to assert that the string "reset_handpay" did not appear
+    anywhere in the module. That grep stopped being true when the lab flag
+    landed -- and it was always the weaker claim. What matters is that the
+    DEFAULT path does not call it, which is what this now checks by running a
+    cycle with a lockup pending since the beginning of time.
     """
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    state.handpay_pending_since = 0.0
+    calls = []
+
+    class _CountsResets(ScriptedClient):
+        def reset_handpay(self):
+            calls.append(1)
+            return 0x00
+
+    poll_and_log(_CountsResets([make_meters()]), conn, state,
+                 HistoryConfig(mode="ring"), monotonic_fn=clock)
+    assert calls == [], "a default run must never send LP 0x94"
+    assert conn.execute(
+        "SELECT count(*) FROM lab_auto_actions").fetchone()[0] == 0
+
+
+def test_reset_handpay_is_reachable_only_from_the_gated_lab_function():
+    """The spirit of the original grep, kept: one call site, and it is the
+    one --lab-ticket-authority protects."""
     import inspect
     import examples.sql_poll_logger as mod
-    assert "reset_handpay" not in inspect.getsource(mod)
+    assert inspect.getsource(mod).count("client.reset_handpay()") == 1
+    assert "client.reset_handpay()" in inspect.getsource(
+        mod._lab_auto_handpay_reset)
+
+
+def test_every_aft_transfer_the_poller_sends_is_accounted_for():
+    """THE PROPERTY IS ABOUT AMOUNTS, NOT ABOUT CALL SITES.
+
+    This asserted one call site, which held until §8.7's cashout decline was
+    added on 2026-11-06. That decline is also an LP 0x72, and it must be:
+    the machine asked a question and 'all amounts zero' is the spec's answer
+    for "not by AFT, use your own means". But it moves nothing.
+
+    So the guarantee worth holding is that the poller has exactly two
+    reasons to send LP 0x72, and only one of them carries an amount."""
+    import inspect
+    import examples.sql_poll_logger as mod
+    src = inspect.getsource(mod)
+    assert src.count("client.aft_transfer_funds(") == 2
+
+    # The one that moves money: credits IN, under a lab-only flag.
+    credit = inspect.getsource(mod._lab_auto_aft_credit)
+    assert "client.aft_transfer_funds(" in credit
+    assert "IN_HOUSE_TO_GAMING_MACHINE" in credit
+
+    # The one that moves nothing: every amount a literal zero.
+    decline = inspect.getsource(mod._decline_aft_cashout)
+    assert "client.aft_transfer_funds(" in decline
+    for amount in ("cashable_amount=0", "restricted_amount=0",
+                   "nonrestricted_amount=0"):
+        assert amount in decline, (
+            f"{amount} must be a literal zero: a cashout decline that could "
+            f"carry a non-zero amount is an AFT-out path by another name")
 
 
 # -- Table C-7 sweep cadence ------------------------------------------------
@@ -2817,3 +3031,1418 @@ def test_the_latest_c7_view_skips_the_null_cycles():
     row = conn.execute("SELECT polled_at, c7_total_coin_in_credits "
                        "FROM latest_c7_meters").fetchone()
     assert row == ("2026-10-27T01:00:00", 100)
+
+
+# --- real time event reporting -------------------------------------------
+#
+# RTE lived only in exception_monitor.py, which prints and stores nothing,
+# while this tool stored everything and polled in the ordinary mode. Only one
+# process can own the serial port, so "run RTE and meter polling together for
+# hours and watch SQLite fill" was not a thing anyone could do. These pin the
+# join.
+
+
+class _RTEEvent:
+    def __init__(self, code, fields=None, description="event"):
+        self.code = code
+        self.fields = fields or {}
+        self.description = description
+
+
+class _RTEClient(ScriptedClient):
+    """A ScriptedClient that answers general polls as Table 12.5 events and
+    can also hand back events the client collected in place of long-poll
+    replies, per §12.3."""
+
+    def __init__(self, meters_script, *, rte_script=None, interleaved=None, **kw):
+        super().__init__(meters_script, **kw)
+        self._rte_script = list(rte_script) if rte_script is not None else []
+        self._interleaved = list(interleaved) if interleaved is not None else []
+        self.drain_calls = 0
+        self.rte_enabled_with = []
+
+    def enable_real_time_events(self, on):
+        self.rte_enabled_with.append(on)
+
+    def general_poll_rte(self):
+        return self._rte_script.pop(0) if self._rte_script else None
+
+    def drain_rte_events(self):
+        self.drain_calls += 1
+        out, self._interleaved = self._interleaved, []
+        return out
+
+
+def test_rte_silence_is_idle_and_is_not_retried(tmp_path):
+    """§12.6: a machine in real time event mode reports no activity by
+    sending NOTHING. Treating that as a timeout would burn the whole retry
+    budget on every quiet cycle -- and on an idle lab cabinet that is almost
+    every cycle."""
+    conn = sqlite3.connect(tmp_path / "db.sqlite3")
+    conn.executescript(SCHEMA)
+    migrate_epoch_columns(conn)
+    client = _RTEClient([make_meters()], rte_script=[])  # always silent
+
+    code, attempt, fields = _general_poll_with_retry(
+        client, conn, "2026-10-28T00:00:00", max_attempts=3, rte=True,
+        sleep_fn=lambda _s: None)
+
+    assert code == int(ExceptionCode.NONE)
+    assert attempt == 1, "silence must not consume retries"
+    assert fields is None
+    assert conn.execute("SELECT COUNT(*) FROM poll_errors").fetchone()[0] == 0
+
+
+def test_an_rte_event_stores_its_decoded_fields(tmp_path):
+    """The whole point of RTE: the exception carries data. A bare code is
+    what ordinary polling already gave us."""
+    conn = sqlite3.connect(tmp_path / "db.sqlite3")
+    conn.executescript(SCHEMA)
+    migrate_epoch_columns(conn)
+    client = _RTEClient(
+        [make_meters()],
+        rte_script=[_RTEEvent(0x7F, {"wager": 500, "win": 12500})])
+
+    code, _attempt, fields = _general_poll_with_retry(
+        client, conn, "2026-10-28T00:00:00", max_attempts=3, rte=True,
+        sleep_fn=lambda _s: None)
+    assert code == 0x7F and fields == {"wager": 500, "win": 12500}
+
+    _dispatch_exception(client, conn, "2026-10-28T00:00:00", code,
+                        source="rte", fields=fields)
+    row = conn.execute(
+        "SELECT exception_code, source, rte_fields FROM machine_events").fetchone()
+    assert row[0] == 0x7F and row[1] == "rte"
+    assert json.loads(row[2]) == {"wager": 500, "win": 12500}
+
+
+def test_ordinary_polling_stores_no_fields(tmp_path):
+    """rte_fields is NULL without RTE, and must stay NULL rather than '{}' --
+    an empty object would read as 'the event carried no data' when the truth
+    is that the protocol mode carries none at all."""
+    conn = sqlite3.connect(tmp_path / "db.sqlite3")
+    conn.executescript(SCHEMA)
+    migrate_epoch_columns(conn)
+    client = ScriptedClient([make_meters()])
+    _dispatch_exception(client, conn, "2026-10-28T00:00:00", 0x11)
+    assert conn.execute("SELECT rte_fields FROM machine_events").fetchone()[0] is None
+
+
+def test_interleaved_events_are_drained_every_cycle(tmp_path):
+    """§12.3 lets the machine answer a LONG poll with an event. The client
+    keeps those; this tool has to take them off it.
+
+    Draining every cycle is the leak guard: the client's pending list has no
+    cap, so a multi-hour run with a ~70-long-poll sweep that never drained
+    would grow it for the length of the run.
+
+    It is drained more than once now -- each heartbeat takes what has built
+    up since the last, so the rows land in arrival order rather than with
+    every interleaved event pushed behind every heartbeat one. What this
+    test guards is that the buffer is emptied and the events are stored, not
+    how many calls it takes.
+    """
+    conn = sqlite3.connect(tmp_path / "db.sqlite3")
+    conn.executescript(SCHEMA)
+    migrate_epoch_columns(conn)
+    client = _RTEClient(
+        [make_meters(), make_meters()],
+        rte_script=[_RTEEvent(0x00), _RTEEvent(0x00)],
+        interleaved=[_RTEEvent(0x11, {"door": "slot"}), _RTEEvent(0x12)])
+
+    poll_and_log(client, conn, PollState(), HistoryConfig(mode="append"),
+                 rte=True, retry_sleep_fn=lambda _s: None,
+                 full_meter_sweep=False, table_c7_sweep=False,
+                 validation_meters_sweep=False, last_accepted_bill_poll=False)
+
+    assert client.drain_calls >= 1
+    rows = conn.execute(
+        "SELECT exception_code, source FROM machine_events ORDER BY id").fetchall()
+    assert rows == [(0x11, "rte-interleaved"), (0x12, "rte-interleaved")]
+    assert json.loads(conn.execute(
+        "SELECT rte_fields FROM machine_events WHERE exception_code = 17"
+    ).fetchone()[0]) == {"door": "slot"}
+
+
+def test_nothing_is_drained_when_rte_is_off(tmp_path):
+    conn = sqlite3.connect(tmp_path / "db.sqlite3")
+    conn.executescript(SCHEMA)
+    migrate_epoch_columns(conn)
+    client = _RTEClient([make_meters()], interleaved=[_RTEEvent(0x11)])
+    poll_and_log(client, conn, PollState(), HistoryConfig(mode="append"),
+                 retry_sleep_fn=lambda _s: None, full_meter_sweep=False,
+                 table_c7_sweep=False, validation_meters_sweep=False,
+                 last_accepted_bill_poll=False)
+    assert client.drain_calls == 0
+
+
+def test_an_old_database_gains_the_rte_column(tmp_path):
+    """A soak database from before --rte existed keeps its old
+    machine_events shape, and every insert naming rte_fields would fail on
+    it. Soak databases are days long; refusing to open them would be worse
+    than an ALTER."""
+    db = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(SCHEMA)
+    conn.execute("ALTER TABLE machine_events DROP COLUMN rte_fields")
+    conn.commit()
+    assert "rte_fields" not in {
+        r[1] for r in conn.execute("PRAGMA table_info(machine_events)")}
+
+    migrate_epoch_columns(conn)
+    assert "rte_fields" in {
+        r[1] for r in conn.execute("PRAGMA table_info(machine_events)")}
+    _dispatch_exception(ScriptedClient([make_meters()]), conn,
+                        "2026-10-28T00:00:00", 0x11)
+    assert conn.execute("SELECT COUNT(*) FROM machine_events").fetchone()[0] == 1
+
+
+# --- interrogation on connect and after a comms gap ----------------------
+#
+# The scenario, in the operator's words: the gateway is running on a machine,
+# someone pulls the SAS cable and plugs it into a different one. The gap is
+# the trigger because the act is physical and physical acts take time -- not
+# because 30 seconds is when data is lost. By §2.2.1's arithmetic the
+# exception queue is gone after about 8 seconds on a played machine and no
+# sweep brings it back; what a sweep establishes is WHO is answering now.
+
+
+class _InterrogationClient(ScriptedClient):
+    def __init__(self, meters_script, *, serial="000106719", asset=246,
+                 games=2, **kw):
+        super().__init__(meters_script, **kw)
+        self._serial, self._asset, self._games = serial, asset, games
+        self.game_configs_read = []
+
+    def send_sas_version_and_serial(self):
+        return SimpleNamespace(sas_version="602", serial_number=self._serial)
+
+    def aft_game_lock_and_status_request(self, lock_code=0xFF, **kw):
+        return SimpleNamespace(asset_number=self._asset)
+
+    def send_enabled_features(self, game_number=0):
+        return SimpleNamespace(game_number=0, max_polling_rate_40ms=True,
+                               ticket_redemption=True)
+
+    def send_meter(self, poll, **kw):
+        if poll == LongPoll.SEND_TOTAL_GAMES_IMPLEMENTED:
+            return self._games
+        raise SASTimeoutError("no")
+
+    def send_game_n_configuration(self, number=0):
+        self.game_configs_read.append(number)
+        return SimpleNamespace(game_number=number, game_id="EG",
+                               additional_id="3CO", denomination=1,
+                               max_bet=200, progressive_group=0,
+                               game_options=0, paytable_id="P1",
+                               base_percentage="9500")
+
+    def send_extended_game_n_information(self, number=0):
+        return SimpleNamespace(game_number=number, max_bet=200,
+                               progressive_group=0, progressive_levels=0,
+                               game_name=f"Game {number}",
+                               paytable_name="PT", wager_categories=1)
+
+    def redeem_ticket_status(self):
+        raise SASTimeoutError("none pending")
+
+    def send_enhanced_validation_information(self, function_code=0xFF):
+        # This cabinet has no ticket-out buffer to back-fill. Its absence is
+        # recorded by the interrogation rather than being a failure.
+        raise SASTimeoutError("no buffer")
+
+
+def _fresh(tmp_path, name="db.sqlite3"):
+    conn = sqlite3.connect(tmp_path / name)
+    conn.executescript(SCHEMA)
+    migrate_epoch_columns(conn)
+    return conn
+
+
+def test_an_interrogation_records_every_game_by_both_polls(tmp_path):
+    """LP 0x53 carries the configuration and LP 0xB5 the human-readable
+    names; neither is a superset, so a game gets one row built from both."""
+    conn = _fresh(tmp_path)
+    client = _InterrogationClient([make_meters()], games=3)
+    interrogate(client, conn, PollState(), "2026-10-28T06:00:00",
+                reason="first_connect")
+
+    assert client.game_configs_read == [1, 2, 3], "game 0 is the machine, not a game"
+    rows = conn.execute(
+        "SELECT game_number, game_id, denomination, game_name, paytable_name "
+        "FROM interrogation_games ORDER BY game_number").fetchall()
+    assert rows == [(1, "EG", 1, "Game 1", "PT"),
+                    (2, "EG", 1, "Game 2", "PT"),
+                    (3, "EG", 1, "Game 3", "PT")]
+    row = conn.execute(
+        "SELECT reason, serial_number, asset_number, games_found, "
+        "machine_changed FROM interrogations").fetchone()
+    assert row == ("first_connect", "000106719", 246, 3, 0)
+
+
+def test_a_swapped_cable_is_caught_and_opens_a_new_epoch(tmp_path):
+    """The scenario this exists for. Same address, different cabinet."""
+    conn = _fresh(tmp_path)
+    state = PollState()
+    interrogate(_InterrogationClient([make_meters()]), conn, state,
+                "2026-10-28T06:00:00", reason="first_connect")
+    first_epoch = state.epoch_id
+
+    moved = _InterrogationClient([make_meters()], serial="999999999", asset=7)
+    interrogate(moved, conn, state, "2026-10-28T06:05:00",
+                reason="comms_restored", gap_seconds=45.0)
+
+    assert state.epoch_id != first_epoch, "a different cabinet needs its own epoch"
+    row = conn.execute(
+        "SELECT reason, gap_seconds, serial_number, machine_changed, identity_note "
+        "FROM interrogations ORDER BY id DESC LIMIT 1").fetchone()
+    assert row[0] == "comms_restored" and row[1] == 45.0
+    assert row[2] == "999999999" and row[3] == 1
+    assert "serial" in (row[4] or "").lower()
+    assert conn.execute(
+        "SELECT reason FROM machine_epochs ORDER BY id DESC LIMIT 1"
+    ).fetchone()[0] == "machine_changed"
+
+
+def test_the_same_machine_after_a_gap_still_breaks_continuity(tmp_path):
+    """No swap, but the events of the gap are gone for good (§2.2.1), so the
+    history either side of it must not be read as continuous."""
+    conn = _fresh(tmp_path)
+    state = PollState()
+    client = _InterrogationClient([make_meters()])
+    interrogate(client, conn, state, "2026-10-28T06:00:00", reason="first_connect")
+    before = state.epoch_id
+
+    interrogate(client, conn, state, "2026-10-28T06:05:00",
+                reason="comms_restored", gap_seconds=31.0)
+
+    assert state.epoch_id != before
+    reason, detail = conn.execute(
+        "SELECT reason, detail FROM machine_epochs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert reason == "comms_restored"
+    assert "31s" in detail
+    assert conn.execute(
+        "SELECT machine_changed FROM interrogations ORDER BY id DESC LIMIT 1"
+    ).fetchone()[0] == 0
+
+
+def test_a_machine_that_answers_nothing_is_still_interrogated(tmp_path):
+    """§4.4 lets a machine ignore any long poll it does not implement. The
+    row records what it refused, which is itself a fact about the machine."""
+    class _Silent(ScriptedClient):
+        def send_sas_version_and_serial(self):
+            raise SASTimeoutError("no")
+
+        def aft_game_lock_and_status_request(self, **kw):
+            raise SASTimeoutError("no")
+
+        def send_enabled_features(self, game_number=0):
+            raise SASTimeoutError("no")
+
+        def send_meter(self, poll, **kw):
+            raise SASTimeoutError("no")
+
+        def send_enabled_game_numbers(self):
+            raise SASTimeoutError("no")
+
+        def redeem_ticket_status(self):
+            raise SASTimeoutError("no")
+
+        def send_enhanced_validation_information(self, function_code=0xFF):
+            raise SASTimeoutError("no")
+
+    conn = _fresh(tmp_path)
+    interrogate(_Silent([make_meters()]), conn, PollState(),
+                "2026-10-28T06:00:00", reason="first_connect")
+    row = conn.execute(
+        "SELECT serial_number, games_found, enabled_features FROM interrogations"
+    ).fetchone()
+    assert row[0] is None and row[1] == 0
+    assert "error" in row[2], "a refusal is recorded, not silently dropped"
+
+
+def test_the_interrogation_drains_the_queue_while_it_runs(tmp_path):
+    """~150 long polls is longer than the exception queue takes to overflow
+    on a played machine. An interrogation that did not drain would cause the
+    loss it exists to detect, silently, when its output is most trusted."""
+    conn = _fresh(tmp_path)
+    beats = []
+    interrogate(_InterrogationClient([make_meters()], games=2), conn,
+                PollState(), "2026-10-28T06:00:00", reason="first_connect",
+                heartbeat=lambda: beats.append(1))
+    # identity, features, then two polls per game, plus the ticket read.
+    assert len(beats) >= 2 + 2 * 2, f"only {len(beats)} heartbeats"
+
+
+def test_an_inherited_sig_ign_is_left_alone():
+    """nohup sets SIGHUP to SIG_IGN before exec. Installing a handler over
+    that revokes the protection it was asked for, turning `nohup ... &` from
+    "survives a dropped SSH session" into "stops cleanly on one".
+
+    The first version of the teardown-signal block did exactly that, and it
+    would only have shown up as an overnight soak coming back short.
+    """
+    import signal
+    import subprocess
+    import textwrap
+
+    prog = textwrap.dedent('''
+        import signal, sys, time
+        def _stop(signum, _frame):
+            raise KeyboardInterrupt(f"signal {signum}")
+        for s in (signal.SIGTERM, signal.SIGHUP):
+            if signal.getsignal(s) == signal.SIG_IGN:
+                continue
+            signal.signal(s, _stop)
+        print("RUNNING", flush=True)
+        try:
+            time.sleep(10)
+            print("SURVIVED", flush=True)
+        except KeyboardInterrupt:
+            print("STOPPED", flush=True)
+    ''')
+    proc = subprocess.Popen(
+        ["nohup", sys.executable, "-c", prog],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "RUNNING"
+        proc.send_signal(signal.SIGHUP)
+        assert proc.stdout.readline().strip() == "SURVIVED", \
+            "nohup's SIGHUP protection must not be revoked"
+    finally:
+        proc.kill()
+        proc.wait()
+
+    # And the poller's own block carries the guard, not just this copy of it.
+    source = (Path(__file__).resolve().parent.parent
+              / "examples" / "sql_poll_logger.py").read_text()
+    assert "signal.getsignal(_sig) == signal.SIG_IGN" in source
+
+
+# --- the call sites, not just the functions --------------------------------
+#
+# Both bugs below were in main()'s startup wiring while the function it
+# called was correct and had its own passing test. A unit test on the callee
+# cannot see them, and main() needs a serial port, so these assert the
+# structure of the source directly. That is a blunt instrument; it is aimed
+# at two invariants that cost real events and a real safety check.
+
+def _sql_poll_logger_ast():
+    import ast as _ast
+    import pathlib as _pathlib
+    src = (_pathlib.Path(__file__).resolve().parent.parent
+           / "examples" / "sql_poll_logger.py").read_text()
+    return _ast.parse(src)
+
+
+def _main_function(tree):
+    import ast as _ast
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.FunctionDef) and node.name == "main":
+            return node
+    raise AssertionError("sql_poll_logger.py has no main()")
+
+
+def test_every_interrogate_call_site_passes_a_heartbeat():
+    """interrogate() threads a heartbeat through ~150 long polls and its own
+    docstring says in capitals that this must not be skipped. The function
+    was right and tested; the first_connect CALL omitted the argument, so
+    every run began with a blind window -- ~13s at the 88ms a sweep measured,
+    and ~45s once --min-poll-interval 0.3 paced it, against a 20-deep queue
+    (§2.2.1) a played cabinet fills in about eight seconds.
+
+    That is the only mechanism found here that destroys events rather than
+    delaying them, and it was invisible to the unit test one level down.
+    """
+    import ast
+    tree = _sql_poll_logger_ast()
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "interrogate"
+    ]
+    assert calls, "no interrogate() call sites found -- has it been renamed?"
+    for call in calls:
+        kwargs = {kw.arg for kw in call.keywords}
+        assert "heartbeat" in kwargs, (
+            f"interrogate() called at line {call.lineno} without heartbeat=; "
+            "that is ~150 long polls of not draining the exception queue"
+        )
+
+
+def test_the_ticket_serial_binding_is_not_inside_the_interrogate_branch():
+    """The lab ticket file binds to one cabinet by serial, and that binding
+    is the authorisation -- it is what stops the file redeeming tickets
+    against a machine it was not issued for.
+
+    (It was ``ticket_authority_serial`` when this test was written; the
+    attribute became ``ticket_authority_binding`` when the asset-number
+    fallback landed, and the name here was updated with it -- a guard that
+    names a symbol which no longer exists passes for free.)
+
+    The check used to sit inside ``if args.interrogate_on_connect:``, so
+    --no-interrogate-on-connect, a flag about startup chatter, silently
+    switched off a safety property. A flag that says "skip the chatter" must
+    not be able to say "and skip the check".
+    """
+    import ast
+    tree = _sql_poll_logger_ast()
+    main = _main_function(tree)
+    branches = [
+        node for node in ast.walk(main)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Attribute)
+        and node.test.attr == "interrogate_on_connect"
+        and isinstance(node.test.value, ast.Name)
+        and node.test.value.id == "args"
+    ]
+    assert branches, "no `if args.interrogate_on_connect:` branch in main()"
+    for branch in branches:
+        for node in ast.walk(ast.Module(body=branch.body, type_ignores=[])):
+            name = getattr(node, "attr", None) or getattr(node, "id", None)
+            assert name != "ticket_authority_binding", (
+                f"the serial binding check is inside the interrogation branch "
+                f"at line {getattr(node, 'lineno', '?')}; "
+                "--no-interrogate-on-connect would disable it"
+            )
+
+
+# --- the ticket file's serial binding --------------------------------------
+#
+# Two bugs, one conflation, both shipped in the same afternoon. First the
+# check read `if seen and seen.strip() != bound`, which fails OPEN: a cabinet
+# that will not answer LP 0x54 (§4.4 lets it) had no serial to compare, so the
+# binding went unenforced and nothing said so. Then that was replaced with a
+# bare refusal, which fails CLOSED on the same cabinet -- and killed a running
+# soak on a command line that had worked ten minutes earlier.
+
+
+def _binding(serial=None, asset=None):
+    MachineBinding = _lab_authority_or_skip().MachineBinding
+    return MachineBinding(serial=serial, asset=asset)
+
+
+def _verdict(binding, identity, *, allow_unverified=False):
+    v = ticket_authority_binding_verdict(
+        binding, identity, allow_unverified=allow_unverified)
+    return None if v is None else v[0]
+
+
+def test_a_mismatched_serial_is_always_refused():
+    """The machine identified itself and it is the wrong one. No flag helps:
+    an operator cannot know better than a burned-in serial."""
+    ident = {"serial_number": "XYZ789", "asset_number": 1}
+    assert _verdict(_binding(serial="ABC123"), ident) == "mismatch"
+    assert _verdict(_binding(serial="ABC123"), ident,
+                    allow_unverified=True) == "mismatch", (
+        "--ticket-authority-unverified-serial must NOT excuse a wrong serial")
+
+
+def test_a_matching_serial_passes_however_it_is_spaced():
+    assert _verdict(_binding(serial="ABC123"),
+                    {"serial_number": "ABC123", "asset_number": 1}) is None
+    assert _verdict(_binding(serial=" ABC123 "),
+                    {"serial_number": "ABC123\n", "asset_number": 1}) is None
+
+
+def test_a_matching_serial_is_not_vetoed_by_a_changed_asset_number():
+    """A RAM clear wipes the asset number and leaves the serial. Refusing a
+    cabinet whose serial matches because its asset was retyped would block a
+    legitimate machine after every clear."""
+    assert _verdict(_binding(serial="ABC123", asset=246),
+                    {"serial_number": "ABC123", "asset_number": 999}) is None
+
+
+def test_the_binding_falls_back_to_the_asset_number():
+    """§4.4 lets a cabinet ignore LP 0x54 and this project's lab EGM does, so
+    a file bound only by serial cannot be checked against it at all. An asset
+    binding is enforceable there -- asset numbers are never reissued on these
+    floors."""
+    no_serial = {"serial_number": None, "asset_number": 246}
+    assert _verdict(_binding(asset=246), no_serial) is None
+    assert _verdict(_binding(asset=247), no_serial) == "mismatch"
+    assert _verdict(_binding(asset=247), no_serial,
+                    allow_unverified=True) == "mismatch", (
+        "a readable asset number that disagrees is still the wrong cabinet")
+
+
+def test_a_serial_only_binding_against_a_silent_cabinet_is_unverifiable():
+    """The case that forced --ticket-authority-unverified-serial into the soak
+    command. An asset binding is the fix; the flag is the override."""
+    no_serial = {"serial_number": None, "asset_number": 246}
+    assert _verdict(_binding(serial="ABC123"), no_serial) == "unverifiable"
+    assert _verdict(_binding(serial="ABC123"), no_serial,
+                    allow_unverified=True) is None
+
+
+def test_a_cabinet_with_no_identity_at_all_is_unverifiable():
+    for ident in (None, {}, {"serial_number": "n/a", "asset_number": 0}):
+        assert _verdict(_binding(serial="ABC123", asset=246),
+                        ident) == "unverifiable", ident
+
+
+def test_an_unbound_file_is_permitted_but_reported():
+    """Whoever wrote the file chose that. It is said loudly rather than
+    silently allowed."""
+    assert _verdict(_binding(), {"serial_number": "ABC123"}) == "unbound"
+
+
+
+# --- RTE that could not be enabled at startup ------------------------------
+
+class _RTELateClient(ScriptedClient):
+    """A cabinet that is still booting: LP 0x0E fails until it is up."""
+
+    def __init__(self, *args, fail_times: int = 2, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rte_attempts = 0
+        self._fail_times = fail_times
+
+    def enable_real_time_events(self, on: bool = True):
+        self.rte_attempts += 1
+        if self.rte_attempts <= self._fail_times:
+            raise SASTimeoutError("machine is still booting")
+        return True
+
+    # Once RTE is on the cycle switches to the Table 12.5 polls, so a client
+    # that only answers the ordinary ones cannot test the switchover.
+    def general_poll_rte(self):
+        return None
+
+    def drain_rte_events(self):
+        return []
+
+
+def test_a_failed_rte_enable_is_retried_every_cycle(capsys):
+    """A gateway micro-PC boots in about thirty seconds; an EGM takes
+    minutes. So after any mains event the poller comes up first, finds
+    nothing answering, and -- before this -- fell back to ordinary polling
+    for the WHOLE RUN, announced in one startup line and invisible after.
+
+    A supervisor does not help: the process does not exit, it runs happily
+    in the wrong mode. The only fix is to keep asking.
+    """
+    conn = make_db()
+    state = PollState()
+    state.rte_wanted = True          # --rte was given
+    state.rte_enabled = False        # ...and startup could not enable it
+    history = HistoryConfig(mode="ring")
+    client = _RTELateClient([make_meters(), make_meters(), make_meters()],
+                            fail_times=2)
+
+    poll_and_log(client, conn, state, history, rte=True)
+    assert state.rte_enabled is False, "first cycle: machine still silent"
+    poll_and_log(client, conn, state, history, rte=True)
+    assert state.rte_enabled is False, "second cycle: still silent"
+    poll_and_log(client, conn, state, history, rte=True)
+    assert state.rte_enabled is True, "third cycle: the cabinet answered"
+    assert client.rte_attempts == 3
+    assert "RTE ENABLED (LP 0x0E) on retry" in capsys.readouterr().out
+
+
+def test_rte_is_not_retried_when_it_was_never_asked_for():
+    """A run without --rte must never put a cabinet into Table 12.5 framing
+    behind the operator's back."""
+    conn = make_db()
+    state = PollState()          # rte_wanted stays False
+    history = HistoryConfig(mode="ring")
+    client = _RTELateClient([make_meters()], fail_times=0)
+    poll_and_log(client, conn, state, history)
+    assert client.rte_attempts == 0
+    assert state.rte_enabled is False
+
+
+def test_once_enabled_it_is_not_re_enabled_every_cycle():
+    """One long poll per cycle only while it is still failing."""
+    conn = make_db()
+    state = PollState()
+    state.rte_wanted = True
+    state.rte_enabled = True     # already on
+    history = HistoryConfig(mode="ring")
+    client = _RTELateClient([make_meters(), make_meters()], fail_times=0)
+    poll_and_log(client, conn, state, history, rte=True)
+    poll_and_log(client, conn, state, history, rte=True)
+    assert client.rte_attempts == 0
+
+
+# --- the pool-age alert is a condition, not an event stream -----------------
+
+def _stale_pool_db():
+    conn = make_db()
+    conn.execute(
+        "INSERT INTO validation_pool (validation_number, validation_system_id, "
+        "status, issued_at) VALUES (1, 0, 'available', '2026-10-01T00:00:00+00:00')")
+    conn.commit()
+    return conn
+
+
+def _pool_rows(conn):
+    return conn.execute(
+        "SELECT error_type, message FROM poll_errors WHERE poll_name = "
+        "'validation_pool' ORDER BY id").fetchall()
+
+
+def test_a_stale_pool_writes_one_row_per_episode_not_per_cycle():
+    """It used to INSERT and commit every cycle the pool was stale. Measured
+    on the lab database: 1302 rows in one hour at the early 2.8s cadence, then
+    ~271/hour for four days, for a condition that never changed.
+
+    poll_errors is the table a human reads to find poll FAILURES, and it was
+    swamped -- the real signal, ~90 core-meter timeouts an hour, sat under a
+    flood of advisory rows all saying the same thing. It was also a write plus
+    a commit every cycle on a gateway whose --mode ring design exists to spare
+    the flash precisely that.
+    """
+    conn = _stale_pool_db()
+    state = PollState()
+    clock = iter([0.0, 10.0, 20.0, 30.0, 40.0]).__next__  # 40 seconds of cycles
+    for _ in range(5):
+        _check_pool_age(conn, "2026-11-02T00:00:00+00:00", max_age_hours=36.0,
+                        state=state, monotonic_fn=clock)
+    rows = _pool_rows(conn)
+    assert len(rows) == 1, f"five cycles wrote {len(rows)} rows"
+    assert rows[0][0] == "PoolStale"
+    assert state.pool_stale_since == "2026-11-02T00:00:00+00:00"
+
+
+def test_a_stale_pool_is_re_recorded_hourly_so_it_has_a_duration():
+    conn = _stale_pool_db()
+    state = PollState()
+    clock = iter([0.0, 1800.0, 3600.0, 3610.0]).__next__
+    for _ in range(4):
+        _check_pool_age(conn, "2026-11-02T00:00:00+00:00", max_age_hours=36.0,
+                        state=state, monotonic_fn=clock)
+    rows = _pool_rows(conn)
+    assert len(rows) == 2, "start, then one an hour later -- not the 30min one"
+    assert "still stale since" in rows[1][1]
+
+
+def test_clearing_a_stale_pool_is_recorded_because_that_is_the_answer():
+    """The alert asks for a top-up. That one arrived is the fact worth
+    keeping -- it is how a replacement proves it reached this gateway."""
+    conn = _stale_pool_db()
+    state = PollState()
+    clock = iter([0.0, 10.0]).__next__
+    _check_pool_age(conn, "2026-11-02T00:00:00+00:00", max_age_hours=36.0,
+                    state=state, monotonic_fn=clock)
+    # A replacement retires the stale row and issues a fresh one.
+    conn.execute("UPDATE validation_pool SET status = 'revoked'")
+    conn.execute(
+        "INSERT INTO validation_pool (validation_number, validation_system_id, "
+        "status, issued_at) VALUES (2, 0, 'available', '2026-11-02T00:00:00+00:00')")
+    conn.commit()
+    _check_pool_age(conn, "2026-11-02T00:00:10+00:00", max_age_hours=36.0,
+                    state=state, monotonic_fn=clock)
+    rows = _pool_rows(conn)
+    assert [r[0] for r in rows] == ["PoolStale", "PoolStaleCleared"]
+    assert state.pool_stale_since is None
+
+
+def test_a_pool_that_was_never_stale_writes_nothing_on_clear():
+    conn = _stale_pool_db()
+    conn.execute("UPDATE validation_pool SET issued_at = '2026-11-02T00:00:00+00:00'")
+    conn.commit()
+    state = PollState()
+    _check_pool_age(conn, "2026-11-02T00:00:00+00:00", max_age_hours=36.0,
+                    state=state, monotonic_fn=lambda: 0.0)
+    assert _pool_rows(conn) == []
+
+
+# --- identity when the cabinet will not give a serial -----------------------
+#
+# Operational requirement, 2026-11-02: "not every machine announces their
+# serial number through sas. We have to make sure that; if serial number isn't
+# available, we fall back to asset number. On our floors we don't issue same
+# asset number twice... In Trinidad; machines asset numbers are never duplicate
+# although they might be in different floors (3 casinos around the country)."
+
+def test_machine_key_falls_back_to_the_asset_number():
+    assert machine_key({"serial_number": "000106719", "asset_number": 246}) == \
+        ("serial", "000106719")
+    assert machine_key({"serial_number": None, "asset_number": 246}) == \
+        ("asset", "246")
+    assert machine_key({"serial_number": "", "asset_number": 246}) == \
+        ("asset", "246")
+    assert machine_key({"serial_number": None, "asset_number": 0}) is None
+    assert machine_key({}) is None
+    assert machine_key(None) is None
+
+
+def test_a_placeholder_serial_is_not_an_identity():
+    """survey_store learned this on the floor; the poller never had it."""
+    for placeholder in ("", "   ", "0", "00000000", "n/a", "N/A", "none", "-"):
+        ident = {"serial_number": placeholder, "asset_number": 246}
+        assert usable_serial(ident) is None, placeholder
+        assert machine_key(ident) == ("asset", "246"), placeholder
+
+
+def test_a_serial_that_is_the_asset_number_retyped_is_not_an_identity():
+    """Seen on the floor 2026-10-27: an IGT cabinet reporting asset 7 and
+    serial "7". It passes every placeholder test and reads like a real serial
+    in a report, which is exactly why it is dangerous."""
+    ident = {"serial_number": "7", "asset_number": 7}
+    assert usable_serial(ident) is None
+    assert machine_key(ident) == ("asset", "7")
+
+
+def test_asset_zero_is_not_an_asset_number():
+    assert usable_asset({"asset_number": 0}) is None
+    assert usable_asset({"asset_number": None}) is None
+    assert usable_asset({"asset_number": 246}) == 246
+
+
+def test_a_changed_asset_with_no_serial_is_a_CHANGED_MACHINE():
+    """The reasoning inverts, and this used to get it backwards.
+
+    "The asset changed but the serial held" is only reassuring when there IS a
+    serial holding. On a cabinet reporting none -- §4.4 permits it, and the lab
+    EGM does it -- the asset number is the only identity there is, and on these
+    floors it is never reissued. A different one is a different machine.
+
+    Reporting it as a reconfiguration would carry one cabinet's meter history
+    silently onto another.
+    """
+    kind, detail = identity_changed(
+        {"serial_number": None, "asset_number": 246},
+        {"serial_number": None, "asset_number": 247})
+    assert kind == "machine_changed", kind
+    assert "only identity" in detail
+
+
+def test_a_changed_asset_WITH_a_serial_is_still_a_reconfiguration():
+    """Unchanged, and must stay so: a RAM clear wipes the asset number while
+    the serial survives, so calling that a swap mislabels every clear."""
+    kind, detail = identity_changed(
+        {"serial_number": "000106719", "asset_number": 246},
+        {"serial_number": "000106719", "asset_number": 247})
+    assert kind == "asset_changed", kind
+
+
+def test_a_cabinet_that_stops_answering_0x54_has_not_changed():
+    """§4.4 lets it refuse. Treating a missed poll as a change would open an
+    epoch every time one was dropped."""
+    assert identity_changed(
+        {"serial_number": "000106719", "asset_number": 246},
+        {"serial_number": None, "asset_number": 246}) is None
+    assert identity_changed(
+        {"serial_number": None, "asset_number": 246},
+        {"serial_number": "000106719", "asset_number": 246}) is None
+
+
+def test_the_placeholder_list_lives_in_the_LIBRARY_and_is_not_copied():
+    """Two copies drift, and the floor lessons behind this list were paid for
+    once already.
+
+    This test used to assert the poller imported the list from
+    examples/survey_store.py. That kept one copy, but it pointed the PRODUCT
+    at a SURVEY TOOL: the public mirror could not ship the gateway without
+    also shipping a tool for walking a floor with a laptop. The list is
+    identity validation, which is library work, so it now lives in
+    saspy.constants and both callers take it from there.
+    """
+    from saspy.constants import PLACEHOLDER_IDENTIFIERS
+    requires_lab_file(Path(__file__).resolve().parent.parent
+                      / "examples" / "survey_store.py")
+    from examples.survey_store import PLACEHOLDER_IDS as survey_list
+    assert survey_list is PLACEHOLDER_IDENTIFIERS
+
+    root = Path(__file__).resolve().parent.parent
+    for name in ("examples/sql_poll_logger.py", "examples/survey_store.py"):
+        src = (root / name).read_text()
+        assert "PLACEHOLDER_IDS = {" not in src, (
+            f"{name} has its own copy of the placeholder list; import it "
+            f"from saspy.constants so the two cannot drift")
+
+    poller = (root / "examples/sql_poll_logger.py").read_text()
+    assert "from survey_store import" not in poller, (
+        "the product must not import a survey tool at runtime")
+    assert "is_placeholder_identifier" in poller
+
+
+def test_the_example_ticket_file_actually_loads():
+    """It is the thing people copy. A first draft of the asset-binding
+    documentation put "machine_asset": 0 in it, which the loader rejects by
+    design -- zero is the field's unset value -- so the example shipped
+    unloadable and the first thing a new operator would hit was an error in a
+    file they had not touched yet."""
+    _lab = _lab_authority_or_skip()
+    path = Path(__file__).resolve().parent.parent / "lab_tickets.example.json"
+    tickets, binding = _lab.load_tickets(path)
+    assert len(tickets) == 3
+    # The example is a template, so it must not claim to be bound to anything
+    # real -- but it must demonstrate both keys.
+    assert binding.asset is None
+    assert "machine_asset" in path.read_text()
+    assert "machine_serial" in path.read_text()
+
+
+def test_an_asset_number_with_letters_is_refused_with_the_reason():
+    """The SAS field is a 4-byte binary integer, so a letter cannot come off
+    the wire -- but a human typing the file can put one there."""
+    import json as _json
+    _lab = _lab_authority_or_skip()
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        bad = Path(d) / "t.json"
+        bad.write_text(_json.dumps({"machine_asset": "A246", "tickets": {}}))
+        with pytest.raises(ValueError, match="not a number"):
+            _lab.load_tickets(bad)
+
+
+# --- exception 0x3C, "operator changed options" -----------------------------
+#
+# The ONLY in-band signal that a cabinet's configuration moved. It was
+# recognised in the description table and dispatched nowhere, so a denomination
+# change could happen with nothing in the database marking when -- every credit
+# figure after it wrong by a factor, and no way to find the boundary later.
+
+def _interrogation_with_games(conn, games):
+    cur = conn.execute(
+        "INSERT INTO interrogations (started_at, reason) VALUES (?, ?)",
+        ("2026-11-02T00:00:00+00:00", "first_connect"))
+    iid = cur.lastrowid
+    for number, cfg in games.items():
+        cols = ", ".join(cfg)
+        marks = ", ".join("?" for _ in cfg)
+        conn.execute(
+            f"INSERT INTO interrogation_games (interrogation_id, game_number, {cols}) "
+            f"VALUES (?, ?, {marks})",
+            (iid, number, *cfg.values()))
+    conn.commit()
+    return iid
+
+
+def test_game_config_diff_reports_a_denomination_change():
+    conn = make_db()
+    a = _interrogation_with_games(conn, {1: {"denomination": 1, "max_bet": 5}})
+    b = _interrogation_with_games(conn, {1: {"denomination": 25, "max_bet": 5}})
+    assert game_config_diff(conn, a, b) == [(1, "denomination", 1, 25)]
+
+
+def test_game_config_diff_reports_a_game_appearing_or_disappearing():
+    """An operator enabling a game is exactly what 0x3C announces."""
+    conn = make_db()
+    a = _interrogation_with_games(conn, {1: {"denomination": 1}})
+    b = _interrogation_with_games(conn, {1: {"denomination": 1},
+                                         2: {"denomination": 1}})
+    assert game_config_diff(conn, a, b) == [(2, "game", "absent", "present")]
+    assert game_config_diff(conn, b, a) == [(2, "game", "present", "absent")]
+
+
+def test_game_config_diff_ignores_a_field_the_machine_stopped_answering():
+    """§4.4 lets a machine refuse LP 0x53 for a game. A refusal is not a
+    change, and treating it as one would announce a reconfiguration every time
+    a poll was dropped."""
+    conn = make_db()
+    a = _interrogation_with_games(conn, {1: {"denomination": 1, "max_bet": 5}})
+    b = _interrogation_with_games(conn, {1: {"denomination": 1}})
+    assert game_config_diff(conn, a, b) == []
+
+
+def test_game_config_diff_ignores_relabelled_names():
+    """game_name and paytable_name are labels; a vendor may re-word one
+    without changing anything that affects accounting."""
+    conn = make_db()
+    a = _interrogation_with_games(conn, {1: {"denomination": 1,
+                                             "game_name": "Lucky 7"}})
+    b = _interrogation_with_games(conn, {1: {"denomination": 1,
+                                             "game_name": "Lucky Seven"}})
+    assert game_config_diff(conn, a, b) == []
+
+
+def test_only_denomination_paytable_and_percentage_open_an_epoch():
+    """max_bet moving is worth recording and does not rescale a meter.
+    Denomination does: SAS counts credits, so 1000 credits at $0.01 and at
+    $0.25 are the same reading and twenty-four dollars apart."""
+    from examples.sql_poll_logger import EPOCH_WORTHY_CONFIG_FIELDS
+    assert set(EPOCH_WORTHY_CONFIG_FIELDS) == {
+        "denomination", "paytable_id", "base_percentage"}
+    assert "max_bet" not in EPOCH_WORTHY_CONFIG_FIELDS
+    assert "game_options" not in EPOCH_WORTHY_CONFIG_FIELDS
+
+
+def test_0x3C_sets_the_pending_flag_rather_than_re_reading_inline():
+    """~150 long polls, and the dispatcher can be running from inside a meter
+    sweep -- the same reason the comms-restored interrogation is deferred."""
+    conn = make_db()
+    state = PollState()
+    _dispatch_exception(ScriptedClient([make_meters()]), conn,
+                        "2026-11-02T00:00:00+00:00", 0x3C, state=state)
+    assert state.options_change_pending == "2026-11-02T00:00:00+00:00"
+    row = conn.execute(
+        "SELECT exception_code FROM machine_events ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row[0] == 0x3C, "the exception itself must still be recorded"
+
+
+# --- real time event mode left on by an unclean stop ------------------------
+#
+# Seen on the gateway 2026-11-02: a soak stopped with SIGTERM, the service
+# started, and its interrogation logged "exception 0x01 during interrogation:
+# unknown/unassigned code 0x01" three times. The teardown's LP 0x0E can itself
+# be pre-empted by a queued event (§12.3), and the service unit's ExecStartPre
+# -- which exists for exactly this -- had failed too.
+
+def test_rte_looks_stuck_only_for_an_address_table_a1_leaves_unassigned():
+    from examples.sql_poll_logger import rte_looks_stuck
+    assert rte_looks_stuck(0x01, 1)      # the case we actually hit
+    assert rte_looks_stuck(0x10, 16)
+    assert not rte_looks_stuck(0x00, 1)  # "no activity" is a real answer
+    assert not rte_looks_stuck(0x7E, 1)  # a real exception from address 1
+    assert not rte_looks_stuck(0x01, 2)  # not THIS machine's address
+    # Address 17+ collides with real Table A-1 codes and cannot be told apart
+    # from one byte. Claiming otherwise would disable RTE on a live event.
+    assert not rte_looks_stuck(0x11, 17)
+    assert not rte_looks_stuck(0x14, 20)
+
+
+class _StuckRTEClient(ScriptedClient):
+    """Answers general polls with its own address until RTE is disabled."""
+
+    def __init__(self, *a, address=1, recovers=True, **kw):
+        super().__init__(*a, **kw)
+        self.address = address
+        self._stuck = True
+        self._recovers = recovers
+        self.disabled = []
+
+    def general_poll(self):
+        return self.address if self._stuck else 0x00
+
+    def enable_real_time_events(self, on):
+        self.disabled.append(on)
+        if on is False and self._recovers:
+            self._stuck = False
+
+
+def test_a_stuck_rte_is_detected_and_cleared_before_anything_else_reads():
+    from examples.sql_poll_logger import recover_stuck_rte
+    client = _StuckRTEClient([make_meters()], address=1)
+    note, code = recover_stuck_rte(client)
+    assert client.disabled == [False], "it must send LP 0x0E disable, once"
+    assert "had been left ON" in note
+    assert code == 0x00
+
+
+def test_a_stuck_rte_that_will_not_clear_says_to_power_cycle():
+    """§12 requires the ordinary mode on power up, so that is the last
+    resort and the message has to name it."""
+    from examples.sql_poll_logger import recover_stuck_rte
+    client = _StuckRTEClient([make_meters()], address=1, recovers=False)
+    note, code = recover_stuck_rte(client)
+    assert "STILL on" in note and "power-cycle" in note
+    assert code is None
+
+
+def test_an_ordinary_cabinet_is_left_alone():
+    """Disabling RTE on a machine that is not in it would be a side effect on
+    a probe, and on a run that WANTED rte it would fight its own startup."""
+    from examples.sql_poll_logger import recover_stuck_rte
+    client = _StuckRTEClient([make_meters()], address=1)
+    client._stuck = False
+    note, code = recover_stuck_rte(client)
+    assert client.disabled == []
+    assert note == "ordinary framing"
+    assert code == 0x00
+
+
+# --- exception 0x69, AFT transfer complete ---------------------------------
+#
+# §8.8 makes acknowledging mandatory: the machine reissues 0x69 every 15
+# seconds until the host polls for and acknowledges the completion status --
+# 15.2s measured on an EGT Premier. And 0x69 is a PRIORITY exception, so it
+# bypasses §2.2.1's queue and arrives ahead of everything waiting. The poller
+# did not handle it at all until 2026-11-03.
+
+class _AFTClient(ScriptedClient):
+    def __init__(self, *a, result=None, fails=False, **kw):
+        super().__init__(*a, **kw)
+        self.interrogations = []
+        self._fails = fails
+        self._result = result
+
+    def aft_interrogate_transfer(self, index=0x00, *, acknowledge=True):
+        self.interrogations.append((index, acknowledge))
+        if self._fails:
+            raise SASTimeoutError("no answer")
+        return self._result
+
+
+def _aft_result(**over):
+    from saspy.models import AftTransferResult
+    import inspect
+    fields = {f: 0 for f in inspect.signature(AftTransferResult).parameters}
+    for text in ("transaction_id", "transaction_date", "transaction_time",
+                 "expiration"):
+        fields[text] = ""
+    fields.update(over)
+    return AftTransferResult(**fields)
+
+
+def test_0x69_is_acknowledged_with_transfer_code_FF():
+    """FE reads the same status WITHOUT acknowledging and does NOT stop the
+    reissue, so it is not what this wants."""
+    conn = make_db()
+    client = _AFTClient([make_meters()],
+                        result=_aft_result(transfer_status=0x00,
+                                           cashable_amount=991111,
+                                           transaction_id="NIMA123"))
+    _dispatch_exception(client, conn, "2026-11-03T00:00:00+00:00", 0x69,
+                        state=PollState())
+    assert client.interrogations == [(0x00, True)], (
+        "0x69 must be acknowledged, not merely read")
+    row = conn.execute(
+        "SELECT transfer_status, cashable_amount, transaction_id "
+        "FROM aft_transfer_completions").fetchone()
+    assert row == (0x00, 991111, "NIMA123")
+
+
+def test_a_failed_acknowledgement_is_recorded_and_says_what_follows():
+    """An unacknowledged transfer installs a permanent 15-second beat at the
+    FRONT of the exception stream. Silence about that would be the worst
+    outcome, because the symptom appears somewhere else entirely."""
+    conn = make_db()
+    client = _AFTClient([make_meters()], fails=True)
+    _dispatch_exception(client, conn, "2026-11-03T00:00:00+00:00", 0x69,
+                        state=PollState())
+    row = conn.execute(
+        "SELECT poll_name, error_type FROM poll_errors").fetchone()
+    assert row[0] == "aft_interrogate_transfer"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM aft_transfer_completions").fetchone()[0] == 0
+
+
+def test_the_amounts_recorded_are_the_machine_s_not_the_request_s():
+    """A partial transfer is the case where the two differ, and the
+    difference is the whole reason to read it back."""
+    conn = make_db()
+    client = _AFTClient([make_meters()],
+                        result=_aft_result(transfer_status=0x00,
+                                           cashable_amount=500,
+                                           nonrestricted_amount=0))
+    _dispatch_exception(client, conn, "2026-11-03T00:00:00+00:00", 0x69,
+                        state=PollState())
+    row = conn.execute(
+        "SELECT cashable_amount, nonrestricted_amount "
+        "FROM aft_transfer_completions").fetchone()
+    assert row == (500, 0)
+
+
+def test_0x69_is_still_recorded_as_a_machine_event():
+    conn = make_db()
+    client = _AFTClient([make_meters()], result=_aft_result())
+    _dispatch_exception(client, conn, "2026-11-03T00:00:00+00:00", 0x69,
+                        state=PollState())
+    row = conn.execute(
+        "SELECT exception_code, description FROM machine_events").fetchone()
+    assert row[0] == 0x69
+    assert "AFT transfer complete" in row[1]
+
+
+# --- the product must not depend on lab scaffolding ---------------------
+
+def test_the_poller_imports_NOTHING_from_the_lab_ticket_authority():
+    """ticket_lab_authority.py exists only because the lab had no server to
+    issue validation numbers. On a floor the numbers are ALWAYS issued by the
+    server, so the gateway must never need that module.
+
+    It did. The poller imported NOT_IN_SYSTEM, TRANSFER_CODES and describe()
+    from it -- Tables 15.12 and 15.12c, spec tables that were simply written
+    in the wrong file. The effect was that the public mirror could not drop
+    the scaffolding without breaking the gateway, and a reader would
+    reasonably conclude the product could mint its own tickets.
+
+    The remaining reference is correct and must stay: a LAZY import inside
+    the --lab-ticket-authority branch, which is the one place that genuinely
+    needs the scaffolding. So the property is not "the name never appears" --
+    that would forbid the flag working -- it is "nothing at module level
+    needs it", checked with ast rather than a substring, because a substring
+    guard here would match this very docstring.
+    """
+    import ast
+    root = Path(__file__).resolve().parent.parent
+    tree = ast.parse((root / "examples" / "sql_poll_logger.py").read_text())
+    for node in tree.body:                      # module level only
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [node.module or ""]
+        else:
+            continue
+        for name in names:
+            assert "ticket_lab_authority" not in name, (
+                f"the product imports lab scaffolding at module level: {name}")
+            assert "survey_store" not in name, (
+                f"the product imports a survey tool at module level: {name}")
+
+
+def test_the_spec_tables_are_in_the_library():
+    from saspy.constants import (
+        TICKET_NOT_IN_SYSTEM, TICKET_REDEMPTION_CATEGORY,
+        TICKET_REDEMPTION_STATUS, TICKET_TRANSFER_CODES,
+        describe_redemption_status, redemption_category,
+    )
+    assert TICKET_TRANSFER_CODES == {"cashable": 0x00, "restricted": 0x01,
+                                     "nonrestricted": 0x02}
+    assert TICKET_NOT_IN_SYSTEM == 0x82
+    assert redemption_category(0x02) == 0b000
+    assert "SUCCESS" in describe_redemption_status(0x00)
+    assert TICKET_REDEMPTION_CATEGORY[0b100] == "FAILED"
+    assert TICKET_REDEMPTION_STATUS  # non-empty
+
+
+def test_0x82_means_DIFFERENT_THINGS_in_each_direction():
+    """The byte is shared; the meaning is not, and conflating them was a
+    FIX that introduced a bug.
+
+    0x82 was missing from TICKET_REDEMPTION_STATUS until 2026-11-06. The
+    fix then saw TICKET_NOT_IN_SYSTEM = 0x82 three lines above and folded
+    that meaning in -- but TICKET_NOT_IN_SYSTEM is what the HOST sends in
+    LP 0x71 to refuse a ticket it does not recognise (§15.12a), while that
+    table is what the MACHINE reports back (§15.12c), where 0x82 is "not a
+    valid transfer function".
+
+    So `describe_redemption_status(0x82)` told an operator the host had
+    not recognised the ticket, when the machine had actually said the
+    transfer function was invalid. This test previously ASSERTED that
+    behaviour, which is why it survived.
+    """
+    from saspy import constants as C
+    assert 0x82 in C.TICKET_REDEMPTION_STATUS
+    assert "unassigned" not in C.describe_redemption_status(0x82)
+    assert "not a valid transfer function" in C.describe_redemption_status(0x82)
+    # The host-side constant keeps its own meaning, documented beside it.
+    assert C.TICKET_NOT_IN_SYSTEM == 0x82
+
+
+def test_the_machine_side_table_is_COMPLETE_against_section_15_12c():
+    """ticket_history.py and ticket_redeem.py each carried a private copy
+    that was MORE complete than the canonical table -- they had 0x83 and
+    0x89 and it did not. Three copies, and the one everything imported was
+    the thinnest."""
+    from saspy import constants as C
+    for code in (0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B):
+        assert code in C.TICKET_REDEMPTION_STATUS, f"0x{code:02X} missing"
+
+
+def test_every_status_code_resolves_to_a_known_category():
+    """A status whose category is unknown prints 'unknown category: ...',
+    which tells an operator nothing about whether the ticket was paid."""
+    from saspy import constants as C
+    for code in C.TICKET_REDEMPTION_STATUS:
+        assert (code >> 5) in C.TICKET_REDEMPTION_CATEGORY, hex(code)
+
+
+def test_is_placeholder_identifier_folds_case_and_whitespace():
+    """Call sites were each writing `v.lower() in {p.lower() for p in ...}`,
+    which is a comparison anyone can get subtly wrong once."""
+    from saspy.constants import is_placeholder_identifier as ph
+    for absent in ("", " ", "0", "N/A", "n/a", " none ", "UNKNOWN", "-", None):
+        assert ph(absent) is True, repr(absent)
+    # Three shapes a cabinet really reports: plain digits, zero-padded, and
+    # a letter prefix. The values are INVENTED. They used to be serials
+    # copied off real cabinets, which published floor identifiers through a
+    # mirrored test for no gain: is_placeholder_identifier is a membership
+    # test against PLACEHOLDER_IDENTIFIERS, so what it needs is any value
+    # outside that set, not a provably genuine one.
+    for genuine in ("20884471", "000471238", "K072418596"):
+        assert ph(genuine) is False, genuine
+
+
+def test_a_FAILED_sweep_still_files_the_events_it_collected():
+    """The drain used to run only on the happy path.
+
+    A failed sweep returned straight out of the cycle, past
+    drain_rte_events(). The events were not lost -- the client holds them in
+    its pending list -- but they waited for the NEXT cycle and were written
+    with that cycle's timestamp, up to a full sweep later.
+
+    The failure that skips the drain is a §12.3 pre-emption burst, and a
+    pre-emption burst is by definition the moment the machine has the most
+    queued. So the one cycle that collected the most events was the one that
+    filed them last and timed them worst. The operator's button-pressing on
+    2026-11-06T21:02 is exactly that case: two polls each burned all 24
+    reissues.
+    """
+    import ast
+    root = Path(__file__).resolve().parent.parent
+    tree = ast.parse((root / "examples" / "sql_poll_logger.py").read_text())
+
+    handler = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        for h in node.handlers:
+            name = getattr(h.type, "id", None)
+            if name == "_MeterPollFailure":
+                handler = h
+    assert handler is not None, "the failure handler moved or was renamed"
+
+    body = ast.dump(ast.Module(body=handler.body, type_ignores=[]))
+    assert "drain_rte_events" in body, (
+        "a failed sweep returns without filing the events it collected")
+
+    # And it must file them under their own arrival time, not the cycle's.
+    assert "arrived_at" in body, (
+        "stranded events must keep the time they came off the wire")
+
+
+# --- the live stream self-audit (§12.5.3) --------------------------------
+
+def _gap_db():
+    conn = make_db()
+    return conn
+
+
+def test_a_clean_chain_of_game_starts_records_nothing():
+    """§12.5.3 puts the coin-in meter inside the game-start event, AFTER the
+    wager, so two consecutive starts differ by exactly the later wager."""
+    from examples.sql_poll_logger import _check_stream_continuity
+    conn = _gap_db()
+    state = PollState()
+    # Each start's coin_in is the PREVIOUS one plus THIS game's wager,
+    # because §12.5.3's meter is read after the wager is taken. Getting
+    # that backwards is the obvious mistake and this fixture made it once.
+    for coin_in, wager in ((10_000, 100), (10_250, 250), (10_350, 100)):
+        _check_stream_continuity(conn, "2026-11-06T12:00:00", state,
+                                 {"total_coin_in": coin_in,
+                                  "wager_cents": wager})
+    assert conn.execute("SELECT count(*) FROM stream_gaps").fetchone()[0] == 0
+    assert state.stream_gaps == 0
+
+
+def test_a_MISSING_game_start_is_caught_and_quantified_immediately():
+    """The whole point of running this live. rte_reconcile has had the same
+    arithmetic since it was written and found nine lost starts on
+    2026-11-06 -- THREE HOURS LATE, because nothing ran it until the
+    operator asked by hand."""
+    from examples.sql_poll_logger import _check_stream_continuity
+    conn = _gap_db()
+    state = PollState()
+    _check_stream_continuity(conn, "2026-11-06T12:00:00", state,
+                             {"total_coin_in": 10_000, "wager_cents": 100})
+    # 180 credits of wagering happened; this game only accounts for 20.
+    _check_stream_continuity(conn, "2026-11-06T12:00:30", state,
+                             {"total_coin_in": 10_200, "wager_cents": 20})
+    row = conn.execute("SELECT unexplained_credits, previous_coin_in, "
+                       "this_coin_in, this_wager FROM stream_gaps").fetchone()
+    assert row == (180, 10_000, 10_200, 20)
+    assert state.stream_gaps == 1
+    assert state.stream_credits_lost == 180
+
+
+def test_a_FALLING_coin_in_meter_is_not_reported_as_a_loss():
+    """It only ever rises, so a fall is a RAM clear or a bad read. Calling
+    it a lost event would cry wolf on the day a technician clears the
+    machine -- which this project has watched happen three times."""
+    from examples.sql_poll_logger import _check_stream_continuity
+    conn = _gap_db()
+    state = PollState()
+    _check_stream_continuity(conn, "2026-11-06T12:00:00", state,
+                             {"total_coin_in": 500_000, "wager_cents": 100})
+    _check_stream_continuity(conn, "2026-11-06T12:00:30", state,
+                             {"total_coin_in": 0, "wager_cents": 100})
+    assert conn.execute("SELECT count(*) FROM stream_gaps").fetchone()[0] == 0
+    # And the chain picks up from the new value rather than the old one.
+    _check_stream_continuity(conn, "2026-11-06T12:01:00", state,
+                             {"total_coin_in": 100, "wager_cents": 100})
+    assert conn.execute("SELECT count(*) FROM stream_gaps").fetchone()[0] == 0
+
+
+def test_the_first_start_of_a_run_cannot_be_a_gap():
+    """There is nothing to compare it against."""
+    from examples.sql_poll_logger import _check_stream_continuity
+    conn = _gap_db()
+    state = PollState()
+    _check_stream_continuity(conn, "2026-11-06T12:00:00", state,
+                             {"total_coin_in": 999_999, "wager_cents": 100})
+    assert conn.execute("SELECT count(*) FROM stream_gaps").fetchone()[0] == 0
+
+
+def test_a_start_with_no_coin_in_field_is_skipped_not_guessed():
+    from examples.sql_poll_logger import _check_stream_continuity
+    conn = _gap_db()
+    state = PollState()
+    _check_stream_continuity(conn, "2026-11-06T12:00:00", state, {})
+    _check_stream_continuity(conn, "2026-11-06T12:00:01", state, None)
+    assert conn.execute("SELECT count(*) FROM stream_gaps").fetchone()[0] == 0
+
+
+def test_the_chain_is_reset_across_a_comms_gap():
+    """The operator's own exemption: "unless gateway lost communication due
+    to a reboot or faulty sas cable". Play continues while nobody polls, so
+    the next start shows a coin-in jump that is NOT a lost event. Without
+    this the tool cries wolf after every reboot."""
+    root = Path(__file__).resolve().parent.parent
+    poller = (root / "examples" / "sql_poll_logger.py").read_text()
+    block = poller[:poller.index('reason="comms_restored"')]
+    tail = block[-900:]
+    assert "state.last_game_start_coin_in = None" in tail, (
+        "the continuity chain is not reset before the comms-restored "
+        "interrogation, so every reboot will report a phantom loss")
+
+
+# --- why a run ended ----------------------------------------------------
+#
+# Operator, 2026-11-08: "My real question is, why did the previous soak
+# ended, did it crash?" The poller printed its reason on every exit path
+# and printed it to a nohup log that was gone. The database outlived it.
+
+
+def test_the_schema_carries_a_lifecycle_table():
+    import sqlite3 as _sq
+    conn = _sq.connect(":memory:")
+    conn.executescript(SCHEMA)
+    cols = [r[1] for r in conn.execute(
+        "PRAGMA table_info(poller_lifecycle)").fetchall()]
+    assert cols, "poller_lifecycle is missing from SCHEMA"
+    for needed in ("at", "event", "reason", "pid", "argv"):
+        assert needed in cols, f"poller_lifecycle has no {needed} column"
+
+
+def test_a_stop_reason_is_written_to_the_database():
+    import sqlite3 as _sq
+    from sql_poll_logger import _record_lifecycle
+    conn = _sq.connect(":memory:")
+    conn.executescript(SCHEMA)
+    _record_lifecycle(conn, "started", reason=None)
+    _record_lifecycle(conn, "stopped", reason="signal 15")
+    rows = conn.execute(
+        "SELECT event, reason FROM poller_lifecycle ORDER BY id").fetchall()
+    assert rows == [("started", None), ("stopped", "signal 15")]
+
+
+def test_recording_a_lifecycle_row_can_NEVER_raise():
+    """A failure to record WHY a run ended must not become why it ends.
+
+    This is the one place in this file a bare except is correct, and the
+    test exists so nobody 'tidies' it into a crash on the way out.
+    """
+    import sqlite3 as _sq
+    from sql_poll_logger import _record_lifecycle
+    conn = _sq.connect(":memory:")   # no schema at all: the insert must fail
+    _record_lifecycle(conn, "stopped", reason="signal 15")
+
+
+def test_an_UNMATCHED_started_is_what_proves_a_kill():
+    """SIGKILL cannot write a row. That is the whole discriminator.
+
+    An OOM kill, a `kill -9` and a power cut all leave 'started' with no
+    'stopped'; every catchable ending leaves both. Nothing else in the
+    database distinguishes them.
+    """
+    import sqlite3 as _sq
+    from sql_poll_logger import _record_lifecycle
+    conn = _sq.connect(":memory:")
+    conn.executescript(SCHEMA)
+    _record_lifecycle(conn, "started", reason=None)      # killed here
+    _record_lifecycle(conn, "started", reason=None)
+    _record_lifecycle(conn, "stopped", reason="end of run")
+    unmatched = conn.execute(
+        "SELECT count(*) FROM poller_lifecycle WHERE event = 'started'"
+    ).fetchone()[0] - conn.execute(
+        "SELECT count(*) FROM poller_lifecycle WHERE event = 'stopped'"
+    ).fetchone()[0]
+    assert unmatched == 1
