@@ -5118,11 +5118,30 @@ def poll_and_log(
                       f"failed sweep were still filed")
         return
 
-    # Only a cycle that actually completed its sweep consumes the cadence. A
-    # failed poll must not: on a flapping link the next cycle would then be
-    # "not due", and C-7 could go unread indefinitely while the log filled
-    # with failures that each looked individually harmless.
-    if c7_due:
+    # Only a cycle that actually READ C-7 consumes the cadence. Two ways a
+    # due sweep does not happen, and both must leave the cadence alone:
+    #
+    # A FAILED POLL. On a flapping link the next cycle would be "not due",
+    # and C-7 could go unread indefinitely while the log filled with
+    # failures that each looked individually harmless. Handled by the early
+    # return above, which never reaches this line.
+    #
+    # A DRAIN. The call site reads `c7_due and not draining` -- under drain
+    # priority the sweep is deferred, not performed -- while this line read
+    # `c7_due` alone and stamped it as done. C-7 then waited another FULL
+    # interval: 300s on the floor unit. The operator's floor gateways run
+    # --drain-priority permanently, because it is what keeps real time
+    # events from being lost, so every busy spell silently cost a C-7 read
+    # and the next one was 5 minutes behind a machine that was mid-play.
+    # Worse, drains cluster: the cabinet is busiest exactly when C-7 keeps
+    # coming due, so the starvation repeats rather than averaging out.
+    #
+    # THE RULE THIS FILE KEEPS RELEARNING, now three times (the "22polls"
+    # label, the "60lp" label, and this): a cadence or a count must be
+    # computed from THE SAME EXPRESSION THE CALL SITE USES, never from a
+    # subset of its terms. `c7_due` is the decision to sweep; `c7_due and
+    # not draining` is the sweep. Only the second one happened.
+    if c7_due and not draining:
         state.last_c7_sweep = mono_now
 
     # A gap long enough for the cable to have moved. Run here, after the

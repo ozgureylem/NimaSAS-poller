@@ -4446,3 +4446,101 @@ def test_an_UNMATCHED_started_is_what_proves_a_kill():
         "SELECT count(*) FROM poller_lifecycle WHERE event = 'stopped'"
     ).fetchone()[0]
     assert unmatched == 1
+
+
+# --- The C-7 cadence and drain priority ---------------------------------
+#
+# Found 2026-11-11 while explaining why the lab sweep varies between 40s and
+# 64s. The call site defers the C-7 sweep under drain priority
+# (`c7_due and not draining`) but the bookkeeping consumed the cadence on
+# `c7_due` alone, so a deferred sweep was recorded as a completed one and
+# C-7 waited another FULL interval.
+#
+# It is not academic. The operator's floor gateways run --drain-priority
+# permanently, because it is what keeps real time events from being lost,
+# and a lab cycle that same night reached 48% of the event budget against a
+# 50% drain threshold. Drains also cluster: the cabinet is busiest exactly
+# when C-7 keeps coming due, so the starvation repeats rather than
+# averaging out.
+
+def _draining_state():
+    """A state the drain-priority rule will act on: above
+    DRAIN_ENTER_FRACTION of the collectable budget."""
+    from sql_poll_logger import DRAIN_ENTER_FRACTION
+    s = PollState()
+    s.last_capacity = 3.3
+    s.last_event_rate = 3.3 * DRAIN_ENTER_FRACTION + 0.1
+    return s
+
+
+def test_a_drained_cycle_does_not_consume_the_c7_cadence():
+    """Deferring the sweep and recording it as done are different things.
+
+    Without this, a busy spell costs a C-7 read AND pushes the next one a
+    full interval away -- 300s on the floor unit, while the cabinet is
+    mid-play and the extended meters are most worth having.
+    """
+    conn = make_db()
+    clock = FakeClock()
+    state = _draining_state()
+    client = ScriptedClient([make_meters()], table_c7_values={0x0000: 4290})
+
+    poll_and_log(client, conn, state, HistoryConfig(mode="ring"),
+                 monotonic_fn=clock, table_c7_interval=3600,
+                 drain_priority=True)
+
+    assert state.draining, "the fixture must actually trigger a drain"
+    row = conn.execute(
+        "SELECT c7_total_coin_in_credits FROM meters_current").fetchone()
+    assert row[0] is None, "the sweep should have been deferred"
+    assert state.last_c7_sweep is None, \
+        "a deferred sweep must not consume the cadence"
+
+
+def test_c7_is_read_on_the_first_quiet_cycle_after_a_drain():
+    """The cadence survives the drain, so the read happens as soon as there
+    is room for it rather than one interval later."""
+    conn = make_db()
+    clock = FakeClock()
+    state = _draining_state()
+    history = HistoryConfig(mode="append")
+    client = ScriptedClient([make_meters(), make_meters()],
+                            table_c7_values={0x0000: 4290})
+
+    # Busy: deferred.
+    poll_and_log(client, conn, state, history, monotonic_fn=clock,
+                 table_c7_interval=3600, drain_priority=True)
+    # Quiet again, and only one second later -- far inside the interval.
+    # Both figures, not just the rate: the cycle overwrites last_capacity
+    # with what it measured, and a zero capacity leaves the hysteresis in
+    # DRAIN_LEAVE_FRACTION unable to see the machine go quiet.
+    state.last_event_rate, state.last_capacity = 0.0, 3.3
+    clock.t += 1.0
+    poll_and_log(client, conn, state, history, monotonic_fn=clock,
+                 table_c7_interval=3600, drain_priority=True)
+
+    rows = [r[0] for r in conn.execute(
+        "SELECT c7_total_coin_in_credits FROM meters_history ORDER BY id")]
+    assert rows == [None, 4290], rows
+    assert state.last_c7_sweep is not None
+
+
+def test_an_undrained_cycle_still_consumes_the_cadence():
+    """The fix must not turn the cadence off. With drain priority enabled
+    but the machine quiet, the sweep runs and the interval applies."""
+    conn = make_db()
+    clock = FakeClock()
+    state = PollState()
+    history = HistoryConfig(mode="append")
+    client = ScriptedClient([make_meters(), make_meters()],
+                            table_c7_values={0x0000: 4290})
+
+    poll_and_log(client, conn, state, history, monotonic_fn=clock,
+                 table_c7_interval=3600, drain_priority=True)
+    clock.t += 1.0
+    poll_and_log(client, conn, state, history, monotonic_fn=clock,
+                 table_c7_interval=3600, drain_priority=True)
+
+    rows = [r[0] for r in conn.execute(
+        "SELECT c7_total_coin_in_credits FROM meters_history ORDER BY id")]
+    assert rows == [4290, None], "second cycle is inside the interval"
