@@ -4544,3 +4544,87 @@ def test_an_undrained_cycle_still_consumes_the_cadence():
     rows = [r[0] for r in conn.execute(
         "SELECT c7_total_coin_in_credits FROM meters_history ORDER BY id")]
     assert rows == [4290, None], "second cycle is inside the interval"
+
+
+# --- A24: what a cancelled-credits handpay is made of -------------------
+#
+# 2026-11-11, two cashouts 31 seconds apart on the lab cabinet: 7,167.17
+# cashable printed a voucher, 2,761.41 derived from a Promotional Voucher
+# became a handpay. 2.6x smaller, same 20,000 printer limit. Credit type,
+# not amount.
+#
+# The operator: "attendant has no way to know if it's a promo credit or
+# cash credit. And handpays are paid in cash, so indirectly we're letting
+# the customer turn a promo ticket into cash even without visiting
+# cashdesk and without anyone's consent."
+
+def _composition_db(rows):
+    """meters_history with just the columns handpay_composition reads."""
+    conn = make_db()
+    for i, (total, restricted, promo_in) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO meters_history (polled_at, c7_current_credits, "
+            "c7_current_restricted_credits, c7_nonrestricted_ticket_in_cents) "
+            "VALUES (?, ?, ?, ?)",
+            (f"2026-11-11T22:0{i}:00+00:00", total, restricted, promo_in))
+    conn.commit()
+    return conn
+
+
+def test_promotional_money_that_just_arrived_is_flagged_as_an_UPPER_BOUND():
+    """The wording matters more than the number. The host cannot measure
+    how much promotional credit is in a handpay -- no balance meter
+    separates nonrestricted promotional from cashable -- so it must not
+    imply it can."""
+    from sql_poll_logger import handpay_composition
+    conn = _composition_db([(500_000, 0, 1_000_000),
+                            (700_000, 0, 1_214_141)])   # +214,141 promo in
+    text = " ".join(handpay_composition(conn))
+    assert "214141" in text, text
+    assert "upper bound" in text.lower(), "must not read as a measurement"
+    assert "MAY be part of this handpay" in text, text
+
+
+def test_the_restricted_portion_is_reported_as_READ_not_inferred():
+    """Restricted IS separable -- c7_current_restricted_credits exists --
+    so that one number is a measurement and should say so."""
+    from sql_poll_logger import handpay_composition
+    conn = _composition_db([(900_000, 773_639, 0), (900_000, 773_639, 0)])
+    text = " ".join(handpay_composition(conn))
+    assert "773639" in text
+    assert "c7_current_restricted_credits" in text, \
+        "name the meter, so the number can be checked against the cabinet"
+
+
+def test_no_promotional_arrival_still_warns_that_absence_proves_nothing():
+    """THE TRAP THIS EXISTS TO AVOID. An attendant told 'no promo detected'
+    is worse off than one told nothing, because nonrestricted promotional
+    is invisible in the balance by design. Silence about it must never
+    read as a clean bill."""
+    from sql_poll_logger import handpay_composition
+    conn = _composition_db([(900_000, 0, 5_000), (900_000, 0, 5_000)])
+    lines = handpay_composition(conn)
+    text = " ".join(lines)
+    assert "NONRESTRICTED PROMOTIONAL money arrived" not in text
+    assert "Absence of the line above is not evidence" in text, text
+
+
+def test_it_says_nothing_at_all_when_the_meters_were_never_read():
+    """--skip-table-c7-sweep leaves every column here NULL. A handpay line
+    with no composition is correct; an invented one is not."""
+    from sql_poll_logger import handpay_composition
+    conn = _composition_db([(None, None, None), (None, None, None)])
+    assert handpay_composition(conn) == []
+
+
+def test_a_jackpot_handpay_gets_no_composition_block():
+    """Level 0x00 is the cabinet paying a win. Its composition is not in
+    question and the extra lines would be noise on the one event type that
+    is already unambiguous."""
+    from sql_poll_logger import (HANDPAY_LEVEL_JACKPOT,
+                                 HANDPAY_LEVEL_CANCELLED_CREDITS)
+    src = (ROOT / "examples" / "sql_poll_logger.py").read_text()
+    assert HANDPAY_LEVEL_JACKPOT == 0x00
+    assert HANDPAY_LEVEL_CANCELLED_CREDITS == 0x80
+    assert "if info.level == HANDPAY_LEVEL_CANCELLED_CREDITS:" in src, \
+        "the block must be gated on cancelled credits, not printed always"

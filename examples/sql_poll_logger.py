@@ -3166,6 +3166,88 @@ def _capture_handpay(client, conn: sqlite3.Connection, now: str,
               f"amount={info.amount} partial_pay={info.partial_pay} "
               f"reset_id=0x{info.reset_id:02X}; the queue entry is now reported, "
               f"so the 15-second 0x51 reissue should stop")
+        # Only for CANCELLED CREDITS (0x80). A jackpot is the cabinet paying
+        # a win and its composition is not in question; a cashout that fell
+        # back is the player's own balance leaving as cash, and that is the
+        # one an attendant has to judge with nothing to judge it on.
+        if info.level == HANDPAY_LEVEL_CANCELLED_CREDITS:
+            for line in handpay_composition(conn):
+                print(line)
+
+
+# A24: WHAT A HANDPAY IS MADE OF, AND WHAT CANNOT BE KNOWN
+#
+# Measured 2026-11-11. Two cashouts on the lab cabinet, 31 seconds apart:
+# 7,167.17 cashable printed a Cashable Voucher, and 2,761.41 derived from a
+# Promotional Voucher became a handpay -- 2.6x SMALLER, under the same
+# 20,000 printer limit. Credit type, not amount.
+#
+# The operator's objection, which is the reason this function exists:
+#
+#   "when it locks up for handpay, attendant has no way to know if it's a
+#    promo credit or cash credit. And handpays are paid in cash, so
+#    indirectly we're letting the customer turn a promo ticket into cash
+#    even without visiting cashdesk and without anyone's consent."
+#
+# He is right, and SAS cannot fix it. The cabinet keeps exactly two balance
+# meters -- c7_current_credits and c7_current_restricted_credits -- so
+# RESTRICTED is separable and NONRESTRICTED PROMOTIONAL is not. The machine
+# is not withholding it; it stopped distinguishing the moment the credits
+# landed, because by its own rules nonrestricted promotional IS cash.
+#
+# So this reports three things and is careful about which is which: the
+# restricted portion, which is READ; the most recent promotional money seen
+# arriving, which is a POINTER and an upper bound, not a measurement; and
+# the limitation itself, because an attendant told "no promo detected" would
+# be worse off than one told nothing.
+#
+# The real control is upstream and is recorded in A24: promotions issued as
+# RESTRICTED print "Playable Only" and never reach this path at all.
+def handpay_composition(conn: sqlite3.Connection) -> list[str]:
+    """What the host can say about the money in a cancelled-credits handpay.
+
+    Best effort from meters already stored. Returns display lines, empty if
+    nothing is known -- silence is correct when there is nothing to add.
+    """
+    out: list[str] = []
+    try:
+        row = conn.execute(
+            "SELECT c7_current_credits, c7_current_restricted_credits "
+            "FROM meters_history "
+            "WHERE c7_current_restricted_credits IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return out
+    if row and row[1] is not None:
+        total, restricted = row[0], row[1]
+        if restricted:
+            out.append(f"    RESTRICTED portion of the balance: {restricted} "
+                       f"(read from c7_current_restricted_credits)")
+        else:
+            out.append("    restricted portion: 0 -- so none of this is "
+                       "'Playable Only' money")
+        if total is not None:
+            out.append(f"    balance at that reading: {total}")
+    try:
+        promo = conn.execute(
+            "SELECT polled_at, c7_nonrestricted_ticket_in_cents FROM meters_history "
+            "WHERE c7_nonrestricted_ticket_in_cents IS NOT NULL "
+            "ORDER BY id DESC LIMIT 2").fetchall()
+    except sqlite3.Error:
+        promo = []
+    if len(promo) == 2 and None not in (promo[0][1], promo[1][1]):
+        moved = promo[0][1] - promo[1][1]
+        if moved > 0:
+            out.append(f"    ** NONRESTRICTED PROMOTIONAL money arrived "
+                       f"recently: {moved} cents, by {promo[0][0]}. It is "
+                       f"indistinguishable from cash in the balance, so it "
+                       f"MAY be part of this handpay. An upper bound, not a "
+                       f"measurement.")
+    if out:
+        out.append("    Nonrestricted promotional credits cannot be separated "
+                   "from cashable in any SAS balance meter (A24). Absence of "
+                   "the line above is not evidence that none is present.")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3195,6 +3277,14 @@ def _capture_handpay(client, conn: sqlite3.Connection, now: str,
 # features inherit that binding and that expiry for free and cannot be
 # switched on against a floor machine by a stray flag in a unit file.
 # deploy/nimasas-poller.service carries none of the three.
+
+# LP 0x1B (§7.8, Table 7.8) Level. MANUAL.md §7.4 and amendment A18:
+# 0x80 is cancelled credits -- a cashout that fell back to a handpay --
+# and 0x00 is a win the cabinet wants an attendant to pay. The two need
+# different handling, because only the first has a composition anyone can
+# argue about (A24).
+HANDPAY_LEVEL_JACKPOT = 0x00
+HANDPAY_LEVEL_CANCELLED_CREDITS = 0x80
 
 LAB_AUTO_HANDPAY_MIN_SECONDS = 60.0
 # Below a minute you are not clearing an unattended lockup, you are racing the
