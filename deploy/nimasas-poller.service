@@ -50,6 +50,20 @@ WorkingDirectory=/home/nima-sas/NimaSAS
 # it: §12.2's 40ms relaxation buys nothing, because §12.3 delivers at most one
 # event per poll and 200ms already allows five a second against a measured
 # play rate near 0.85.
+# DRAIN PRIORITY IS NOT LISTED BELOW BECAUSE IT IS NOW THE DEFAULT.
+# Since 2026-11-11, at the operator's instruction -- "drain priority must
+# be on by default (sas poller, not only during soak). It really helps
+# losing less of rte." Above 50% of the collectable event budget the
+# optional sweeps are deferred and the poll slots go to general polls.
+#
+# What is deferred is 39 single meters, 13 Table C-7 chunks and 12
+# validation polls, every one a CUMULATIVE counter that reads the same a
+# minute later. What it protects is real time events, and a lost event is
+# gone for good: no meter carries a player's turnover (HANDOVER §19, A14).
+# Coin in, coin out and games played are still read every cycle.
+#
+# --no-drain-priority turns it off, and exists for measuring what the
+# deferral is worth. It does not belong on a floor gateway.
 ExecStart=/usr/bin/python3 /home/nima-sas/NimaSAS/examples/sql_poll_logger.py \
     /home/nima-sas/gateway.ini \
     --db /home/nima-sas/NimaSAS/gateway.sqlite3 \

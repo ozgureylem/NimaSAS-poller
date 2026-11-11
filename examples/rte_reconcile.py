@@ -1682,12 +1682,78 @@ def check_payout_identity(conn, events, since, until,
             # The branch below already knew this -- "a meter that did not
             # move cannot tell them apart" -- but only said it about
             # candidates that CLOSED. The ranking never applied it.
-            differing = cols_of.get(a, set()) ^ cols_of.get(b, set())
+            ca, cb = cols_of.get(a, set()), cols_of.get(b, set())
+            # A NESTED PAIR IS NEVER CORROBORATION, AT ANY SIZE.
+            #
+            # The guard above only skipped a pair whose extra meter was
+            # ZERO. On 2026-11-11 the extra meter had moved, by 205,000 --
+            # and the pair was accepted, because 205,000 is 0.986% of a
+            # 20.8M total and the bar is 1%.
+            #
+            # Read what that acceptance says. "coin_out" and "coin_out +
+            # jackpot" differ by precisely the meter whose inclusion is the
+            # question. Declaring them to agree is declaring that the thing
+            # under dispute is small, and then using that to decide the
+            # dispute. The two candidates are not two measurements; they are
+            # one measurement and one hypothesis about it.
+            #
+            # It inverted the finding. `best` anchored on coin_out alone and
+            # reported events EXCEEDING meters by 35,240, which the sign rule
+            # turns into "a payout meter this tool does not poll". Anchored
+            # on the one genuinely independent pair -- coin_out + jackpot
+            # against c7_total_won_credits, two different polls landing on
+            # the same number to 0.000% -- it is meters exceeding events by
+            # 169,760: game-end events were LOST. The second reading is the
+            # one 113,134 starts against 113,109 ends, 90 in-window buffer
+            # overflows and 29 continuity gaps all support.
+            #
+            # So: subset either way, skip. Only candidates neither of which
+            # contains the other can corroborate.
+            if ca <= cb or cb <= ca:
+                continue
+            differing = ca ^ cb
             if differing and all((d(c) or 0) == 0 for c in differing):
                 continue
             off = abs(totals[a] - totals[b])
             if off <= 0.01 * max(abs(totals[a]), abs(totals[b])):
                 agreeing.append((a, b, totals[a], totals[b], off))
+    # TIGHTEST AGREEMENT FIRST, because `best` takes agreeing[0].
+    #
+    # It used to take whichever pair the loops happened to emit first, which
+    # is candidate order, which is arbitrary with respect to the evidence. On
+    # 2026-11-11 that was the 0.986% pair while a 0.000% pair sat behind it.
+    # Two polls landing on the same number to three decimal places is a
+    # different quality of evidence from two landing within a percent, and
+    # the ranking has to say so.
+    agreeing.sort(key=lambda row: row[4] / max(abs(row[2]), abs(row[3]), 1))
+    # AND THEN KEEP ONLY NON-COMPETING PAIRS.
+    #
+    # Excluding nested pairs is not enough on its own. "coin_out" and
+    # "c7_total_won_credits" have disjoint columns -- genuinely different
+    # polls -- so the nesting rule lets them through, and on 2026-11-11 they
+    # sat 0.892% apart, inside the bar. The detector then reported BOTH
+    # "coin_out + jackpot agrees with c7" (0.000%) and "coin_out agrees with
+    # c7" (0.892%).
+    #
+    # Both cannot be true. "coin_out includes jackpots" and "coin_out and
+    # jackpot are separate meters" are COMPETING HYPOTHESES about one
+    # cabinet, and c7 is the independent measurement that decides between
+    # them. It cannot corroborate both; it matches one and misses the other
+    # by exactly the jackpot.
+    #
+    # So, tightest first, keep a pair only if neither of its candidates is
+    # nested with a candidate already kept. The 0.000% match takes
+    # "coin_out + jackpot", which makes "coin_out alone" a losing
+    # hypothesis rather than a second opinion.
+    kept, kept_cols = [], []
+    for row in agreeing:
+        a, b = row[0], row[1]
+        ca, cb = cols_of.get(a, set()), cols_of.get(b, set())
+        if any(c <= ca or ca <= c or c <= cb or cb <= c for c in kept_cols):
+            continue
+        kept.append(row)
+        kept_cols.extend((ca, cb))
+    agreeing = kept
     if agreeing:
         lines.append("")
         lines.append("  TWO INDEPENDENT METER PATHS AGREE on what was awarded:")

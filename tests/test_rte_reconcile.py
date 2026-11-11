@@ -1448,3 +1448,68 @@ def test_two_genuinely_different_polls_still_count_as_agreement(tmp_path):
     _, lines = check_payout_identity(conn, game_ends([450, 450]), None, None)
     text = " ".join(lines)
     assert "TWO INDEPENDENT METER PATHS AGREE" in text, text
+
+
+def test_a_nested_pair_is_not_corroboration_even_when_the_meter_MOVED(tmp_path):
+    """The 2026-11-11 case, and the other half of the unmoved-meter bug.
+
+    The earlier guard skipped a nested pair only when the extra meter was
+    ZERO. Here it moved -- by 205,000 on the real cabinet -- and the pair
+    was accepted anyway, because 205,000 is 0.986% of a 20.8M total and
+    the agreement bar is 1%.
+
+    Read what accepting it says. "coin_out" and "coin_out + jackpot"
+    differ by exactly the meter whose inclusion IS the question. Calling
+    them agreed is asserting that the disputed quantity is small and then
+    using that assertion to settle the dispute. They are not two
+    measurements; they are one measurement and one hypothesis about it.
+
+    Scaled down from the real numbers, same shape: the jackpot delta is
+    just under 1% of the award total.
+    """
+    conn = _payout_db(tmp_path, [
+        {"total_coin_out": 0, "total_jackpot": 0, "c7_total_won_credits": 0},
+        # coin out +1,000,000; jackpot +9,000 (0.89% of 1,009,000);
+        # c7 +1,009,000 == coin_out + jackpot, to the unit.
+        {"total_coin_out": 1_000_000, "total_jackpot": 9_000,
+         "c7_total_won_credits": 1_009_000},
+    ])
+    _, lines = check_payout_identity(conn, game_ends([500_000, 500_000]),
+                                     None, None)
+    text = " ".join(lines)
+    assert "TWO INDEPENDENT METER PATHS AGREE" in text, text
+    block = text.split("TWO INDEPENDENT METER PATHS AGREE")[1]
+    # The ONLY pair that may be named is the disjoint one. A nested pair
+    # would show the 0.89% agreement; the real one is 0.000%.
+    assert "0.892%" not in block and "0.890%" not in block, block
+    assert "off by 0 -- 0.000%" in block, block
+
+
+def test_the_tightest_agreement_anchors_the_comparison(tmp_path):
+    """`best` takes agreeing[0], so the ordering of that list is a finding,
+    not a detail.
+
+    It used to be whichever pair the nested loops emitted first -- candidate
+    order, which is arbitrary with respect to the evidence. Two polls landing
+    on the same number to three decimals is a different quality of evidence
+    from two landing within a percent, and the ranking has to say so.
+
+    Here the events are deliberately SHORT of the meters, which is the
+    lost-game-end signature. Anchoring on coin_out alone would understate
+    the residual and, on the real data, flipped its sign.
+    """
+    conn = _payout_db(tmp_path, [
+        {"total_coin_out": 0, "total_jackpot": 0, "c7_total_won_credits": 0},
+        {"total_coin_out": 1_000_000, "total_jackpot": 9_000,
+         "c7_total_won_credits": 1_009_000},
+    ])
+    # Events account for 1,004,000 -- 5,000 short of the 1,009,000 the two
+    # independent polls agree on, and 4,000 OVER coin_out alone.
+    _, lines = check_payout_identity(conn, game_ends([502_000, 502_000]),
+                                     None, None)
+    text = " ".join(lines)
+    if "closest was" in text:
+        anchor = text.split("closest was")[1][:200]
+        assert "1009000" in anchor or "corroborated" in anchor, anchor
+        assert "total_coin_out alone" not in anchor.split(",")[0], (
+            "anchored on the nested candidate again: " + anchor)

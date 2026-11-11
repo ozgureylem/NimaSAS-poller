@@ -167,15 +167,33 @@ def test_the_GROUPED_meters_are_never_deferred():
     assert "GROUPED_METER_POLL_COUNT = 8" in src
 
 
-def test_it_is_OFF_by_default():
-    """It changes what goes on the wire, which on this project is a
-    decision taken at start time and visible in the flag list."""
-    import argparse
+def test_it_is_ON_by_default_and_can_be_turned_off():
+    """Changed 2026-11-11, at the operator's instruction: "drain priority
+    must be on by default (sas poller, not only during soak). It really
+    helps losing less of rte."
+
+    It was off because it changes what goes on the wire, and this project
+    makes that kind of decision explicit at start time. The measurements
+    settled it the other way. What drain priority defers is 39 single
+    meters, 13 Table C-7 chunks and 12 validation polls -- every one of
+    them a CUMULATIVE counter that reads the same a minute later. What it
+    buys is poll slots during the only moments events are at risk, and a
+    lost real time event is gone for good: no meter carries a player's
+    turnover (HANDOVER §19, A14). An asymmetric trade, measured, so the
+    default follows the measurement.
+
+    Tested through the real parser rather than by matching source text.
+    The previous version grepped for `action="store_true"` and called it
+    a "cheap structural check"; build_parser() exists now, so the check
+    can be the actual behaviour.
+    """
     import sql_poll_logger as m
-    parser = argparse.ArgumentParser()
-    # cheap structural check rather than rebuilding the whole parser
-    src = (ROOT / "examples" / "sql_poll_logger.py").read_text()
-    assert '"--drain-priority",\n        action="store_true"' in src
+    parse = lambda *a: m.build_parser().parse_args(["gateway.ini", *a])
+    assert parse().drain_priority is True, "the DEFAULT must be on"
+    assert parse("--drain-priority").drain_priority is True, \
+        "the explicit flag must still work, so a unit file can say so"
+    assert parse("--no-drain-priority").drain_priority is False, \
+        "measuring what the deferral is worth needs a way to turn it off"
     assert m.DRAIN_ENTER_FRACTION == 0.50
 
 

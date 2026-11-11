@@ -184,6 +184,16 @@ Two of those flags are decisions, not tuning:
 - **`--mode ring`, not `append`.** Append grows `meters_history` without
   bound; it is the audit and soak setting. Ring caps it, which is what
   the flash on a gateway micro-PC needs to survive years of poll cycles.
+- **Drain priority is ON by default and is not in the list above.**
+  Above 50% of the event budget §2.3.3 allows a host to collect, the
+  optional meter sweeps are deferred and the poll slots go to general
+  polls instead. What gets deferred is 39 single meters, 13 Table C-7
+  chunks and 12 validation polls — all cumulative, so reading them a
+  minute later costs nothing. What it protects is real time events, and
+  a dropped event is gone for good: no meter carries a player's
+  turnover. Coin in, coin out and games played are read every cycle
+  regardless. `--no-drain-priority` turns it off, for measuring what the
+  deferral is worth; it does not belong on a floor gateway.
 - **`--min-poll-interval 0.2`** is the specification's own floor and the
   default. Do not lower it. The 40 ms relaxation available under RTE buys
   nothing here, because at most one event is delivered per poll and

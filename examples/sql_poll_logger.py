@@ -5640,8 +5640,18 @@ def build_parser() -> argparse.ArgumentParser:
         "Ignored when --skip-table-c7-sweep is given",
     )
     parser.add_argument(
+        "--no-drain-priority",
+        dest="drain_priority",
+        action="store_false",
+        help="turn OFF the deferral of optional meter sweeps under load. "
+             "Only for measuring what the deferral is worth, by running a "
+             "window without it. A floor gateway should not use this.",
+    )
+    parser.add_argument(
         "--drain-priority",
+        dest="drain_priority",
         action="store_true",
+        default=True,
         help="when the cabinet produces events faster than the sweep leaves "
              # argparse runs help through %-formatting, so every literal
              # percent sign must be doubled -- including the ones an
@@ -5660,8 +5670,11 @@ def build_parser() -> argparse.ArgumentParser:
              "reading them later. Measured on 2026-11-08: a button burst "
              "put 43%% of poll slots into long polls that drain nothing, "
              "collecting 1.6 events/s against a 3.3/s budget while the "
-             "cabinet produced 11.5/s. OFF by default -- it changes what "
-             "goes on the wire",
+             "cabinet produced 11.5/s. **ON BY DEFAULT since 2026-11-11**, "
+             "at the operator's instruction: \"drain priority must be on by "
+             "default, not only during soak. It really helps losing less of "
+             "rte.\" Kept as an explicit flag so a unit file can say so out "
+             "loud; --no-drain-priority turns it off",
     )
     parser.add_argument(
         "--drain-fast-poll",
@@ -6037,6 +6050,19 @@ def main() -> int:
         f"validation meters sweep {'enabled' if not args.skip_validation_meters_sweep else 'skipped'}, "
         f"last-accepted-bill poll {'enabled' if not args.skip_last_accepted_bill_poll else 'skipped'})."
     )
+    # A default that changes what goes on the wire has to announce itself.
+    # Nobody reads a unit file to find out why a sweep got shorter.
+    if args.drain_priority:
+        print(f"  drain priority ON (default): above "
+              f"{DRAIN_ENTER_FRACTION * 100:.0f}% of the collectable event "
+              f"budget the optional sweeps are deferred and the slots spent "
+              f"on general polls; resumes below "
+              f"{DRAIN_LEAVE_FRACTION * 100:.0f}%. Coin in, coin out and "
+              f"games played are read every cycle regardless.")
+    else:
+        print("  drain priority OFF (--no-drain-priority): the full sweep "
+              "runs however busy the cabinet gets. Events the queue drops "
+              "while it runs are gone -- no meter carries them.")
 
     if args.lab_ticket_authority:
         import datetime as _dt
