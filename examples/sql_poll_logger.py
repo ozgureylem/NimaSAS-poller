@@ -286,6 +286,8 @@ from saspy.constants import (
     describe_aft_transfer_status,
     clarify_exception,
     describe_exception,
+    describe_redemption_status,
+    TICKET_TRANSFER_CODES,
 )
 from saspy.exceptions import SASPreempted, SASError, SASPortCapabilityError, SASTimeoutError
 from saspy.bcd import decode_bcd
@@ -1110,6 +1112,20 @@ STARTUP_DRAIN_MAX = 64
 # another cabinet and plug it in. Nobody does that in less.
 DEFAULT_COMMS_GAP_SECONDS = 30.0
 DEFAULT_POOL_AGE_ALERT_HOURS = 36.0
+# AGE IS NOT DEPTH, and the age alert cannot see this one.
+#
+# A pool can be old and full -- the lab on 2026-11-11, 243 hours stale with
+# barely a cashout, alerting correctly and in no danger -- or young and
+# nearly empty, which is a busy floor machine topped up an hour ago with
+# 190 of its 200 numbers gone. The second is the one that bites and the
+# age check says nothing about it, right up to the last number.
+#
+# When the pool empties the gateway has nothing to answer a 0x57 with, so
+# every cashout becomes a handpay: below the printer limit, with every
+# credit type printing correctly and the host answering in time. And it
+# fails CORRELATED -- if the top-up stops, every gateway on the floor
+# drains at once.
+DEFAULT_POOL_DEPTH_ALERT = 25
 
 # SAS 6.02 §2.3.3 ("Polling Rate"): "The host may not issue general polls
 # or long polls to any single gaming machine at a rate faster than once
@@ -1228,6 +1244,7 @@ class PollState:
     fast_poll_active: bool = False
     fast_poll_fallback_announced: bool = False
     pool_stale_since: str | None = None
+    pool_low_since: str | None = None
     pool_stale_last_row: float | None = None
     pool_stale_last_print: float | None = None
     clear_candidate_cycles: int = 0
@@ -1238,6 +1255,19 @@ class PollState:
     ticket_authority: dict | None = None
     ticket_authority_binding: object | None = None  # ticket_lab_authority.MachineBinding
     ticket_authority_path: str | None = None
+    # THE FLOOR PATH for ticket-in (§9), and the opposite of the three
+    # fields above: with --server-ticket-authority the poller asks the
+    # SERVER what an escrowed ticket is worth, through validation_queries
+    # and the gateway client, and holds no authority of its own. Mutually
+    # exclusive with the lab file.
+    server_ticket_authority: bool = False
+    ticket_query_timeout_s: float = 2.0
+    ticket_query_backoff_s: float = 30.0
+    ticket_query_cap: int = 10
+    ticket_query_cap_window_s: float = 60.0
+    # Monotonic. None means "not backing off".
+    ticket_query_backoff_until: float | None = None
+    ticket_query_times: list | None = None
     # LAB ONLY, and only ever set when --lab-ticket-authority is also in
     # effect. See LabAutoConfig for why that file is the gate.
     #
@@ -2615,6 +2645,70 @@ def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
         print(f"[{now}] validation number rejected by machine (status=0x{status:02X}); left available for reuse")
 
 
+def check_pool_depth(conn: sqlite3.Connection, now: str, *,
+                     min_available: int = DEFAULT_POOL_DEPTH_ALERT,
+                     state=None) -> None:
+    """Warn while the pool is running out, and say how fast.
+
+    The age alert (D-16) answers "is a top-up reaching this gateway?".
+    This answers "will there be a number for the next cashout?", and they
+    are not the same question -- see DEFAULT_POOL_DEPTH_ALERT above.
+
+    Reports CONSUMPTION, not just the count, because a depth alone does
+    not tell an operator when to top up. Ten numbers left is comfortable
+    on a cabinet that dispenses one a day and an emergency on one doing
+    six an hour, and assigned_at is already recorded, so the rate is free.
+    """
+    if min_available <= 0:
+        return
+    try:
+        available = conn.execute(
+            "SELECT COUNT(*) FROM validation_pool WHERE status = 'available'"
+        ).fetchone()[0]
+    except sqlite3.Error:
+        return
+    low = available < min_available
+
+    if not low:
+        if state is not None and state.pool_low_since is not None:
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, "
+                "message) VALUES (?, ?, ?, ?)",
+                (now, "validation_pool", "PoolLowCleared",
+                 f"low since {state.pool_low_since}; {available} available now"))
+            _safe_commit(conn, now)
+            print(f"[{now}] validation_pool is no longer low ({available} "
+                  f"available; was flagged from {state.pool_low_since}).")
+            state.pool_low_since = None
+        return
+
+    used = conn.execute(
+        "SELECT COUNT(*) FROM validation_pool WHERE assigned_at IS NOT NULL "
+        "AND assigned_at >= datetime(?, '-24 hours')", (now,)).fetchone()[0]
+    rate = used / 24.0
+    if rate > 0:
+        left = f"about {available / rate:.1f}h left at {rate:.1f}/h"
+    else:
+        left = "nothing dispensed in 24h, so no rate to project from"
+
+    # One row per episode, like the age alert: a condition, not an event.
+    if state is None or state.pool_low_since is None:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, "
+            "message) VALUES (?, ?, ?, ?)",
+            (now, "validation_pool", "PoolLow",
+             f"{available} available, below --pool-depth-alert "
+             f"{min_available}; {used} used in 24h"))
+        _safe_commit(conn, now)
+        if state is not None:
+            state.pool_low_since = now
+
+    print(f"[{now}] ALERT: validation_pool has {available} number(s) "
+          f"available, below --pool-depth-alert {min_available} -- {left}. "
+          f"At zero every cashout becomes a handpay, whatever the printer "
+          f"limit says. Top up with examples/pool_replace.py.")
+
+
 def _pool_age_hours(conn: sqlite3.Connection, now: str) -> float | None:
     """Hours since the oldest still-'available' row entered the pool, or
     None if the pool currently has no available rows at all (that's
@@ -2827,6 +2921,8 @@ def _capture_ticket_in(client, conn: sqlite3.Connection, now: str,
     decision = None
     if state is not None and state.ticket_authority is not None:
         decision = _answer_ticket_in(client, conn, ticket, state, now)
+    elif state is not None and state.server_ticket_authority:
+        decision = _ask_server_ticket_in(client, conn, ticket, state, now)
 
     conn.execute(
         "INSERT INTO ticket_in_events (captured_at, amount_cents, parsing_code, "
@@ -2991,6 +3087,251 @@ def _answer_ticket_in(client, conn: sqlite3.Connection, ticket,
     return f"{note}; machine status 0x{result.machine_status:02X} {describe(result.machine_status)}"
 
 
+# Created ONLY when --server-ticket-authority is given. A lab gateway run
+# the way it always has been gets no new table and no new statement.
+#
+# gateway/db.py carries the same DDL for the gateway client, which is a
+# separate process and may start first. Two copies, because this module
+# must not import the server-link package (tests/test_gateway_frame.py
+# asserts that, on the operator's instruction) -- and a test compares the
+# two, so they cannot drift.
+#
+#   pending   LP 0x70 was read; waiting, inside the deadline, for the server
+#   answered  the gateway client wrote the server's VALIDATION_RESPONSE
+#   acted     LP 0x71 was sent with that answer
+#   timeout / backoff / capped / failed
+#             refused locally with 0x80; a late answer must NOT be acted
+#             on, which is why the client's UPDATE requires state='pending'
+VALIDATION_QUERIES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS validation_queries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asked_at TEXT NOT NULL,
+    validation_number TEXT NOT NULL,
+    parsing_code INTEGER,
+    reported_amount_cents INTEGER,
+    state TEXT NOT NULL DEFAULT 'pending',
+    sent_at TEXT,
+    answered_at TEXT,
+    decision TEXT,
+    transfer_code INTEGER,
+    amount_cents INTEGER,
+    restricted_expiration INTEGER,
+    pool_id INTEGER,
+    reason TEXT,
+    outcome TEXT,
+    machine_status INTEGER,
+    completion_status INTEGER,
+    completed_at TEXT,
+    result_sent_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_validation_queries_state
+    ON validation_queries (state, id);
+"""
+
+# Table 15.12a, HOST -> MACHINE: the codes a host may send to refuse a
+# ticket. The server chooses among them (§9.4: "the host chooses the code,
+# not the wording"); this range is what the poller will agree to relay.
+TICKET_REJECT_CODES = range(0x80, 0x89)
+# What the gateway says when it has NO answer -- the server did not reply
+# inside the deadline, or the poller is backing off. Table 15.12a: "unable
+# to validate (no reason given / other)". Deliberately the neutral one.
+TICKET_UNABLE_TO_VALIDATE = 0x80
+# How often the waiting poller re-reads its own question. The gateway
+# client writes the answer from another process, so this is a read of a
+# one-row indexed lookup in a WAL database, not a wire exchange.
+TICKET_QUERY_POLL_S = 0.02
+
+
+def _ask_server_ticket_in(client, conn: sqlite3.Connection, ticket,
+                          state: "PollState", now: str, *,
+                          clock=time.monotonic, sleep=time.sleep) -> str:
+    """§9: ask the SERVER what the escrowed ticket is worth, and tell the
+    machine exactly what the server said.
+
+    This is the floor path, and it is the reverse of _answer_ticket_in() in
+    the one way that matters: the gateway holds no authority. It does not
+    look the number up in its own pool, even for a ticket it printed thirty
+    seconds ago -- §7.1, "the pool is a routing and issuing mechanism, not a
+    validity list" -- because whether that ticket was already paid at the
+    cage is something only the server can know. It does not supply the
+    amount either: the amount sent in LP 0x71 is the server's ledger figure
+    and never the one the ticket reports about itself (§9.1).
+
+    HOW THE QUESTION TRAVELS. The poller owns the serial port and must not
+    own a socket (§4.3), so the question is a row in validation_queries.
+    The gateway client sends it as VALIDATION_QUERY and writes the
+    VALIDATION_RESPONSE back into the same row; this function waits for
+    that, bounded by --ticket-query-timeout.
+
+    WHAT THE WAIT COSTS, STATED RATHER THAN HIDDEN. The poll loop is
+    single-threaded, so while this waits nothing else is polled. On a
+    working link the answer is back in tens of milliseconds. When the
+    server is slow the wait runs to the timeout -- two seconds by default,
+    against a general-poll ceiling of five -- and then §9.2's backoff stops
+    it happening again on the next insertion: for --ticket-query-backoff
+    seconds every ticket is refused locally WITHOUT a query, so a
+    struggling server is not also made to answer every customer's retry.
+
+    A ticket is always ANSWERED. Silence leaves the machine holding it for
+    §15.12's thirty seconds and tells the player nothing.
+    """
+    if ticket.parsing_code != 0x00 or len(ticket.validation_data) != 9:
+        return (f"NOT ANSWERED: parsing code 0x{ticket.parsing_code:02X} with "
+                f"{len(ticket.validation_data)} bytes is not Table 15.11b's 00 "
+                "with 9 BCD bytes")
+    number = decode_bcd(ticket.validation_data)
+    digits = f"{number:018d}"
+
+    def _refuse_locally(why: str, state_name: str, query_id=None) -> str:
+        note = f"REFUSED LOCALLY 0x{TICKET_UNABLE_TO_VALIDATE:02X} ({why})"
+        try:
+            result = client.redeem_ticket(
+                transfer_code=TICKET_UNABLE_TO_VALIDATE,
+                transfer_amount_cents=0, validation_number=number,
+                parsing_code=ticket.parsing_code)
+            note += (f"; machine status 0x{result.machine_status:02X}")
+            status = result.machine_status
+        except SASError as e:
+            note += f"; LP 0x71 failed: {type(e).__name__}: {e}"
+            status = None
+        if query_id is None:
+            # No query was sent, so there is no row yet. Write one anyway:
+            # a ticket refused during a backoff moves no meter and reaches
+            # no server, and this row is the only place it ever existed.
+            conn.execute(
+                "INSERT INTO validation_queries (asked_at, validation_number, "
+                "parsing_code, reported_amount_cents, state, outcome, "
+                "machine_status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (now, digits, ticket.parsing_code, ticket.amount_cents,
+                 state_name, note, status))
+        else:
+            # The caller has already taken this row out of 'pending', so
+            # the client's conditional write can no longer land on it.
+            conn.execute(
+                "UPDATE validation_queries SET state = ?, outcome = ?, "
+                "machine_status = ? WHERE id = ?",
+                (state_name, note, status, query_id))
+        _safe_commit(conn, now)
+        return note
+
+    # --- §9.2: backoff, then the per-window cap ----------------------------
+    at = clock()
+    if (state.ticket_query_backoff_until is not None
+            and at < state.ticket_query_backoff_until):
+        left = state.ticket_query_backoff_until - at
+        return _refuse_locally(
+            f"query backoff, {left:.0f}s left: the server did not answer an "
+            "earlier ticket and is not being asked again yet", "backoff")
+    recent = [t for t in (state.ticket_query_times or [])
+              if at - t < state.ticket_query_cap_window_s]
+    if len(recent) >= state.ticket_query_cap:
+        state.ticket_query_times = recent
+        return _refuse_locally(
+            f"query cap: {len(recent)} queries in the last "
+            f"{state.ticket_query_cap_window_s:.0f}s", "capped")
+    recent.append(at)
+    state.ticket_query_times = recent
+
+    # --- ask ---------------------------------------------------------------
+    cursor = conn.execute(
+        "INSERT INTO validation_queries (asked_at, validation_number, "
+        "parsing_code, reported_amount_cents, state) VALUES (?, ?, ?, ?, 'pending')",
+        (now, digits, ticket.parsing_code, ticket.amount_cents))
+    query_id = cursor.lastrowid
+    if not _safe_commit(conn, now):
+        # The question never became durable, so the client cannot see it.
+        # Do not wait two seconds for an answer that cannot come.
+        return _refuse_locally("the query could not be written", "failed")
+
+    deadline = at + state.ticket_query_timeout_s
+    answer = None
+    while True:
+        row = conn.execute(
+            "SELECT state, decision, transfer_code, amount_cents, "
+            "restricted_expiration, pool_id, reason FROM validation_queries "
+            "WHERE id = ?", (query_id,)).fetchone()
+        if row is not None and row[0] == "answered":
+            answer = row
+            break
+        if clock() >= deadline:
+            break
+        sleep(TICKET_QUERY_POLL_S)
+
+    if answer is None:
+        # CLAIM THE ROW FIRST. If the client's answer lands between the
+        # last read and here, the UPDATE below matches nothing and the
+        # answer stands -- so re-read once rather than refuse a ticket the
+        # server allowed a millisecond ago.
+        claimed = conn.execute(
+            "UPDATE validation_queries SET state = 'timeout' "
+            "WHERE id = ? AND state = 'pending'", (query_id,)).rowcount
+        _safe_commit(conn, now)
+        if claimed:
+            state.ticket_query_backoff_until = clock() + state.ticket_query_backoff_s
+            print(f"[{now}] ALERT: no VALIDATION_RESPONSE for ...{digits[-6:]} in "
+                  f"{state.ticket_query_timeout_s:.1f}s. Refusing tickets "
+                  f"locally for {state.ticket_query_backoff_s:.0f}s (§9.2). "
+                  "Is the gateway client running and connected?")
+            return _refuse_locally(
+                f"no answer from the server in "
+                f"{state.ticket_query_timeout_s:.1f}s", "timeout", query_id)
+        answer = conn.execute(
+            "SELECT state, decision, transfer_code, amount_cents, "
+            "restricted_expiration, pool_id, reason FROM validation_queries "
+            "WHERE id = ?", (query_id,)).fetchone()
+
+    # An answer arrived, so the server is answering: end any backoff.
+    state.ticket_query_backoff_until = None
+    _, decision, code, amount, expiration, pool_id, reason = answer
+
+    # --- relay it, after checking it is a thing a server may say -----------
+    if decision == "allow":
+        if code not in TICKET_TRANSFER_CODES.values() or not amount or amount <= 0:
+            decision, why = "reject", (
+                f"server said ALLOW with transfer code {code!r} and amount "
+                f"{amount!r}, which is not a payable ticket")
+            code, amount = TICKET_UNABLE_TO_VALIDATE, 0
+            reason = f"{why} (server reason: {reason})"
+            print(f"[{now}] ALERT: {why}. Refused.")
+    elif decision != "reject" or code not in TICKET_REJECT_CODES:
+        why = (f"unusable VALIDATION_RESPONSE: decision {decision!r}, "
+               f"transfer code {code!r}")
+        decision, code, amount = "reject", TICKET_UNABLE_TO_VALIDATE, 0
+        reason = f"{why} (server reason: {reason})"
+        print(f"[{now}] ALERT: {why}. Refused.")
+    if decision == "reject":
+        amount = 0
+
+    restricted = decision == "allow" and code == TICKET_TRANSFER_CODES["restricted"]
+    if decision == "allow":
+        note = f"SERVER ALLOW: {amount} cents, transfer code 0x{code:02X}"
+        if ticket.amount_cents and ticket.amount_cents != amount:
+            note += f" (machine reported {ticket.amount_cents})"
+    else:
+        note = f"SERVER REJECT 0x{code:02X} ({reason})"
+    status = None
+    try:
+        result = client.redeem_ticket(
+            transfer_code=code, transfer_amount_cents=amount,
+            validation_number=number,
+            restricted_expiration=(expiration or 0) if restricted else 0,
+            pool_id=(pool_id or 0) if restricted else 0,
+            parsing_code=ticket.parsing_code)
+        status = result.machine_status
+        note += (f"; machine status 0x{status:02X} "
+                 f"{describe_redemption_status(status)}")
+    except SASError as e:
+        # Indistinguishable from here: the machine may have acted. The
+        # server's lease is what resolves it (§9.3) -- with no completion
+        # status it expires into UNKNOWN_REDEMPTION, never back to Open.
+        note += f"; LP 0x71 failed: {type(e).__name__}: {e}"
+    conn.execute(
+        "UPDATE validation_queries SET state = 'acted', outcome = ?, "
+        "machine_status = ? WHERE id = ?", (note, status, query_id))
+    _safe_commit(conn, now)
+    return note
+
+
 def _acknowledge_aft_transfer(client, conn: sqlite3.Connection, now: str) -> None:
     """Called on exception 0x69: read the completion status and ACKNOWLEDGE it.
 
@@ -3050,7 +3391,8 @@ def _acknowledge_aft_transfer(client, conn: sqlite3.Connection, now: str) -> Non
           f"id={result.transaction_id!r}")
 
 
-def _capture_ticket_in_completion(client, conn: sqlite3.Connection, now: str) -> None:
+def _capture_ticket_in_completion(client, conn: sqlite3.Connection, now: str,
+                                  *, stamp_query: bool = False) -> None:
     """Called on exception 0x68: the machine's redemption cycle finished
     — stacked or rejected, not which one (Appendix A of the project's own
     Technical v3: "Announces that the cycle finished, not that it
@@ -3080,6 +3422,24 @@ def _capture_ticket_in_completion(client, conn: sqlite3.Connection, now: str) ->
         "VALUES (?, ?, ?, ?, ?)",
         (now, result.machine_status, result.amount_cents, result.parsing_code, result.validation_data.hex()),
     )
+    # §9.1 step 6: the completion status belongs to the question that
+    # preceded it, so the gateway client can send REDEMPTION_RESULT for THAT
+    # query. One cabinet holds one ticket in escrow at a time, so the most
+    # recent answered-or-refused query with no completion is the one. A
+    # status in the "not finished" categories (waiting 0x20, pending 0x40)
+    # or 0xFF (no cycle) is not a completion and is not stamped.
+    #
+    # Only with --server-ticket-authority: without it there is no such
+    # table and this function is exactly what it was.
+    category = result.machine_status >> 5
+    if (stamp_query and result.machine_status != 0xFF
+            and category not in (0b001, 0b010)):
+        conn.execute(
+            "UPDATE validation_queries SET completion_status = ?, "
+            "completed_at = ? WHERE id = (SELECT id FROM validation_queries "
+            "WHERE completion_status IS NULL AND state <> 'pending' "
+            "ORDER BY id DESC LIMIT 1)",
+            (result.machine_status, now))
     _safe_commit(conn, now)
     print(f"[{now}] ticket-in completion captured: machine_status=0x{result.machine_status:02X} amount_cents={result.amount_cents}")
 
@@ -4043,7 +4403,9 @@ def _dispatch_exception(
     if exception_code == ExceptionCode.TICKET_INSERTED:
         _capture_ticket_in(client, conn, now, state)
     elif exception_code == ExceptionCode.TICKET_TRANSFER_COMPLETE:
-        _capture_ticket_in_completion(client, conn, now)
+        _capture_ticket_in_completion(
+            client, conn, now,
+            stamp_query=state is not None and state.server_ticket_authority)
     elif exception_code in (ExceptionCode.CASH_OUT_TICKET_PRINTED, ExceptionCode.HANDPAY_VALIDATED):
         _drain_ticket_out_history(client, conn, now)
     elif exception_code == ExceptionCode.SYSTEM_VALIDATION_REQUEST:
@@ -4889,6 +5251,12 @@ def poll_and_log(
     interval: float | None = None,
     general_poll_retries: int = DEFAULT_GENERAL_POLL_RETRIES,
     pool_age_alert_hours: float = DEFAULT_POOL_AGE_ALERT_HOURS,
+    # 0 here, DEFAULT_POOL_DEPTH_ALERT at the CLI, for the same reason
+    # drain_priority is False here and on at the CLI: the command line is
+    # the product default, and a test that seeds a three-number pool is
+    # not a gateway running out -- it is a fixture. Tests that mean to
+    # exercise the alert pass the threshold explicitly.
+    pool_depth_alert: int = 0,
     retry_sleep_fn=time.sleep,
     rte: bool = False,
     credit_poll_every: int = 0,
@@ -4945,6 +5313,10 @@ def poll_and_log(
 
     _check_pool_age(conn, now, max_age_hours=pool_age_alert_hours,
                     state=state, monotonic_fn=monotonic_fn)
+    # Depth, which the age check above cannot see. Both run: a pool can be
+    # old and full, or young and nearly empty, and only one of those stops
+    # the next cashout printing.
+    check_pool_depth(conn, now, min_available=pool_depth_alert, state=state)
 
     # LAB ONLY, and off unless the lab flags built a LabAutoConfig. Placed
     # here, before the general poll, on purpose: it then runs on every cycle
@@ -5820,6 +6192,35 @@ def build_parser() -> argparse.ArgumentParser:
         "otherwise abort every cycle's row write on such a machine.",
     )
     parser.add_argument(
+        "--server-ticket-authority",
+        action="store_true",
+        help="THE FLOOR PATH for ticket-in (spec §9). On exception 0x67 the "
+        "poller writes the escrowed ticket's validation number to the "
+        "validation_queries table; the gateway client (python3 -m "
+        "gateway.client, a separate process) sends it to the server as "
+        "VALIDATION_QUERY and writes the server's answer back; the poller then "
+        "tells the machine exactly that with LP 0x71. The gateway decides "
+        "nothing: not validity, not the amount, not even for a ticket it "
+        "printed itself. With no client running, or no server answering, every "
+        "ticket is refused with 0x80 after --ticket-query-timeout and handed "
+        "back. Cannot be combined with --lab-ticket-authority.",
+    )
+    parser.add_argument(
+        "--ticket-query-timeout",
+        type=float, default=2.0, metavar="SECONDS",
+        help="how long the poll loop waits for the server's answer to one "
+        "ticket before refusing it locally (default %(default)s; spec §15 "
+        "QUERY_TIMEOUT is 'pending lab'). Nothing else is polled during the "
+        "wait, so this must stay well inside §2.3.3's 5 s ceiling.",
+    )
+    parser.add_argument(
+        "--ticket-query-backoff",
+        type=float, default=30.0, metavar="SECONDS",
+        help="after an unanswered query, refuse tickets locally WITHOUT asking "
+        "for this long (default %(default)s; spec §9.2, QUERY_BACKOFF_WINDOW "
+        "'pending lab'). Stops customer reinsertion amplifying a slow server.",
+    )
+    parser.add_argument(
         "--lab-ticket-authority",
         metavar="PATH",
         default=None,
@@ -5979,6 +6380,22 @@ def build_parser() -> argparse.ArgumentParser:
         "(Decisions Annex D-09) — this re-polls right away rather than losing that cycle. N=1 disables retrying.",
     )
     parser.add_argument(
+        "--pool-depth-alert",
+        type=int,
+        default=DEFAULT_POOL_DEPTH_ALERT,
+        metavar="N",
+        help="print an active, repeated alert (and log one PoolLow row per "
+        "episode) while fewer than N validation numbers remain available, "
+        "with the 24-hour consumption rate and a projection of how long is "
+        "left (default: %(default)s). DIFFERENT QUESTION FROM "
+        "--pool-age-alert-hours: that one asks whether a top-up is reaching "
+        "this gateway, this one asks whether there will be a number for the "
+        "next cashout. A pool can be old and full, or young and nearly "
+        "empty. At zero every cashout becomes a handpay whatever the "
+        "printer limit says, and if the top-up stops it happens on every "
+        "gateway at once. 0 disables it.",
+    )
+    parser.add_argument(
         "--pool-age-alert-hours",
         type=float,
         default=DEFAULT_POOL_AGE_ALERT_HOURS,
@@ -6074,6 +6491,20 @@ def main() -> int:
               f"polled below the floor once and recorded it as a bug; it is "
               f"not a knob.", file=sys.stderr)
         return 2
+    if args.server_ticket_authority and args.lab_ticket_authority:
+        print("--server-ticket-authority and --lab-ticket-authority cannot be "
+              "combined.\n  One asks the server what a ticket is worth; the "
+              "other answers from a file on the gateway. A run with both has "
+              "two authorities, and which one paid a given ticket would be a "
+              "question nobody could answer afterwards.", file=sys.stderr)
+        return 2
+    if args.server_ticket_authority and not (
+            0.1 <= args.ticket_query_timeout <= 4.0):
+        print(f"--ticket-query-timeout {args.ticket_query_timeout} is outside "
+              "0.1-4.0 s. The poll loop waits this long with nothing else "
+              "polled, and §2.3.3 lets a machine go at most 5 s between "
+              "polls.", file=sys.stderr)
+        return 2
     if args.lab_auto_handpay_reset or args.lab_auto_aft_credit:
         if not args.lab_ticket_authority:
             print("--lab-auto-handpay-reset and --lab-auto-aft-credit both "
@@ -6153,6 +6584,18 @@ def main() -> int:
         print("  drain priority OFF (--no-drain-priority): the full sweep "
               "runs however busy the cabinet gets. Events the queue drops "
               "while it runs are gone -- no meter carries them.")
+
+    if args.server_ticket_authority:
+        conn.executescript(VALIDATION_QUERIES_SCHEMA)
+        conn.commit()
+        state.server_ticket_authority = True
+        state.ticket_query_timeout_s = args.ticket_query_timeout
+        state.ticket_query_backoff_s = args.ticket_query_backoff
+        print(f"  ticket-in: SERVER authority (§9). Each escrowed ticket is "
+              f"asked of the server through validation_queries; no answer in "
+              f"{args.ticket_query_timeout:.1f}s refuses it with 0x80. "
+              f"`python3 -m gateway.client` must be running against this "
+              f"database, or every ticket is handed back.")
 
     if args.lab_ticket_authority:
         import datetime as _dt
@@ -6482,6 +6925,7 @@ def main() -> int:
                 interval=args.interval,
                 general_poll_retries=args.general_poll_retries,
                 pool_age_alert_hours=args.pool_age_alert_hours,
+                pool_depth_alert=args.pool_depth_alert,
                 rte=rte_on,
                 comms_gap_seconds=args.comms_gap_seconds,
                 lab_auto=lab_auto,

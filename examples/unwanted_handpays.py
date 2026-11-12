@@ -123,9 +123,21 @@ def _events(conn, codes, since, until):
     if until:
         where.append("occurred_at <= ?")
         params.append(until)
+    # ORDER BY occurred_at, id -- NOT occurred_at alone.
+    #
+    # The poller stamps every event drained in one sweep with that cycle's
+    # time, so ties are the normal case and not an edge. With ORDER BY on
+    # the timestamp alone the order WITHIN a tie is whatever SQLite
+    # happens to return, and the walks below read sequence off that order.
+    # They were reading an accident.
+    #
+    # id is insert order, which for a batch IS arrival order: the drain
+    # files events as it collects them, and the interleaved drain runs
+    # before each heartbeat's own read specifically to keep it that way
+    # (sql_poll_logger's "keeps row ids in arrival order").
     return conn.execute(
-        "SELECT occurred_at, exception_code FROM machine_events WHERE "
-        + " AND ".join(where) + " ORDER BY occurred_at", params).fetchall()
+        "SELECT occurred_at, exception_code, id FROM machine_events WHERE "
+        + " AND ".join(where) + " ORDER BY occurred_at, id", params).fetchall()
 
 
 def _seconds(a: str, b: str) -> float | None:
@@ -151,7 +163,7 @@ def find_unwanted(conn, since=None, until=None,
     pending_request = None     # (at,) of the last 0x57 with no ticket yet
     last_button = None
     out: list[dict] = []
-    for at, code in _events(conn, codes, since, until):
+    for at, code, _id in _events(conn, codes, since, until):
         if code == CASHOUT_PRESSED:
             last_button = at
         elif code == VALIDATION_REQUEST:
@@ -191,7 +203,7 @@ def find_unwanted(conn, since=None, until=None,
     # stamps it is not. So anything whose request was followed by a ticket
     # inside the window is dropped here regardless of where the 0x51 sat:
     # the cabinet printed, so the host answered, so it is not this defect.
-    printed = [at for at, code in _events(conn, (TICKET_PRINTED,), since, until)]
+    printed = [at for at, code, _id in _events(conn, (TICKET_PRINTED,), since, until)]
     kept = []
     for item in out:
         answered = any(
@@ -216,16 +228,43 @@ def find_unwanted(conn, since=None, until=None,
     # reports one of them is answering half the question.
     charged = {item["at"] for item in out}
     pending_button = None
-    for at, code in _events(conn, codes, since, until):
+    button_id = None
+    for at, code, _id in _events(conn, codes, since, until):
         if code == CASHOUT_PRESSED:
-            pending_button = at
+            pending_button, button_id = at, _id
         elif code == VALIDATION_REQUEST:
             pending_button = None      # it asked; handled above
         elif code == TICKET_PRINTED:
             pending_button = None
         elif code == HANDPAY_PENDING and pending_button is not None:
             gap = _seconds(pending_button, at)
-            if gap is not None and 0 < gap <= window and at not in charged:
+            # A ZERO GAP HERE IS A SEQUENCE, AND IN THE 0x57 WALK IT IS NOT.
+            #
+            # That walk rejects gap == 0 on purpose, and the reason is
+            # written above it: §7.8.1 REISSUES 0x51 every fifteen seconds
+            # until LP 0x1B reads the queue, so an old handpay still
+            # waiting will keep firing and can land in the same batch as a
+            # new 0x57. Two false positives came from exactly that.
+            #
+            # The trigger here is different in the way that matters. A
+            # CASH OUT BUTTON PRESS IS NOT REISSUED -- it happens once,
+            # when a finger touches it. So a 0x66 and a 0x51 sharing a
+            # cycle stamp are not two unrelated things that collided;
+            # they are a sequence whose clock resolution is too coarse to
+            # show it, and `id` resolves it because insert order is
+            # arrival order.
+            #
+            # IT IS NOT HYPOTHETICAL. On 2026-11-11 a cash out and its
+            # lockup landed in one 56-second sweep, every event stamped
+            # 22:26:54.099103, and the tool reported "5 cash out(s) ended
+            # in a lockup" when there had been six. Not misclassified --
+            # not counted. And the longer the sweep the likelier it is,
+            # so the scorecard went blind exactly when the host is most
+            # under load. Sweeps that night ran 37s to 131s.
+            same_batch_in_order = (gap == 0 and button_id is not None
+                                   and _id > button_id)
+            if (gap is not None and (0 < gap or same_batch_in_order)
+                    and gap <= window and at not in charged):
                 kept.append({
                     "at": at,
                     "requested_at": None,      # never asked
@@ -350,7 +389,7 @@ def aft_requested_near(conn, at: str, window: float) -> bool:
     `0x66 -> 0x51` with no 0x57. They are completely different faults and
     the 0x6A is the only thing on the wire that separates them.
     """
-    for occurred, _ in _events(conn, (AFT_CASHOUT_REQUEST,
+    for occurred, _, _id in _events(conn, (AFT_CASHOUT_REQUEST,
                                       AFT_WIN_CASHOUT_REQUEST), None, None):
         gap = _seconds(occurred, at)
         if gap is not None and 0 <= gap <= window:
@@ -445,7 +484,7 @@ def pool_was_empty(conn, at: str, window: float = 120.0) -> bool:
 
 def printer_fault_near(conn, at: str, window: float = 300.0):
     rows = _events(conn, PRINTER_FAULTS, None, None)
-    for occurred, code in rows:
+    for occurred, code, _id in rows:
         gap = _seconds(at, occurred)
         if gap is not None and abs(gap) <= window:
             return code

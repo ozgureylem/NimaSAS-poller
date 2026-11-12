@@ -458,3 +458,76 @@ def test_backlog_is_read_off_the_stored_source_not_guessed_from_a_gap(tmp_path):
     ])
     assert arrived_as_backlog(conn, "2026-11-08T18:18:43") is True
     assert arrived_as_backlog(conn, "2026-11-08T19:00:00") is False
+
+
+# --- A cash out and its lockup inside ONE sweep -------------------------
+#
+# 2026-11-11, on the lab cabinet. A cash out, eight unanswered 0x6A and a
+# 0x51 all landed in one 56-second sweep, so the poller stamped every one
+# of them 22:26:54.099103. The gap was 0.0, `0 < gap` rejected it, and the
+# tool reported "5 cash out(s) ended in a lockup" when there had been six.
+#
+# Not misclassified. NOT COUNTED. And the longer the sweep the likelier it
+# is, so the scorecard went blind exactly when the host is most loaded --
+# sweeps that night ran 37s to 131s.
+#
+# The 0x57 walk rejects a zero gap on purpose and keeps doing so: §7.8.1
+# reissues 0x51 every fifteen seconds, so an OLD handpay can collide with
+# a NEW 0x57 and did, twice. A cash out button press is not reissued, so
+# in this walk a shared stamp is a sequence with a clock too coarse to
+# show it, and the row id resolves it.
+
+BATCH = "2026-11-11T22:26:54.099103+00:00"
+
+
+def test_a_cashout_and_its_lockup_in_ONE_sweep_are_still_counted(tmp_path):
+    _, conn = _db(tmp_path / "same", [
+        (BATCH, CASHOUT_PRESSED),
+        (BATCH, HANDPAY_PENDING),
+    ])
+    found = find_unwanted(conn)
+    assert len(found) == 1, (
+        "a lockup that shares its cash out's cycle stamp must still be "
+        f"counted, got {found}")
+    assert found[0]["requested_at"] is None, "no 0x57 was raised"
+    assert found[0]["seconds"] == 0
+
+
+def test_the_ORDER_inside_the_batch_still_has_to_be_right(tmp_path):
+    """id is insert order and insert order is arrival order. A 0x51 filed
+    BEFORE the button cannot have been caused by it -- that is the
+    reissued-handpay case the 0x57 walk guards against, and this walk
+    must not become the hole it closed."""
+    _, conn = _db(tmp_path / "rev", [
+        (BATCH, HANDPAY_PENDING),     # id 1 -- already pending
+        (BATCH, CASHOUT_PRESSED),     # id 2 -- pressed afterwards
+    ])
+    assert find_unwanted(conn) == [], \
+        "a handpay filed before the button must not pair with it"
+
+
+def test_a_ticket_in_the_same_batch_still_clears_it(tmp_path):
+    """The cabinet printed, so the host answered. Unchanged by the id
+    tiebreak, and worth pinning: this is the difference between a lockup
+    and a cashout that worked."""
+    _, conn = _db(tmp_path / "tk", [
+        (BATCH, CASHOUT_PRESSED),
+        (BATCH, TICKET_PRINTED),
+        (BATCH, HANDPAY_PENDING),
+    ])
+    assert find_unwanted(conn) == []
+
+
+def test_the_0x57_walk_still_refuses_a_zero_gap(tmp_path):
+    """The guard that stopped two false positives stays. A 0x57 and a 0x51
+    in one batch are NOT evidence of a sequence, because the 0x51 may be
+    §7.8.1 reissuing an older lockup every fifteen seconds."""
+    _, conn = _db(tmp_path / "vr", [
+        (BATCH, CASHOUT_PRESSED),
+        (BATCH, VALIDATION_REQUEST),
+        (BATCH, HANDPAY_PENDING),
+    ])
+    found = find_unwanted(conn)
+    assert all(f["requested_at"] is None for f in found), (
+        "a 0x51 sharing a batch with a 0x57 must not be charged to it: "
+        f"{found}")

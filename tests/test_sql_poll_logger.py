@@ -2087,8 +2087,15 @@ def test_pool_age_alert_zero_disables_it(capsys):
     history = HistoryConfig(mode="ring")
     seed_pool(conn, 1, issued_at="2020-01-01T00:00:00+00:00")  # ancient
     client = ScriptedClient([make_meters()])
-    poll_and_log(client, conn, state, history, monotonic_fn=clock, pool_age_alert_hours=0)
-    assert "ALERT: validation_pool" not in capsys.readouterr().out
+    # pool_depth_alert=0 too: this test is about the AGE flag, and a
+    # one-number pool is legitimately low. Two alerts now share the
+    # "ALERT: validation_pool" prefix and they answer different questions
+    # -- is a top-up reaching this gateway, versus will there be a number
+    # for the next cashout. Asserting on the prefix made this test pass
+    # for the wrong reason the moment the second one existed.
+    poll_and_log(client, conn, state, history, monotonic_fn=clock,
+                 pool_age_alert_hours=0, pool_depth_alert=0)
+    assert "oldest available number" not in capsys.readouterr().out
 
 
 # --- synced_at: ticket tables are drain-eligible, meters never are ---------
@@ -4628,3 +4635,95 @@ def test_a_jackpot_handpay_gets_no_composition_block():
     assert HANDPAY_LEVEL_CANCELLED_CREDITS == 0x80
     assert "if info.level == HANDPAY_LEVEL_CANCELLED_CREDITS:" in src, \
         "the block must be gated on cancelled credits, not printed always"
+
+
+# --- Pool DEPTH, which the age alert cannot see ------------------------
+#
+# 2026-11-11. The lab gateway alerted "oldest available number is 243.3h
+# old" and was in no danger at all -- barely a cashout in ten days, so the
+# numbers were still there. The dangerous state is the opposite one: a
+# busy floor machine topped up an hour ago with 190 of 200 gone, which the
+# age check calls healthy right up to the last number.
+#
+# At zero the gateway has nothing to answer a 0x57 with, so every cashout
+# becomes a handpay -- below the printer limit, with every credit type
+# printing correctly and the host answering in time. And it fails
+# correlated: if the top-up stops, every gateway drains at once.
+
+def _pool_db(available, assigned_recent=0):
+    conn = make_db()
+    for i in range(available):
+        conn.execute("INSERT INTO validation_pool (validation_number, "
+                     "validation_system_id, status, issued_at) "
+                     "VALUES (?,0,'available',datetime('now'))", (900000 + i,))
+    for i in range(assigned_recent):
+        conn.execute("INSERT INTO validation_pool (validation_number, "
+                     "validation_system_id, status, issued_at, assigned_at) "
+                     "VALUES (?,0,'assigned',datetime('now'),datetime('now'))",
+                     (800000 + i,))
+    conn.commit()
+    return conn
+
+
+def test_a_young_but_nearly_empty_pool_is_flagged(capsys):
+    """The case the age alert is blind to."""
+    from sql_poll_logger import check_pool_depth, utc_now
+    conn = _pool_db(available=4, assigned_recent=96)
+    check_pool_depth(conn, utc_now(), min_available=25, state=PollState())
+    out = capsys.readouterr().out
+    assert "4 number(s) available" in out, out
+    assert "every cashout becomes a handpay" in out, out
+
+
+def test_it_projects_how_long_is_left_from_the_measured_rate(capsys):
+    """A depth alone cannot tell an operator when to top up. Ten left is
+    comfortable at one a day and an emergency at six an hour."""
+    from sql_poll_logger import check_pool_depth, utc_now
+    conn = _pool_db(available=10, assigned_recent=48)   # 2/h over 24h
+    check_pool_depth(conn, utc_now(), min_available=25, state=PollState())
+    out = capsys.readouterr().out
+    assert "5.0h left at 2.0/h" in out, out
+
+
+def test_a_full_pool_says_nothing(capsys):
+    from sql_poll_logger import check_pool_depth, utc_now
+    conn = _pool_db(available=200)
+    check_pool_depth(conn, utc_now(), min_available=25, state=PollState())
+    assert capsys.readouterr().out == ""
+
+
+def test_one_row_per_EPISODE_not_one_per_cycle():
+    """The age alert learned this the hard way: a condition that holds for
+    hours must not write a row every cycle."""
+    from sql_poll_logger import check_pool_depth, utc_now
+    conn, state = _pool_db(available=2), PollState()
+    for _ in range(5):
+        check_pool_depth(conn, utc_now(), min_available=25, state=state)
+    n = conn.execute("SELECT COUNT(*) FROM poll_errors WHERE "
+                     "error_type='PoolLow'").fetchone()[0]
+    assert n == 1, f"{n} rows for one episode"
+
+
+def test_a_top_up_clears_it_and_records_that_it_arrived(capsys):
+    """Clearing is worth exactly one row: it is the evidence a top-up
+    actually reached this gateway."""
+    from sql_poll_logger import check_pool_depth, utc_now
+    conn, state = _pool_db(available=2), PollState()
+    check_pool_depth(conn, utc_now(), min_available=25, state=state)
+    assert state.pool_low_since is not None
+    for i in range(50):
+        conn.execute("INSERT INTO validation_pool (validation_number, "
+                     "validation_system_id, status, issued_at) "
+                     "VALUES (?,0,'available',datetime('now'))", (700000 + i,))
+    check_pool_depth(conn, utc_now(), min_available=25, state=state)
+    assert state.pool_low_since is None
+    assert conn.execute("SELECT COUNT(*) FROM poll_errors WHERE "
+                        "error_type='PoolLowCleared'").fetchone()[0] == 1
+    assert "no longer low" in capsys.readouterr().out
+
+
+def test_zero_disables_it(capsys):
+    from sql_poll_logger import check_pool_depth, utc_now
+    check_pool_depth(_pool_db(available=0), utc_now(), min_available=0,
+                     state=PollState())
+    assert capsys.readouterr().out == ""

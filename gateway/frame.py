@@ -145,6 +145,11 @@ class MessageType:
     ROTATE_KEY = 0x10         # S->G  key rotation (§10.5)
     REVOKE = 0x11             # S->G  key revocation
     DISABLE = 0x12            # S->G  with reason; §8.1 governs when
+    ENABLE = 0x13             # S->G
+    POOL_REPLACE = 0x14       # S->G  new epoch, revoke-prior-available (§7.4)
+    VALIDATION_QUERY = 0x20   # G->S  ticket-in: number read from escrow (§9)
+    VALIDATION_RESPONSE = 0x21  # S->G  ALLOW with amount, or REJECT + reason
+    REDEMPTION_RESULT = 0x22  # G->S  completion status read from the machine
 
 
 KNOWN_TYPES = frozenset(
@@ -155,10 +160,13 @@ KNOWN_TYPES = frozenset(
 # names message-confusion as a thing the header exists to prevent.
 GATEWAY_TO_SERVER = frozenset({
     MessageType.HEARTBEAT, MessageType.EVENT_BATCH,
-    MessageType.ON_DEMAND_RESULT, MessageType.ALERT})
+    MessageType.ON_DEMAND_RESULT, MessageType.ALERT,
+    MessageType.VALIDATION_QUERY, MessageType.REDEMPTION_RESULT})
 SERVER_TO_GATEWAY = frozenset({
     MessageType.PULL_INVITE, MessageType.ACK, MessageType.ON_DEMAND_PULL,
-    MessageType.ROTATE_KEY, MessageType.REVOKE, MessageType.DISABLE})
+    MessageType.ROTATE_KEY, MessageType.REVOKE, MessageType.DISABLE,
+    MessageType.ENABLE, MessageType.POOL_REPLACE,
+    MessageType.VALIDATION_RESPONSE})
 assert GATEWAY_TO_SERVER | SERVER_TO_GATEWAY == KNOWN_TYPES
 assert not (GATEWAY_TO_SERVER & SERVER_TO_GATEWAY)
 

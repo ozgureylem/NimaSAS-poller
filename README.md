@@ -87,10 +87,12 @@ lookup, HMAC before the sequence check, message type after verification,
 and the JSON parser last. The tests assert the order, including that the
 key store is *not* consulted for a malformed client_id.
 
-**What is not built yet:** the TCP client, the 15-second heartbeat, the
-server-invited drain, pool epochs and signature verification, and key
-rotation. Eight tables carry a `synced_at` column and nothing sets one. The
-gateway accumulates correctly and cannot yet hand anything over.
+**What is not in this repository:** the TCP client, the 15-second
+heartbeat, the server-invited drain, pool epochs and signature
+verification, and key rotation. Eight tables carry a `synced_at` column
+and nothing here sets one. The poller's `--server-ticket-authority` flag
+(spec §9) writes its question to a table and needs a gateway client to
+carry it; without one it refuses every ticket.
 
 ## The tools
 

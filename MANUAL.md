@@ -389,16 +389,17 @@ direction: when a machine is ready to print a cashout ticket, it waits
 for the host to hand it a validation number. This tool answers that
 locally, from a pool you seed in advance (`--seed-validation-pool`, or
 hand-inserted real numbers) — no server round-trip, which is exactly
-the split your own project's Technical v3 §5.4/§5.8 describes: cashout
-is gateway-authority, redemption isn't. See §4.4 for the full mechanism
+the split the migration specification (V2) describes in §7.1 and §9:
+cashout is answered by the gateway from a pool the server issued,
+redemption is the server's decision. See §4.4 for the full mechanism
 and §6.3 for why this direction gets a spend-from pool while ticket-in
 only ever gets a read-only log. Every cycle also checks the pool's
-*age* (`--pool-age-alert-hours`, default 36 — Decisions Annex D-16): a
+*age* (`--pool-age-alert-hours`, default 36 — spec V2 §7.4 and §15): a
 pool that stale is raised as an active, repeated alert, never used to
 block dispensing — age isn't an integrity signal, it's a sign that
 nothing is topping this gateway's pool up.
 
-**General-poll reliability** (Decisions Annex D-09): a failed general
+**General-poll reliability** (spec V2 §5.2): a failed general
 poll is re-polled immediately, up to `--general-poll-retries` (default
 3) consecutive attempts, rather than waiting out the rest of
 `--interval` — SAS delivers one pending exception per poll, and an
@@ -454,11 +455,14 @@ A lab/stress-test run: logs every single poll (uncapped), polling every
 | `--skip-table-c7-sweep` | off | Skip the ~154-meter Table C-7 sweep (13 chunked `0x6F` exchanges; their columns are left `NULL`); every other meter poll still runs. Much cheaper per meter than `--skip-full-meter-sweep`'s target (12 meters/exchange vs. 1), so worth leaving on even where that one isn't affordable — see §4.4. |
 | `--skip-validation-meters-sweep` | off | Skip the 12 `0x50` exchanges, one per validation type (their columns are left `NULL`); every other meter poll still runs. Explicitly redundant with the Table C-7 validation meters (`0x80`+) — deliberate cross-check, not waste — but `0x50` has no batching, so it's the priciest of the three sweeps per meter actually obtained — see §4.4. |
 | `--skip-last-accepted-bill-poll` | off | Skip `0x48` (its columns are left `NULL`); every other meter poll still runs. Not a cost lever like the sweeps above — §7.11 warns some older gaming machines don't support `0x48` at all, and unlike `0x6F`'s per-meter soft-skip that failure aborts the *whole* exchange, so left on, it would fail every cycle on such a machine — see §4.4. |
-| `--general-poll-retries N` | `3` | Consecutive immediate re-poll attempts on a failed general poll before waiting for the next `--interval` cycle (Decisions Annex D-09). `1` disables retrying. |
+| `--general-poll-retries N` | `3` | Consecutive immediate re-poll attempts on a failed general poll before waiting for the next `--interval` cycle (spec V2 §5.2). `1` disables retrying. |
 | `--drain-priority` / `--no-drain-priority` | **ON** | Above 50% of the event budget §2.3.3 lets a host collect, defer the optional meter sweeps and spend the slots on general polls instead; resume below 30%. Coin in, coin out and games played are still read every cycle — only the 39 single meters, 13 Table C-7 chunks and 12 validation polls are deferred, and all of those are cumulative, so reading them a minute later costs nothing. A real time event the queue drops in the meantime is gone for good: no meter carries a player's turnover. **On by default since 2026-11-11**; it was off until the measurements settled the trade. `--no-drain-priority` turns it off and exists for measuring what the deferral is worth. |
 | `--drain-fast-poll` | off | While drain priority is active, poll at the machine's advertised fast rate (§12.2) instead of `--min-poll-interval`, and go back the moment it ends. Table 7.14e bit 0 is where the machine says it supports this; a machine that has not said so is never polled fast. |
 | `--drain-fast-poll-fallback SECONDS` | — | The rate to use during a drain when the machine advertises no fast rate of its own. |
-| `--pool-age-alert-hours HOURS` | `36.0` | Print an active, repeated `ALERT:` line (and log a `PoolStale` row) every cycle the oldest available `validation_pool` number is at or above this age (Decisions Annex D-16). Never blocks dispensing. `0` or negative disables it. |
+| `--server-ticket-authority` | off | **Ticket-in answered by the server** (spec V2 §9). On exception `0x67` the poller writes the escrowed ticket's number to `validation_queries`; the gateway client (`python3 -m gateway.client`, a separate process) sends it as `VALIDATION_QUERY` and writes the answer back; the poller sends LP `0x71` with the server's code and the server's amount. The gateway decides nothing — not validity, not the amount, not even for a ticket it printed. With no client or no server, every ticket is refused with `0x80` and returned. Cannot be combined with `--lab-ticket-authority`. The gateway client is in the private repository only (`docs/private/SERVER-LINK.md` there); in a checkout without it, this flag refuses every ticket. |
+| `--ticket-query-timeout SECONDS` | `2.0` | How long the poll loop waits for the server's answer to one ticket before refusing it locally. Nothing else is polled during the wait, so it is restricted to `0.1`–`4.0` — inside §2.3.3's 5 s ceiling. Spec V2 §15 lists `QUERY_TIMEOUT` as "pending lab"; this is a starting value. |
+| `--ticket-query-backoff SECONDS` | `30.0` | After an unanswered query, refuse tickets locally **without asking** for this long (spec V2 §9.2), so customer reinsertion cannot amplify a slow server. |
+| `--pool-age-alert-hours HOURS` | `36.0` | Print an active, repeated `ALERT:` line (and log a `PoolStale` row) every cycle the oldest available `validation_pool` number is at or above this age (spec V2 §7.4, §15). Never blocks dispensing. `0` or negative disables it. |
 
 ### 4.4 What's actually happening (technical)
 
@@ -478,8 +482,8 @@ Each cycle then does three things, in order:
 **0. A validation_pool age check.** Independent of whether a cashout is
 even pending this cycle — see step 1's `0x57` handling below for the
 pool itself — every cycle checks how old the oldest still-`available`
-row is. At or above `--pool-age-alert-hours` (default 36, per the
-project's own Decisions Annex D-16) it prints an unmissable `ALERT:`
+row is. At or above `--pool-age-alert-hours` (default 36, per spec V2
+§15's pool age flag) it prints an unmissable `ALERT:`
 line and writes a `PoolStale` row to `poll_errors`, repeated every
 cycle the condition holds — the same treatment as `--db-size-warning-mb`
 above, not a quiet log entry. This **never blocks dispensing**: age
@@ -767,8 +771,8 @@ columns refreshed every cycle or can live with them stale/`NULL`.
   almost always means `--seed-validation-pool` was only run once and
   the pool has simply been consumed by test cashouts since. Re-seed it,
   or lower `--pool-age-alert-hours` if 36h doesn't suit a fast lab
-  test cycle. This never blocks dispensing on its own (Decisions Annex
-  D-16) — it's a health signal, not a validity check.
+  test cycle. This never blocks dispensing on its own (spec V2
+  §7.4) — it's a health signal, not a validity check.
 - **Database file grows large during a long `append`-mode stress run**:
   expected — that mode never deletes rows by design. Either plan disk
   space accordingly or switch to `ring` mode, which won't grow past
@@ -1248,8 +1252,8 @@ CREATE VIEW ticket_in_history AS ...
 
 `issued_at` is set by `seed_validation_pool()` to when a row entered the
 pool — this reference tool's stand-in for a real server recording when
-it minted a batch. It's what the pool-age check (§4.4, Decisions Annex
-D-16) reads; a hand-inserted real number with no batch info recorded
+it minted a batch. It's what the pool-age check (§4.4, spec V2
+§7.4) reads; a hand-inserted real number with no batch info recorded
 leaves it `NULL`, which the age check treats as unknown rather than
 brand-new or infinitely old.
 
@@ -2230,6 +2234,10 @@ turn the next cashout into a handpay.
 - `README.md` — repository layout and the licensing note on
   `docs/spec/` and `docs/sastest/` (private repo only — not present in
   the public code-only repo).
+- `docs/private/SERVER-LINK.md` — **private repo only.** The gateway
+  client (`python3 -m gateway.client`), ticket-in answered by a server,
+  and a stand-in server that runs on a Windows or Linux laptop so both can
+  be tested before the real gateway service exists.
 - `saspy/client.py` and `tests/test_client.py` — the authoritative,
   current list of implemented long polls.
 - `saspy/crc.py` and `saspy/framing.py` — the module docstrings there
