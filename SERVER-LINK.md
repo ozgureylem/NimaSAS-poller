@@ -208,7 +208,7 @@ is unaffected, because it is answered from the pool.
 ### 2.2 What the server does to the pool on its own
 
 Three things, from the validation-pool spec change of 2026-11-12
-(`docs/project/VALIDATION-POOL-RULES-SPEC-CHANGE.md`):
+(`docs/project/VALIDATION-POOL-RULES-SPEC-CHANGE.md`, private repository):
 
 | when | what | size |
 |---|---|---|

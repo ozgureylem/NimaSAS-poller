@@ -170,7 +170,7 @@ list. Tests whose *subject* is a lab tool go with it; tests that merely
 reference one stay and skip.
 
 Also absent: floor captures, survey data, machine serials, the licensed
-specification, and `legacy/sas.py` — the Python 2 predecessor this was
+specification, and `legacy/sas.py` (private repository) — the Python 2 predecessor this was
 cleaned from, which stays private so the clean-room separation keeps
 meaning something. `legacy/meter_snapshot-2026-11-08-pre-probe-table.py` is
 here, because surveys taken before that date were taken with it and a
@@ -178,7 +178,8 @@ snapshot can only be read against the tool that wrote it.
 
 ## Verified against real hardware
 
-Every meter claim in `tests/test_hardware_vectors.py` was read over SAS from
+Every meter claim in this repository's hardware-vector tests (kept in the
+private repository, not mirrored here) was read over SAS from
 an EGT Premier and then found on that machine's own accounting display, to
 the cent. Where this project's documents and the specification disagree, the
 disagreement is written down with the measurement that settled it.

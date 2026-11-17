@@ -364,10 +364,15 @@ source.
   can't both be right, and a field-order mistake otherwise passes every
   test written from the spec.
 - **As a fallback.** A cabinet that doesn't implement LP `0x6F` doesn't
-  refuse it: SAS §4.4 lets it stay silent, so each chunk costs a full
-  timeout. After three sweeps with zero codes answered, the C-7 probation
-  turns C-7 off **and forces both cadenced sweeps back to every cycle**.
-  Answering only some codes is normal, and SAS §7.21b allows it.
+  refuse it: SAS §4.4 lets it stay silent. So a chunk that times out
+  and has **never** answered on this cabinet is taken to mean "C-7 isn't
+  here": the rest of the C-7 columns are left NULL, the cycle completes,
+  and the core meters read earlier in it are kept. After three sweeps
+  with zero codes answered, the C-7 probation turns C-7 off **and forces
+  both cadenced sweeps back to every cycle**. A chunk that **has**
+  answered before and then goes silent is treated as a dead link, not a
+  missing feature (§A3.2). Answering only some codes is normal, and
+  SAS §7.21b allows it.
 
 **Why these cadences.** Both sweeps are read often enough that a
 reconciliation window of a few minutes contains more than one reading of
@@ -778,7 +783,11 @@ chassis label, the SAS serial (LP `0x54`), and sometimes a vendor terminal
 ID. **The SAS serial and asset number are typed in by a technician during
 a RAM clear**, so they can be blank, mistyped, or swapped. The asset
 number isn't even unique on a floor: a multi-station cabinet reports its
-station index in that field.
+station index in that field. The two tend to fail on the same cabinets,
+because one person types both at the same moment, so neither is a safe
+fallback for the other. The poller treats a serial that is empty, all
+zeros, a placeholder such as "n/a", or just the asset number retyped as
+**no serial at all**, rather than as an identity that happens to be blank.
 
 So identity is never trusted once. The poller keeps **epochs**
 (`machine_epochs`): boundaries across which meter deltas aren't
@@ -951,6 +960,11 @@ with you.
 - **Not built on the gateway:** `ON_DEMAND_PULL`, `ROTATE_KEY`, `REVOKE`,
   `DISABLE` and `ENABLE`. Each is authenticated, answered with an
   `ALERT` naming it, and otherwise ignored.
+- **Consequence for commissioning:** the specification (§10.5) requires
+  the key a technician typed to be replaced by a `ROTATE_KEY` on the first
+  authenticated session, and a gateway that can't complete that is not
+  commissioned. Because `ROTATE_KEY` isn't built on the gateway yet, that
+  requirement isn't met yet.
 
 **Heartbeat (spec Appendix B.3).** Beyond the specification's fields it
 carries:
@@ -965,6 +979,12 @@ carries:
 **Event batches.** Each event carries `epoch_id`, and each batch carries
 the full epochs its rows belong to, so the server can place every row on
 a cabinet from the batch alone.
+
+**Meter widths (spec §11.3).** The specification has the server correct
+rollover against each meter's own declared width. The `saspy` client
+reads that width from every LP `0x6F`/`0xAF` reply (`SelectedMeters.sizes`),
+but the poller doesn't store it yet and the drain doesn't send it, so the
+server has no per-meter width to use yet.
 
 **What drains (spec §6.2 and Appendix B).**
 - `meters_history` **does** drain.

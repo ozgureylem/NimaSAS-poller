@@ -213,7 +213,7 @@ file; `sql_poll_logger.py` is the gateway proper.
 than a device path.** Every other tool that talks to a machine takes
 `/dev/...`. Both directions of that confusion have cost real bench time,
 so the test suite now enforces it across every document in this
-repository (`tests/test_commands_doc.py`).
+repository (`tests/test_commands_doc.py`, private repository).
 
 To survive a reboot, install the unit:
 

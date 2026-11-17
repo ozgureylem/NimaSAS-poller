@@ -459,7 +459,7 @@ A lab/stress-test run: logs every single poll (uncapped), polling every
 | `--drain-priority` / `--no-drain-priority` | **ON** | Above 50% of the event budget §2.3.3 lets a host collect, defer the optional meter sweeps and spend the slots on general polls instead; resume below 30%. Coin in, coin out and games played are still read every cycle — only the 39 single meters, 13 Table C-7 chunks and 12 validation polls are deferred, and all of those are cumulative, so reading them a minute later costs nothing. A real time event the queue drops in the meantime is gone for good: no meter carries a player's turnover. **On by default since 2026-11-11**; it was off until the measurements settled the trade. `--no-drain-priority` turns it off and exists for measuring what the deferral is worth. |
 | `--drain-fast-poll` | off | While drain priority is active, poll at the machine's advertised fast rate (§12.2) instead of `--min-poll-interval`, and go back the moment it ends. Table 7.14e bit 0 is where the machine says it supports this; a machine that has not said so is never polled fast. |
 | `--drain-fast-poll-fallback SECONDS` | — | The rate to use during a drain when the machine advertises no fast rate of its own. |
-| `--server-ticket-authority` | off | **Ticket-in answered by the server** (spec V2 §9). On exception `0x67` the poller writes the escrowed ticket's number to `validation_queries`; the gateway client (`python3 -m gateway.client`, a separate process) sends it as `VALIDATION_QUERY` and writes the answer back; the poller sends LP `0x71` with the server's code and the server's amount. The gateway decides nothing — not validity, not the amount, not even for a ticket it printed. With no client or no server, every ticket is refused with `0x80` and returned, which is correct and not a degraded mode: **a server outage must halt ticket-in** (operator, 2026-11-15; MIGRATION-SPEC-AMENDMENTS A27). This is the only ticket authority there is — the `--lab-ticket-authority` file that once answered locally was removed the same day. The gateway client is in the private repository only (`docs/private/SERVER-LINK.md` there); in a checkout without it, this flag refuses every ticket. |
+| `--server-ticket-authority` | off | **Ticket-in answered by the server** (spec V2 §9). On exception `0x67` the poller writes the escrowed ticket's number to `validation_queries`; the gateway client (`python3 -m gateway.client`, a separate process) sends it as `VALIDATION_QUERY` and writes the answer back; the poller sends LP `0x71` with the server's code and the server's amount. The gateway decides nothing — not validity, not the amount, not even for a ticket it printed. With no client or no server, every ticket is refused with `0x80` and returned, which is correct and not a degraded mode: **a server outage must halt ticket-in** (operator, 2026-11-15; MIGRATION-SPEC-AMENDMENTS A27). This is the only ticket authority there is — the `--lab-ticket-authority` file that once answered locally was removed the same day. The gateway client ships in this repository (`gateway/client.py`, documented in `SERVER-LINK.md`); in a checkout without a reachable server, this flag refuses every ticket. |
 | `--ticket-query-timeout SECONDS` | `2.0` | How long the poll loop waits for the server's answer to one ticket before refusing it locally. Nothing else is polled during the wait, so it is restricted to `0.1`–`4.0` — inside §2.3.3's 5 s ceiling. Spec V2 §15 lists `QUERY_TIMEOUT` as "pending lab"; this is a starting value. |
 | `--ticket-query-backoff SECONDS` | `30.0` | After an unanswered query, refuse tickets locally **without asking** for this long (spec V2 §9.2), so customer reinsertion cannot amplify a slow server. |
 | `--pool-age-alert-hours HOURS` | `36.0` | Print an active, repeated `ALERT:` line (and log a `PoolStale` row) every cycle the oldest available `validation_pool` number is at or above this age (spec V2 §7.4, §15). Never blocks dispensing. `0` or negative disables it. |
@@ -1146,7 +1146,7 @@ poll's behavior against a 6.0 or 6.01 machine as something to verify
 against that machine, not something this library guarantees.
 
 The full current set of implemented long polls is best read directly
-from `saspy/client.py` and `tests/test_client.py`, since it's the part
+from `saspy/client.py` and `tests/test_client.py` (private repository), since it's the part
 of this project most likely to grow; this manual won't try to keep a
 duplicate list in sync.
 
@@ -1734,7 +1734,7 @@ Total In - Total Out  =  Total Bet - Total Won
 ```
 
 26.74 held on 42.90 wagered is 62.33%, against the screen's **Machine hold
-62.34%**. `tests/test_hardware_vectors.py` asserts all of these against
+62.34%**. `tests/test_hardware_vectors.py` (private repository) asserts all of these against
 `captures/`.
 
 **`0004` DOES include AFT transfers to the host.** This manual briefly said
@@ -2102,7 +2102,7 @@ Everything in this section was read off hardware between 26 and 30 October
 cabinet floor survey. Where a claim here disagrees with a planning document,
 the measurement is the thing to trust and the document is the thing to
 correct. The private repo carries the evidence trail in
-`docs/project/HANDOVER.md`.
+`docs/project/HANDOVER.md` (private repository).
 
 ### 8.1 The meter mapping, proved three ways
 
@@ -2306,11 +2306,15 @@ turn the next cashout into a handpay.
 - `README.md` — repository layout and the licensing note on
   `docs/spec/` and `docs/sastest/` (private repo only — not present in
   the public code-only repo).
-- `docs/private/SERVER-LINK.md` — **private repo only.** The gateway
-  client (`python3 -m gateway.client`), ticket-in answered by a server,
-  and a stand-in server that runs on a Windows or Linux laptop so both can
-  be tested before the real gateway service exists.
-- `saspy/client.py` and `tests/test_client.py` — the authoritative,
+- `SERVER-LINK.md` — **now in this repository.** The gateway client
+  (`python3 -m gateway.client`), ticket-in answered by a server, and a
+  stand-in server that runs on a Windows or Linux laptop so both can be
+  tested before the real gateway service exists. The whole of `gateway/`
+  ships here too, `service.py` included. (Corrected 2026-11-17: this said
+  "private repo only" and pointed at `docs/private/SERVER-LINK.md`, which
+  would have told a reader the server-link half of the system was not
+  delivered.)
+- `saspy/client.py`, and `tests/test_client.py` in the private repository — the authoritative,
   current list of implemented long polls.
 - `saspy/crc.py` and `saspy/framing.py` — the module docstrings there
   document the CRC-16 wire-byte-order finding and general frame

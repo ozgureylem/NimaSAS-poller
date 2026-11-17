@@ -297,7 +297,7 @@ Before spending a session photographing screens, ask the machine which
 matches are even available to be made:
 
 ```bash
-python3 examples/meter_fingerprint.py /dev/ttyUSB0 --address 1
+[meter_fingerprint.py is lab-only and is not in this repository -- see NimaSAS]
 ```
 
 It reports every group of meters holding the same value (mutually
@@ -343,7 +343,7 @@ This is the point of the tool.
    you have them.
 5. **Hand it over with the bytes.** The exact TX/RX pair is what lets
    someone add the poll to `saspy` with a real test behind it —
-   `tests/test_client.py` builds its fixtures field by field from the
+   `tests/test_client.py` (private repository) builds its fixtures field by field from the
    spec tables, and a captured exchange is exactly what is needed to
    write one.
 

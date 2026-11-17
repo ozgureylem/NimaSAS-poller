@@ -40,7 +40,7 @@ python3 examples/meter_snapshot.py /dev/ttyUSB0 --address 1   # device path
 ```
 
 Both directions of that confusion have cost bench time, including once
-from a command written into a chat message. `tests/test_commands_doc.py`
+from a command written into a chat message. the documentation tests (private repository)
 now enforces it across every document in this repository, so a wrong one
 fails the suite rather than wasting an afternoon.
 
@@ -358,7 +358,7 @@ python3 examples/meter_snapshot.py gateway.ini
 ```
 
 The first is the mistake that wasted a session. Both are now caught by
-`tests/test_commands_doc.py` if they appear in any document here.
+the documentation tests (private repository) if they appear in any document here.
 
 ```bash
 # WRONG on macOS: hangs with no error, looks exactly like a dead cable.
