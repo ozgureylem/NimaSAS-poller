@@ -4702,12 +4702,60 @@ def _poll_all_meters(
             # as a bug being patched.
             alternate = chunk_num % 2 == 0
             fn = client.send_extended_meters_alternate if alternate else client.send_extended_meters
-            result = poll(
-                f"send_extended_meters{'_alternate' if alternate else ''}"
-                f"(chunk {chunk_num}/{TABLE_C7_CHUNK_COUNT})",
-                fn,
-                list(chunk_codes),
-            )
+            chunk_name = (f"send_extended_meters{'_alternate' if alternate else ''}"
+                          f"(chunk {chunk_num}/{TABLE_C7_CHUNK_COUNT})")
+            # A CABINET WITH NO LP 0x6F AT ALL ANSWERS NOTHING, AND §4.4 SAYS
+            # THAT IS CORRECT OF IT.
+            #
+            # There are two ways a machine can lack Table C-7, and until
+            # 2026-11-17 only one of them worked:
+            #
+            #   it ANSWERS 0x6F and reports every code unsupported (size=0)
+            #       -> the sweep completes with 0 of 154, the probation
+            #          detector below counts empty sweeps, gives up, and
+            #          forces both meter intervals back to every cycle.
+            #
+            #   it IGNORES 0x6F entirely, which §4.4 REQUIRES of a machine
+            #   that does not support a long poll ("the gaming machine will
+            #   ignore it", silently)
+            #       -> every chunk times out. As a mandatory poll that
+            #          aborted the whole cycle, so NO meter row was written
+            #          at all -- not a degraded row, nothing -- and
+            #          sweep_completed was never True, so the detector never
+            #          ran and the fallback never fired. Measured: twelve
+            #          cycles, twelve poll_errors, ZERO rows in
+            #          meters_history, c7_supported still None.
+            #
+            # The second is the spec-mandated behaviour, so it was the more
+            # likely one, and it took the money meters down with it: the
+            # core polls had already succeeded earlier in the cycle and
+            # their values were discarded with the row.
+            #
+            # So a timeout on a chunk this cabinet has NEVER answered is
+            # treated as "C-7 is not here": the remaining columns go NULL,
+            # the sweep ends, and the cycle completes normally so the
+            # detector below sees an empty sweep and can decide.
+            #
+            # A chunk that HAS answered before is the opposite case and
+            # keeps the old behaviour exactly -- silence from a poll the
+            # cabinet has proven it supports is the LINK, not the feature
+            # set, and that must still abort the cycle and start the gap
+            # clock. That distinction is METER_SUPPORT's whole job.
+            try:
+                result = poll(chunk_name, fn, list(chunk_codes))
+            except _MeterPollFailure as chunk_failure:
+                if (isinstance(chunk_failure.original, SASTimeoutError)
+                        and not isinstance(chunk_failure.original, SASPreempted)
+                        and not METER_SUPPORT.is_known_good(chunk_name)):
+                    for remaining in TABLE_C7_EXTENDED_COLUMNS:
+                        values.setdefault(remaining, None)
+                    print(f"[{now}] {chunk_name} has never answered and "
+                          "answered nothing now: treating LP 0x6F as "
+                          "unsupported on this cabinet (§4.4), not as a dead "
+                          "link. The cycle continues; the probation check "
+                          "decides whether to stop sweeping.")
+                    break
+                raise
             # .get(), not [] -- a code absent from result.meters means the
             # machine answered normally but reported that specific meter as
             # unsupported (size=0, §7.21b), not a failure. That's a known

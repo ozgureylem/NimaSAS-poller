@@ -126,10 +126,26 @@ NEVER_PRUNED = frozenset({
 #
 # These are a DISASTER-RECOVERY window, not a tidiness threshold: the
 # gateway is the server's backup of last resort, so a server restored from
-# a backup younger than the window can pull again what it lost. That needs
-# a "replay since T" command which does not exist yet -- until it does the
-# rows are kept and cannot be re-sent, and the window is a promise the
-# drain cannot keep.
+# a backup younger than the window can pull again what it lost.
+#
+# THE OTHER HALF OF THAT PROMISE IS NOW KEPT. This used to end "that needs
+# a 'replay since T' command which does not exist yet ... the window is a
+# promise the drain cannot keep." It exists: gateway/client.py's
+# apply_replay(), reached through the invite payload, puts acknowledged
+# rows back in the drain and is applied BEFORE that exchange collects its
+# events, so recovered rows ride the same batch.
+#
+# It is BY ROW ID, not by time, which is why the stale wording was wrong
+# in its shape and not only in its tense -- "since T" is the thing that
+# cannot be built correctly here. Event ids are arrival order within one
+# collection path, and a slower path files an older event under a newer
+# id, so a cut by time re-sends some rows twice and misses others. The
+# server names the last id it holds per table and everything above it
+# drains again.
+#
+# So the number below is a real budget now: it is how old a server backup
+# may be and still be made whole from the floor. Shortening it to save
+# disk shortens that.
 RETENTION_HOURS = {"machine_events": 72.0,
                    "meters_history": 72.0}      # inert while in NEVER_PRUNED
                                                 # (still listed there by

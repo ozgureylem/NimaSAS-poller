@@ -386,8 +386,17 @@ class SASClient:
         frame = build_command(self.address, bytes([poll]), crc_required=self._crc_required(poll))
         raw = self._exchange_fixed(frame, response_length=13, timeout=self.timeout)
         payload = self._strip(raw)
+        # THIS FIELD IS THE VALIDATION NUMBER, NOT THE PRINTED TICKET NUMBER.
+        #
+        # Table 15.5 names it "Validation number -- Standard validation
+        # number (calculated by the gaming machine)", 4 BCD. It is NOT the
+        # 0001-9999 sequence printed on the ticket, which lives in LP 0x4D
+        # (Table 15.13b) and is a different quantity entirely. This model
+        # called it ticket_number until 2026-11-17; a host joining the two
+        # on name would have joined a machine-calculated validation number
+        # to a print sequence that rolls over every 9999 tickets.
         return models.CashOutTicketInfo(
-            ticket_number=decode_bcd(payload[1:5]),
+            validation_number=decode_bcd(payload[1:5]),
             amount_cents=decode_bcd(payload[5:10]),
         )
 
@@ -681,6 +690,19 @@ class SASClient:
         data = payload[2:2 + length]
         resp_game_number = decode_bcd(data[0:2])
         meters: dict[int, int] = {}
+        # THE SIZE BYTE IS THE METER'S CAPACITY, AND IT WAS BEING DISCARDED.
+        #
+        # §7.21: the size "implies the maximum number of digits in the meter,
+        # i.e. meter rollover ... A meter that rolls over at 99,999,999 ...
+        # would therefore always have a size byte of 04 ... A meter with a
+        # maximum capacity of 12 digits would always have a size byte of 06."
+        #
+        # So the rollover modulus is 10 ** (2 * size), per meter, declared by
+        # the machine -- not the constant 100,000,000 a host might assume. It
+        # was parsed to decode the value and then dropped, so nothing
+        # downstream could know the width, and a rollover correction applied
+        # at eight digits to a wider meter is wrong by orders of magnitude.
+        sizes: dict[int, int] = {}
         idx = 2
         while idx < len(data):
             code = decode_binary_le(data[idx:idx + 2])
@@ -690,8 +712,10 @@ class SASClient:
             if size == 0:
                 continue  # unsupported meter: code + size=0, no value bytes (§7.21)
             meters[code] = decode_bcd(data[idx:idx + size])
+            sizes[code] = size
             idx += size
-        return models.SelectedMeters(game_number=resp_game_number, meters=meters)
+        return models.SelectedMeters(game_number=resp_game_number, meters=meters,
+                                     sizes=sizes)
 
     # -- Secure enhanced validation ID (0x4C, Table 15.6a/15.6b) -------------
 
@@ -736,7 +760,17 @@ class SASClient:
             time=f"{decode_bcd(payload[7:10]):06d}",
             validation_number=decode_bcd(payload[10:18]),
             amount_cents=decode_bcd(payload[18:23]),
-            ticket_number=decode_binary_le(payload[23:25]),
+            # FFFF IS "NO TICKET", NOT TICKET 65535 (Table 15.13b).
+            #
+            # The spec: "The sequential number printed on the ticket, starts
+            # at 0001, rolls over from 9999 to 0000 (FFFF for validations
+            # with no ticket)". A handpay or a jackpot receipt validated
+            # without printing carries FFFF, and decoding it as an integer
+            # stored a ticket number of 65535 against a record that never had
+            # a ticket -- a value a host could neither look up nor recognise
+            # as absent. None says absent, which is what the field means.
+            ticket_number=(None if decode_binary_le(payload[23:25]) == 0xFFFF
+                           else decode_binary_le(payload[23:25])),
             validation_system_id=decode_bcd(payload[25:26]),
             expiration=f"{decode_bcd(payload[26:30]):08d}",
             pool_id=decode_binary_le(payload[30:32]),

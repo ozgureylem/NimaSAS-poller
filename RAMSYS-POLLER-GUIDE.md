@@ -2,8 +2,8 @@
 
 **For:** the RamSys development team
 **From:** the NimaSAS project
-**Companion document:** *Linux Migration — Technical Specification V2*
-(6 November 2026), shared separately. The specification says **what** the
+**Companion document:** *Linux Migration — Technical Specification V2.1*
+(17 November 2026), shared separately. The specification says **what** the
 gateway layer must do. This document explains **what each file in this
 repository is for, and why it exists**, so you don't have to open every
 Python file to find out.
@@ -35,7 +35,7 @@ it is safe on a live machine.
 ### Conventions
 
 - **"SAS §n"** means the SAS 6.02 protocol specification. **"Spec §n"**
-  means the Linux Migration Technical Specification V2.
+  means the Linux Migration Technical Specification V2.1.
 - **LP `0xNN`** is a SAS long poll. A bare **`0xNN`** in an event context
   is a SAS exception code (Table A-1).
 - **Safety classes**, used throughout Part B:
@@ -934,11 +934,13 @@ The poller unit settings, and the reason for each:
 - **`PrivateNetwork=yes`, `NoNewPrivileges`, `ProtectSystem=strict`.**
   The poller needs one serial port and one directory, nothing else.
 
-## A10. The server link as built: where it differs from Specification V2
+## A10. The server link as built: where it differs from Specification V2.1
 
-The specification describes the server link as designed. These are the
-places where what is built, and what has since been decided, differs
-from it. Where they disagree, this section describes the code. Field
+The specification describes the server link as designed. Specification
+V2.1 already carries the retention windows, the disaster-recovery replay
+and the validation-pool rules; this section lists what it does not, and
+marks what is specified but not yet built. Where the two disagree, this
+section describes the code. Field
 names marked as proposals in `SERVER-LINK.md` §4 are open until agreed
 with you.
 
@@ -977,8 +979,13 @@ a cabinet from the batch alone.
   and **30 days** for every other drained table, by `db_maintain.py`
   every 12 hours.
 - A row the server hasn't acknowledged is never deleted.
-- The validation pool, machine epochs and `meters_history` are never
-  pruned.
+- These windows are the **disaster-recovery budget**: how old a server
+  backup can be and still be made whole from the floor by replay. They
+  aren't a disk-tidiness setting; shortening them shortens that.
+- The validation pool and machine epochs are never pruned.
+  `meters_history` isn't pruned either today: the specification gives it
+  72 hours, but `db_maintain.py` keeps a guard on it, by the operator's
+  choice.
 
 **The validation pool (spec §7.1 and §15).**
 - **Size is per gateway**, starting at 50, set on the server for each
@@ -991,6 +998,16 @@ a cabinet from the batch alone.
   this gateway missed its rotation.
 - **Issue order:** oldest issued first, by issue sequence, never by
   number.
+- **Uniqueness** is enforced on the 16-digit part of the number as well
+  as the full 18 digits, by the server, which is the only place it can be
+  floor-wide.
+- **Not built yet: per-number revocation.** The specification (§7.4)
+  requires the server to revoke unassigned numbers older than 35 hours
+  one by one, with a signed revoke list, and to replace half as many.
+  Today a rotation is a full `POOL_REPLACE` instead: every available
+  number is retired and the pool is re-issued at its full size. The
+  revoke list and its signature (§7.3) are still to be built, on both
+  sides.
 
 **Recovering from a server restore (not in the specification).**
 - **Sequence numbers.** At start, the server moves every gateway's send

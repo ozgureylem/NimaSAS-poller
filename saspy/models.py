@@ -9,7 +9,7 @@ fresh from its long-poll call and belongs to whoever called it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -193,10 +193,25 @@ class SelectedMeters:
     current value. Both long polls return the same shape here even though
     they differ on the wire (2F: 1-byte codes, fixed per-meter size from
     Table C-7; 6F: 2-byte codes, a self-describing size byte per meter).
+
+    ``sizes`` maps meter code to the BCD byte count the MACHINE declared for
+    it, which is the only statement of that meter's capacity anybody gets.
+    §7.21: a meter rolling over at 99,999,999 "would therefore always have a
+    size byte of 04 ... A meter with a maximum capacity of 12 digits would
+    always have a size byte of 06". So the rollover modulus is
+    10 ** (2 * size), per meter, and NOT a constant 100,000,000.
+
+    It was parsed and thrown away until 2026-11-17. A host correcting
+    rollover against an assumed eight digits is wrong on any meter the
+    machine declares wider, and nothing downstream could tell, because the
+    width never left this method. Empty for LP 0x2F, which has no size byte
+    at all -- there the width comes from Table C-7 and must be known in
+    advance.
     """
 
     game_number: int
     meters: dict[int, int]
+    sizes: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -212,7 +227,7 @@ class EnhancedValidationInfo:
     time: str  # HHMMSS
     validation_number: int
     amount_cents: int
-    ticket_number: int
+    ticket_number: int | None  # 0001-9999, rolls over; None when the spec's FFFF said no ticket
     validation_system_id: int
     expiration: str
     pool_id: int
@@ -299,7 +314,7 @@ class BillMeters:
 class CashOutTicketInfo:
     """Response to long poll 0x3D (Table 15.5)."""
 
-    ticket_number: int
+    validation_number: int  # Table 15.5: machine-calculated validation number, NOT the printed ticket sequence
     amount_cents: int
 
 
