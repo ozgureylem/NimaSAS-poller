@@ -1,0 +1,79 @@
+# Scheduled maintenance for the gateway database. Started by
+# nimasas-db-maintain.timer, never enabled on its own.
+#
+# What it does, beside a RUNNING poller: returns free pages to the
+# filesystem a few hundred at a time, and checkpoints the write-ahead log.
+# It does NOT run a full VACUUM -- that would hold the database for longer
+# than the ten seconds a cashout is allowed, and turn it into a handpay.
+#
+# It returns space only on a database converted ONCE with
+#   python3 examples/db_maintain.py enable-auto-vacuum --db ...
+# (poller and gateway client stopped). Until then each run says so and
+# changes nothing.
+#
+# IT DELETES, and only this: rows the SERVER ACKNOWLEDGED longer ago than
+# their table's retention. Decided by the operator 2026-11-15:
+#
+#     machine_events                 72 hours
+#     every other drained table      30 days
+#
+# A row the server has not acknowledged is never deleted, however old.
+# Never pruned at all: the validation pool, the machine epochs, and
+# meters_history -- the last because it does not drain yet, so the server
+# holds no copy of it. In --mode append that table therefore still grows;
+# this job cannot bound it until meters drain.
+#
+# The windows are a disaster-recovery margin: the gateway is the server's
+# backup of last resort. What that costs: analysis tools that read THIS
+# database stop seeing events older than three days once the server has
+# them. Remove --prune-acked to go back to deleting nothing.
+#
+# Install:
+#   sudo cp deploy/nimasas-db-maintain.service deploy/nimasas-db-maintain.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nimasas-db-maintain.timer
+#   systemctl list-timers nimasas-db-maintain.timer
+# Run once by hand:   sudo systemctl start nimasas-db-maintain.service
+# Read what it did:   journalctl -u nimasas-db-maintain.service -n 20
+#
+# IT MAINTAINS ONE DATABASE: the one named in ExecStart, which is the one
+# nimasas-poller.service writes. A poller started by hand against another
+# file -- the lab's soak runs use ~/soak.sqlite3 -- is NOT covered, and
+# that database grows with nothing bounding it. That is deliberate rather
+# than an oversight: soak data is what the analysis reads, and pruning it
+# at 72 hours is the operator's decision, not a timer's. To cover another
+# database, run this by hand with its --db, or add a drop-in:
+#   sudo systemctl edit nimasas-db-maintain.service
+# and remember ReadWritePaths must include its directory.
+#
+# Paths are the lab gateway's. A floor install uses /opt/nimasas and
+# /var/lib/nimasas (spec §5.13).
+
+[Unit]
+Description=NimaSAS gateway database maintenance (incremental vacuum, WAL checkpoint)
+Documentation=file:/home/nimasas/NimaSAS/MANUAL.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=nimasas
+WorkingDirectory=/home/nimasas/NimaSAS
+ExecStart=/usr/bin/python3 /home/nimasas/NimaSAS/examples/db_maintain.py run \
+    --db /home/nimasas/NimaSAS/gateway.sqlite3 \
+    --prune-acked
+# Below the poller in every queue that matters: this is housekeeping, and
+# the poller is on a clock.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nimasas-db-maintain
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=no
+ReadWritePaths=/home/nimasas/NimaSAS
+PrivateNetwork=yes
+PrivateDevices=yes

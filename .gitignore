@@ -151,3 +151,13 @@ survey/screens/
 survey/screens/
 survey/screens/
 survey/screens/
+
+# KEY MATERIAL for the server link. Neither was ignored until 2026-11-12,
+# and both sit in the directory people run git from.
+#   <db>.linkkey.json        on the gateway: its HMAC key (§10.5)
+#   <db>.pool-signing.key    on the server: the Ed25519 PRIVATE key that
+#                            signs validation pools (§7.3)
+# A `git add -A` on either machine would have committed one of them. The
+# gateway's has happened before with another key -- HANDOVER §1.
+*.linkkey.json
+*.pool-signing.key

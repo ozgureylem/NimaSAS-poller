@@ -459,7 +459,7 @@ A lab/stress-test run: logs every single poll (uncapped), polling every
 | `--drain-priority` / `--no-drain-priority` | **ON** | Above 50% of the event budget §2.3.3 lets a host collect, defer the optional meter sweeps and spend the slots on general polls instead; resume below 30%. Coin in, coin out and games played are still read every cycle — only the 39 single meters, 13 Table C-7 chunks and 12 validation polls are deferred, and all of those are cumulative, so reading them a minute later costs nothing. A real time event the queue drops in the meantime is gone for good: no meter carries a player's turnover. **On by default since 2026-11-11**; it was off until the measurements settled the trade. `--no-drain-priority` turns it off and exists for measuring what the deferral is worth. |
 | `--drain-fast-poll` | off | While drain priority is active, poll at the machine's advertised fast rate (§12.2) instead of `--min-poll-interval`, and go back the moment it ends. Table 7.14e bit 0 is where the machine says it supports this; a machine that has not said so is never polled fast. |
 | `--drain-fast-poll-fallback SECONDS` | — | The rate to use during a drain when the machine advertises no fast rate of its own. |
-| `--server-ticket-authority` | off | **Ticket-in answered by the server** (spec V2 §9). On exception `0x67` the poller writes the escrowed ticket's number to `validation_queries`; the gateway client (`python3 -m gateway.client`, a separate process) sends it as `VALIDATION_QUERY` and writes the answer back; the poller sends LP `0x71` with the server's code and the server's amount. The gateway decides nothing — not validity, not the amount, not even for a ticket it printed. With no client or no server, every ticket is refused with `0x80` and returned. Cannot be combined with `--lab-ticket-authority`. The gateway client is in the private repository only (`docs/private/SERVER-LINK.md` there); in a checkout without it, this flag refuses every ticket. |
+| `--server-ticket-authority` | off | **Ticket-in answered by the server** (spec V2 §9). On exception `0x67` the poller writes the escrowed ticket's number to `validation_queries`; the gateway client (`python3 -m gateway.client`, a separate process) sends it as `VALIDATION_QUERY` and writes the answer back; the poller sends LP `0x71` with the server's code and the server's amount. The gateway decides nothing — not validity, not the amount, not even for a ticket it printed. With no client or no server, every ticket is refused with `0x80` and returned, which is correct and not a degraded mode: **a server outage must halt ticket-in** (operator, 2026-11-15; MIGRATION-SPEC-AMENDMENTS A27). This is the only ticket authority there is — the `--lab-ticket-authority` file that once answered locally was removed the same day. The gateway client is in the private repository only (`docs/private/SERVER-LINK.md` there); in a checkout without it, this flag refuses every ticket. |
 | `--ticket-query-timeout SECONDS` | `2.0` | How long the poll loop waits for the server's answer to one ticket before refusing it locally. Nothing else is polled during the wait, so it is restricted to `0.1`–`4.0` — inside §2.3.3's 5 s ceiling. Spec V2 §15 lists `QUERY_TIMEOUT` as "pending lab"; this is a starting value. |
 | `--ticket-query-backoff SECONDS` | `30.0` | After an unanswered query, refuse tickets locally **without asking** for this long (spec V2 §9.2), so customer reinsertion cannot amplify a slow server. |
 | `--pool-age-alert-hours HOURS` | `36.0` | Print an active, repeated `ALERT:` line (and log a `PoolStale` row) every cycle the oldest available `validation_pool` number is at or above this age (spec V2 §7.4, §15). Never blocks dispensing. `0` or negative disables it. |
@@ -892,6 +892,78 @@ WantedBy=multi-user.target
 
 `Restart=always` rather than `on-failure` so a clean stop is also
 restarted; use `on-failure` if you want Ctrl-C/exit-0 to stay stopped.
+
+#### Keeping the database from growing: `db_maintain.py` and its timer
+
+Do **not** schedule a plain `VACUUM`. It rewrites the whole file and holds
+it while it does; a cashout that arrives in that window runs out its ten
+seconds (SAS 6.02 §15.7) and becomes a handpay. It also needs free disk
+about equal to the database. `examples/db_maintain.py` does the part a
+running gateway can afford:
+
+```
+python3 examples/db_maintain.py status --db gateway.sqlite3
+python3 examples/db_maintain.py run    --db gateway.sqlite3
+```
+
+`run` returns free pages to the filesystem a few hundred at a time — each
+step a transaction of milliseconds, with the poller writing in between —
+and checkpoints the write-ahead log. It is safe beside a running poller and
+is what the timer runs.
+
+Two things to know before expecting the file to shrink:
+
+- **It needs a one-time conversion.** Incremental vacuum only works on a
+  database in `auto_vacuum = INCREMENTAL` mode, and no database created so
+  far is. Converting takes one full `VACUUM`, so do it once, with the poller
+  **and** the gateway client stopped:
+
+  ```
+  sudo systemctl stop nimasas-poller
+  python3 examples/db_maintain.py enable-auto-vacuum --db gateway.sqlite3
+  sudo systemctl start nimasas-poller
+  ```
+
+  The command checks the process table and refuses if anything is still
+  writing, refuses without room for a second copy of the file, and runs
+  `integrity_check` before and after. Until it has been run, `run` says so
+  on every invocation and changes nothing.
+
+- **A vacuum only returns what has been deleted.** The drained tables
+  shrink only with `--prune-acked`, which deletes rows the **server has
+  acknowledged**, once they are older than their table's retention:
+  72 hours for `machine_events`, 30 days for every other drained table
+  (tickets, AFT completions, handpays). A row the server has not
+  acknowledged is never deleted; past 48 hours it is reported as an
+  `ALERT` instead. It is off on the command line and on in the timer's
+  unit.
+
+  `meters_history` is **not** pruned, because the server does not receive
+  meter rows yet and the gateway holds the only copy. In `--mode ring`
+  that table caps itself. In `--mode append` it grows without bound, and
+  this job cannot stop that until meters drain.
+
+To schedule it (every 12 hours, at 09:20 and 21:20 UTC by default — edit
+`OnCalendar` to taste):
+
+```
+sudo cp deploy/nimasas-db-maintain.service deploy/nimasas-db-maintain.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now nimasas-db-maintain.timer
+journalctl -u nimasas-db-maintain.service -n 20
+```
+
+The timer maintains **one** database: the one in the unit's `ExecStart`,
+which is the one `nimasas-poller.service` writes. A poller started by hand
+against a different file is not covered and that file grows unbounded;
+run `db_maintain.py` against it yourself, or point the unit at it.
+
+The unit as shipped runs with `--prune-acked`. Once the server has a
+row, the server's copy is the record; analysis tools that read the
+gateway's own database stop seeing events older than three days. Remove
+the flag from `ExecStart` to delete nothing.
+
+---
 
 ## 5. `saspy` — the library itself
 
@@ -1991,7 +2063,7 @@ written down rather than left to be rediscovered.
 | first argument | tools |
 |---|---|
 | `gateway.ini` (a config file) | `sql_poll_logger.py` — **the only one** |
-| the device path, with `--address` | everything else that talks to a machine: `meter_snapshot.py`, `meter_fingerprint.py`, `meter_crosscheck.py`, `accounting_summary.py`, `ticket_history.py`, `ticket_redeem.py`, `ticket_in_watch.py`, `ticket_lab_authority.py`, `handpay_clear.py`, `host_cashout.py`, `aft_cashout.py`, `aft_push_credits.py`, `aft_status.py`, `exception_monitor.py`, `connectivity_check.py`, `wager_categories.py`, `poll_test_tool.py`, and the probes |
+| the device path, with `--address` | everything else that talks to a machine: `meter_snapshot.py`, `meter_fingerprint.py`, `meter_crosscheck.py`, `accounting_summary.py`, `ticket_history.py`, `ticket_redeem.py`, `ticket_in_watch.py`, `handpay_clear.py`, `host_cashout.py`, `aft_cashout.py`, `aft_push_credits.py`, `aft_status.py`, `exception_monitor.py`, `connectivity_check.py`, `wager_categories.py`, `poll_test_tool.py`, and the probes |
 | something else entirely | `capture_diff.py` takes two snapshot files, `soak_report.py` takes the database, `commission_gateway.py` takes flags only |
 
 ```bash

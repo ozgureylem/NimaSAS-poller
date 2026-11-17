@@ -1,0 +1,72 @@
+# The gateway client (spec §4.3, §10): the gateway's side of the server link.
+#
+# A SEPARATE unit from nimasas-poller.service, on purpose, and the two
+# differ in exactly the way that matters:
+#
+#   nimasas-poller.service          PrivateNetwork=yes  + the serial port
+#   nimasas-gateway-client.service  network             + NO serial port
+#
+# The process that can reach the cabinet cannot reach the network, and the
+# process that can reach the network cannot reach the cabinet. They meet in
+# one SQLite file. A fault in this unit -- server unreachable, a malformed
+# frame, memory pressure -- cannot stop polling (§4.3), and a poller restart
+# does not make the server see the gateway as dead.
+#
+# NOT ENABLED BY install.sh. The lab gateway runs with no server link unless
+# somebody decides otherwise:
+#
+#   1. on the server:   python -m gateway.service commission <CLIENT_ID>
+#   2. on this gateway: the `python3 -m gateway.client commission ...` line
+#                       that command printed (writes the key file, mode 0600)
+#   3. sudo cp deploy/nimasas-gateway-client.service /etc/systemd/system/
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now nimasas-gateway-client
+#
+# For ticket-in to be answered by the server, the POLLER must also be
+# started with --server-ticket-authority, which is now the only ticket
+# authority there is (MIGRATION-SPEC-AMENDMENTS A27).
+# Without that flag this unit still fills the pool and drains events, and
+# the poller's ticket-in behaviour is unchanged.
+#
+# Paths are the lab gateway's. A floor install uses /opt/nimasas and
+# /var/lib/nimasas (§5.13).
+
+[Unit]
+Description=NimaSAS gateway client (server link: heartbeat, drain, pool, ticket-in query)
+Documentation=file:/home/nimasas/NimaSAS/MANUAL.md
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nimasas
+WorkingDirectory=/home/nimasas/NimaSAS
+ExecStart=/usr/bin/python3 -m gateway.client run \
+    --db /home/nimasas/NimaSAS/gateway.sqlite3
+# The server being away is the normal failure, and the client retries it
+# itself. Restart= is for the process dying, which should be never.
+# 10s is right HERE, unlike the poller's 30: this unit's start is cheap
+# (open a socket, read a key file) and it is the gateway's only channel to
+# the server. A slow restart here delays the ticket-in path and the drain;
+# a slow restart there saves the SD card from 360 interrogations an hour.
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=0
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nimasas-gateway-client
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=no
+ReadWritePaths=/home/nimasas/NimaSAS
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# No serial port, no other device. Not in the dialout group.
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

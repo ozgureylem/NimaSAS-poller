@@ -219,19 +219,29 @@ teardown listens for, and it disables RTE, flushes the last interleaved
 event and closes the database. After a `SIGKILL`, run the `--disable-rte`
 recovery in §1.
 
-### The lab ticket authority, and why it refuses here
+### Ticket-in has exactly one authority, and it is not the gateway
 
-`sql_poll_logger.py` carries a `--lab-ticket-authority` flag that makes a
-gateway an authority on what tickets are worth. The module that
-implements it is lab-only and is **not** in this repository, so the flag
-exits 2 with a message saying so — which is almost certainly what you
-want, since such a file has no place near a floor.
+`sql_poll_logger.py` answers an escrowed ticket only with
+`--server-ticket-authority`: it writes the number to `validation_queries`,
+the gateway client asks the server, and the poller relays the server's
+answer and the server's amount in LP `0x71`. It decides nothing itself —
+not validity, not the amount, not even for a ticket it printed thirty
+seconds earlier (§9.1).
 
-The file format is documented in `lab_tickets.example.json`. Copy it to
-`lab_tickets.json`, which is gitignored, and put real numbers there if
-you implement your own authority. Validation numbers identify tickets a
-real property issued, so they are operational data and do not belong in
-a repository — which is why no number appears in this document.
+Without that flag, or with no server answering, the insertion is recorded
+and the cabinet hands the ticket back on its own thirty-second timeout
+(§15.12). **That is correct behaviour, not a degraded mode.**
+
+There was once a `--lab-ticket-authority` flag that answered from a JSON
+file on the gateway, for testing on a bench wired to nothing. It was
+removed on 2026-11-15. The reason it is not coming back: a ticket issued
+at a cashdesk was never seen by this gateway and never will be, so a
+gateway permitted to answer offline can pay a ticket the cage has already
+paid, and neither end detects it until the money is reconciled.
+
+Validation numbers identify tickets a real property issued, so they are
+operational data and do not belong in a repository — which is why no
+number appears in this document.
 
 ---
 
@@ -401,3 +411,106 @@ Fires any long poll at an EGM and shows what comes back. It ships so
 that other developers can find the polls their own projects need; it is
 not part of running a gateway, and it can write to a machine depending
 on which poll you aim at it. Lab cabinets only.
+
+## Re-measuring on your own cabinet
+
+The guide says, in several places, to measure per model: events per game,
+the cashout ladder, whether 40 ms is advertised, the burst threshold,
+and whether `games_played` counts at the start or the end of a game.
+These are the two checks whose method is not obvious, and both are
+read-only: no serial port, no stopping the poller, run from data the
+poller has already collected.
+
+### Does this cabinet count a game at START or at END?
+
+It decides how three detectors read a window edge. On the lab cabinet
+`total_coin_in` increments at game START and `games_played` at game END,
+so a window closing mid-spin shows exactly one more wager than games
+played — an edge, not a loss. **That is cabinet behaviour, not a SAS
+guarantee.** Check yours:
+
+```bash
+sqlite3 -header -column <your.sqlite3> "
+WITH m AS (
+  SELECT polled_at, games_played,
+         LAG(polled_at)    OVER (ORDER BY polled_at) AS prev_at,
+         LAG(games_played) OVER (ORDER BY polled_at) AS prev_games
+  FROM meters_history
+  WHERE polled_at >= '<START>' AND games_played IS NOT NULL
+), d AS (
+  SELECT (games_played - prev_games) AS gd,
+         (SELECT COUNT(*) FROM machine_events x WHERE x.exception_code = 126
+            AND x.occurred_at > m.prev_at AND x.occurred_at <= m.polled_at) AS starts,
+         (SELECT COUNT(*) FROM machine_events x WHERE x.exception_code = 127
+            AND x.occurred_at > m.prev_at AND x.occurred_at <= m.polled_at) AS ends
+  FROM m WHERE prev_at IS NOT NULL
+)
+SELECT COUNT(*) AS discriminating_intervals,
+       SUM(gd = starts) AS matches_STARTS,
+       SUM(gd = ends)   AS matches_ENDS
+FROM d WHERE starts <> ends"
+```
+
+It keeps only meter-read intervals where the start count and the end
+count differ — a spin in flight across the boundary — and asks which one
+the `games_played` delta followed. The lab cabinet returned 188 / 28 /
+144.
+
+**Under about 20 discriminating intervals, or a split near 50/50, is
+inconclusive rather than an answer** — collection lag blurs some
+boundaries and that blur also looks like 50/50. The query was validated
+against synthetic data built to each rule before being trusted: 175/0
+when the truth was START, 0/175 when it was END.
+
+### Is a timing figure real, or is it your own polling?
+
+**Run this before quoting any sub-second number out of
+`machine_events`.** `occurred_at` is when the GATEWAY filed an event,
+not when the cabinet raised it, so a statistic about how closely events
+arrive is partly a statistic about how fast you were polling.
+
+```bash
+sqlite3 -header -column <your.sqlite3> "
+WITH g AS (SELECT (julianday(occurred_at) - julianday(LAG(occurred_at)
+             OVER (ORDER BY occurred_at))) * 86400.0 AS gap
+           FROM machine_events WHERE occurred_at >= '<START>')
+SELECT CAST(gap*100 AS INT)*10 AS ms_bucket, COUNT(*) n
+FROM g WHERE gap IS NOT NULL AND gap < 0.5
+GROUP BY ms_bucket ORDER BY ms_bucket"
+```
+
+Spikes sitting on your poll rates and their multiples are collection
+pacing. A real arrival process decays smoothly and has no opinion about
+those particular numbers. Measured on the lab cabinet at 40 ms and 200
+ms: **90.4% of 2719 sub-500 ms gaps fell on 40, 80, 200 and 240 ms**,
+56.8% at 40 ms alone.
+
+The decisive form is an A/B. Pick two windows where the CABINET was
+doing the same thing and the GATEWAY was configured differently:
+
+```bash
+sqlite3 -header -column <your.sqlite3> "
+WITH g AS (SELECT occurred_at,
+  (julianday(occurred_at) - julianday(LAG(occurred_at)
+   OVER (ORDER BY occurred_at))) * 86400.0 AS gap
+  FROM machine_events WHERE occurred_at >= '<START>')
+SELECT CASE WHEN occurred_at < '<CUTOVER>' THEN 'A: before' ELSE 'B: after' END AS window,
+       COUNT(*) gaps, SUM(gap < 0.05) under_50ms,
+       ROUND(100.0*SUM(gap < 0.05)/COUNT(*),1) pct_under_50ms,
+       ROUND(AVG(gap),3) mean_gap_s
+FROM g WHERE gap IS NOT NULL GROUP BY window"
+```
+
+Across one threshold change on the same cabinet with the same play:
+**47.9% "clumped" before, 9.1% after.**
+
+**The trap is self-reinforcing, which is why it is worth a section.** A
+low drain-priority threshold engages drain priority often; drain
+priority polls faster; events are filed closer together; measured
+"clumping" rises; and deriving the threshold from that measurement
+argues for keeping it low. Every iteration looks like confirmation. The
+way out is a quantity the loop cannot touch — for the burst threshold
+that is consecutive pre-emptions of one long poll, which no polling rate
+can inflate.
+
+**Seconds are real. Milliseconds are the gateway.**

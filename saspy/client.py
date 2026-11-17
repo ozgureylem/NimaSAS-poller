@@ -1004,29 +1004,66 @@ class SASClient:
         """Table 8.3c, shared by the initiating poll and the interrogation."""
         payload = self._strip(raw)
 
-        idx = 2  # skip command + length
-        transaction_buffer_position = payload[idx]; idx += 1
-        transfer_status = payload[idx]; idx += 1
-        receipt_status = payload[idx]; idx += 1
-        transfer_type_resp = payload[idx]; idx += 1
-        cashable = decode_bcd(payload[idx:idx + 5]); idx += 5
-        restricted = decode_bcd(payload[idx:idx + 5]); idx += 5
-        nonrestricted = decode_bcd(payload[idx:idx + 5]); idx += 5
-        flags = payload[idx]; idx += 1
-        asset = decode_binary_le(payload[idx:idx + 4]); idx += 4
-        tid_len = payload[idx]; idx += 1
-        tid = payload[idx:idx + tid_len].decode("ascii"); idx += tid_len
-        tx_date = decode_bcd(payload[idx:idx + 4]); idx += 4
-        tx_time = decode_bcd(payload[idx:idx + 3]); idx += 3
-        expiration_val = decode_bcd(payload[idx:idx + 4]); idx += 4
-        pool = decode_binary_le(payload[idx:idx + 2]); idx += 2
+        # A TRUNCATED RESPONSE IS NOT A CRASH.
+        #
+        # 2026-11-14T18:49:11, on the operator's live rig, one second
+        # after a §8.7 decline went out:
+        #
+        #   exception 0x6A drained: AFT request for host cashout
+        #   Polling stopped: IndexError: index out of range
+        #
+        # Every field below was read as payload[idx] with no bounds check,
+        # so a response shorter than the full Table 8.3c layout took the
+        # whole poller down -- and the handler then reported it as "the
+        # serial port failed mid-run... the adapter disconnecting", which
+        # sent the operator after a cable.
+        #
+        # §8.3's response is variable length: the trailing meter fields
+        # carry their own size bytes and a machine answering a declined or
+        # unavailable transfer may stop early. The one field that always
+        # matters is transfer_status, at offset 3 -- the reason the
+        # transfer did not happen. Crashing before reading it threw away
+        # the answer to the question being asked.
+        #
+        # So every read is bounded and anything past the end stays 0 / "".
+        # A short answer now decodes to as much as it carried.
+        def u8(i: int) -> int:
+            return payload[i] if 0 <= i < len(payload) else 0
 
-        cashable_meter_size = payload[idx]; idx += 1
-        cashable_meter = decode_bcd(payload[idx:idx + cashable_meter_size]); idx += cashable_meter_size
-        restricted_meter_size = payload[idx]; idx += 1
-        restricted_meter = decode_bcd(payload[idx:idx + restricted_meter_size]); idx += restricted_meter_size
-        nonrestricted_meter_size = payload[idx]; idx += 1
-        nonrestricted_meter = decode_bcd(payload[idx:idx + nonrestricted_meter_size]); idx += nonrestricted_meter_size
+        def slice_at(i: int, n: int) -> bytes:
+            return payload[i:i + n] if i < len(payload) else b""
+
+        def bcd(i: int, n: int) -> int:
+            chunk = slice_at(i, n)
+            return decode_bcd(chunk) if len(chunk) == n else 0
+
+        def le(i: int, n: int) -> int:
+            chunk = slice_at(i, n)
+            return decode_binary_le(chunk) if len(chunk) == n else 0
+
+        idx = 2  # skip command + length
+        transaction_buffer_position = u8(idx); idx += 1
+        transfer_status = u8(idx); idx += 1
+        receipt_status = u8(idx); idx += 1
+        transfer_type_resp = u8(idx); idx += 1
+        cashable = bcd(idx, 5); idx += 5
+        restricted = bcd(idx, 5); idx += 5
+        nonrestricted = bcd(idx, 5); idx += 5
+        flags = u8(idx); idx += 1
+        asset = le(idx, 4); idx += 4
+        tid_len = u8(idx); idx += 1
+        tid = slice_at(idx, tid_len).decode("ascii", "replace"); idx += tid_len
+        tx_date = bcd(idx, 4); idx += 4
+        tx_time = bcd(idx, 3); idx += 3
+        expiration_val = bcd(idx, 4); idx += 4
+        pool = le(idx, 2); idx += 2
+
+        cashable_meter_size = u8(idx); idx += 1
+        cashable_meter = bcd(idx, cashable_meter_size); idx += cashable_meter_size
+        restricted_meter_size = u8(idx); idx += 1
+        restricted_meter = bcd(idx, restricted_meter_size); idx += restricted_meter_size
+        nonrestricted_meter_size = u8(idx); idx += 1
+        nonrestricted_meter = bcd(idx, nonrestricted_meter_size); idx += nonrestricted_meter_size
 
         return models.AftTransferResult(
             transaction_buffer_position=transaction_buffer_position,

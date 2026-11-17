@@ -301,6 +301,11 @@ class SASTransport:
             rest = self._read_exact(data_length + crc_length, deadline)
             return header + rest
 
+    #: Set by a caller around OPTIONAL polls: a zero-argument callable
+    #: returning True when the reissue loop should stop early. None means
+    #: "use the whole budget", which is right for every mandatory poll.
+    give_up_requeue = None
+
     def exchange_rte_aware(
         self,
         frame: bytes,
@@ -372,6 +377,46 @@ class SASTransport:
             started = time.monotonic()
             preempted = 0
             for _ in range(max_requeue):
+                # ABANDON AN OPTIONAL POLL THE MOMENT SOMETHING ELSE NEEDS
+                # THE SLOTS.
+                #
+                # Operator, 2026-11-13, watching a button burst: "first move
+                # arrived almost 20 seconds after the button burst... drain
+                # priority should interrupt meter sweep and first focus on
+                # ticket out then RTE then if there's room c7."
+                #
+                # His log:
+                #   meters poll failed after 19.829s
+                #   (send_extended_meters_alternate(chunk 10/13)): SASPreempted
+                #
+                # Nineteen seconds inside ONE Table C-7 chunk. The sweep's
+                # own give_up_optional() probe is checked BETWEEN chunks, so
+                # once chunk 10 was in flight nothing could stop its 24
+                # reissues -- and drain priority only engaged when that poll
+                # finally failed. A game start was lost in the window
+                # (40 credits, reported as a stream gap).
+                #
+                # Each reissue does carry an event away, so the time is not
+                # wasted; it is spent on the wrong thing. A C-7 meter is
+                # cumulative and the next sweep reads it in full. A cashout
+                # waiting on a validation number is not.
+                #
+                # Set by the poller around OPTIONAL polls only, so a ticket,
+                # handpay or validation poll still gets its whole budget.
+                if preempted and self.give_up_requeue is not None \
+                        and self.give_up_requeue():
+                    raise SASPreempted(
+                        f"optional long poll abandoned after {preempted} "
+                        f"pre-emption(s) in "
+                        f"{time.monotonic() - started:.2f}s because the "
+                        f"cabinet is bursting and the slots are wanted for "
+                        f"draining. NOT a fault and NOT a lost read: every "
+                        f"reissue carried a real event away, the meter is "
+                        f"cumulative and the next sweep reads it in full. "
+                        f"\u00a712.4: reinsert and send it again later.",
+                        events_collected=preempted,
+                        elapsed=time.monotonic() - started,
+                    )
                 # §12.4 reinserts the poll into the transmit queue; it does
                 # not give the queue a shorter deadline each time round. The
                 # wall-clock guard below is the only thing bounding total

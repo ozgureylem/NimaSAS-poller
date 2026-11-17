@@ -277,6 +277,14 @@ class HandpayInformation:
 class BillMeters:
     """Response to long poll 0x1E (Table B-1 row 1E) — six "bills in"
     count meters for the most common denominations in one poll.
+
+    DENOMINATIONS, IN THE MACHINE'S CONFIGURED CURRENCY. The field names
+    say 1/5/10/20/50/100 and mean exactly that: not US dollars. The '$'
+    in the specification's labels is its own notation.
+
+    Six denominations only. Table C-7 carries sixteen (0x40-0x4F), and
+    the gap is operational rather than theoretical: BZD circulates a $2
+    note that has no field here.
     """
 
     bills_1: int

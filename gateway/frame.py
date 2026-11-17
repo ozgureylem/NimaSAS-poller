@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import socket
 import struct
 from dataclasses import dataclass
 from hashlib import sha256
@@ -121,6 +122,85 @@ class SequenceRejected(FrameError):
         self.got, self.floor = got, floor
 
 
+
+def enable_keepalive(sock, *, idle: int = 30, interval: int = 10,
+                     count: int = 3) -> None:
+    """Make the OS notice a peer that stopped answering.
+
+    WITHOUT THIS A PULLED CABLE IS INVISIBLE TO THE END THAT IS NOT
+    WRITING. TCP has no idea the link is gone: select() never reports the
+    socket readable, because nothing is arriving and nothing ever will,
+    and a write disappears into the kernel's buffer to be retransmitted
+    for roughly fifteen minutes before it finally errors. Both ends sit
+    there believing they are connected.
+
+    Measured on the lab gateway 2026-11-13T02:09: the operator pulled the
+    network cable, cashed out successfully from the validation pool --
+    which is exactly what the pool is for -- and then plugged the cable
+    back in. The server had already given up ("WinError 121, the
+    semaphore timeout period has expired") but the gateway client had
+    not, so it never reconnected. Five minutes later the link was still
+    down, with no error on either side.
+
+    Keepalive turns that into about a minute: idle seconds of quiet, then
+    `count` probes `interval` apart, then the socket errors and the
+    client's existing reconnect loop does the rest.
+
+    Every option is best-effort. A platform that lacks one is not a
+    platform where the link should refuse to run, so each is attempted
+    and skipped if absent -- but SO_KEEPALIVE itself is universal, and on
+    its own it still gets there, just on the OS default timer.
+    """
+    # BEST-EFFORT MEANS BEST-EFFORT, INCLUDING THE METHOD NOT EXISTING.
+    #
+    # 2026-11-13, and it took the lab server down on every connection:
+    #
+    #   File "gateway\\service.py", line 1335, in handle
+    #     frame.enable_keepalive(raw)
+    #   File "gateway\\frame.py", line 162, in enable_keepalive
+    #     sock.ioctl(socket.SIO_KEEPALIVE_VALS,
+    #   AttributeError: 'TransportSocket' object has no attribute 'ioctl'
+    #
+    # asyncio hands the callback a TransportSocket, a deliberately
+    # narrowed proxy that does NOT expose ioctl. The guard below asked
+    # hasattr(socket, "SIO_KEEPALIVE_VALS") -- a question about the
+    # MODULE, true on every Windows build -- and then called a method on
+    # the SOCKET that was not there. AttributeError is not OSError, so
+    # nothing caught it, client_connected_cb died, and the gateway sat in
+    # "the server closed the connection; retrying in 1s" forever.
+    #
+    # A keepalive timer is an optimisation on top of a link that already
+    # works. It must never be the reason a connection fails to start, so
+    # every call here is guarded by both hasattr on the OBJECT and a
+    # catch wide enough for a method that is missing or refuses its
+    # arguments.
+    _SKIPPABLE = (OSError, AttributeError, ValueError, TypeError)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except _SKIPPABLE:
+        return
+    # Windows has no TCP_KEEPIDLE; it takes the same three numbers
+    # through an ioctl, in milliseconds, and derives the count itself.
+    if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+        if hasattr(sock, "ioctl"):
+            try:
+                sock.ioctl(socket.SIO_KEEPALIVE_VALS,
+                           (1, idle * 1000, interval * 1000))
+            except _SKIPPABLE:
+                pass
+        return
+    for name, value in (("TCP_KEEPIDLE", idle),
+                        ("TCP_KEEPINTVL", interval),
+                        ("TCP_KEEPCNT", count)):
+        option = getattr(socket, name, None)
+        if option is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, option, value)
+        except _SKIPPABLE:
+            pass
+
+
 class MessageTypeUnknown(FrameError):
     """Step 6, and it happens AFTER verification on purpose: an attacker
     without a key must not be able to probe which type values exist."""
@@ -147,6 +227,13 @@ class MessageType:
     DISABLE = 0x12            # S->G  with reason; §8.1 governs when
     ENABLE = 0x13             # S->G
     POOL_REPLACE = 0x14       # S->G  new epoch, revoke-prior-available (§7.4)
+    # AFT_TRANSFER is the first S->G type that MOVES MONEY ONTO A MACHINE.
+    # Added 2026-11-12 at the operator's request. The gateway refuses it
+    # unless the poller was started with --allow-server-aft, because this
+    # reverses the standing read-only posture of 2026-11-08 ("no AFT fund
+    # transfer, no machine state change") and that reversal should be a
+    # thing somebody typed, per cabinet, not a default.
+    AFT_TRANSFER = 0x15       # S->G  push credits to the EGM (§8.3)
     VALIDATION_QUERY = 0x20   # G->S  ticket-in: number read from escrow (§9)
     VALIDATION_RESPONSE = 0x21  # S->G  ALLOW with amount, or REJECT + reason
     REDEMPTION_RESULT = 0x22  # G->S  completion status read from the machine
@@ -166,7 +253,7 @@ SERVER_TO_GATEWAY = frozenset({
     MessageType.PULL_INVITE, MessageType.ACK, MessageType.ON_DEMAND_PULL,
     MessageType.ROTATE_KEY, MessageType.REVOKE, MessageType.DISABLE,
     MessageType.ENABLE, MessageType.POOL_REPLACE,
-    MessageType.VALIDATION_RESPONSE})
+    MessageType.VALIDATION_RESPONSE, MessageType.AFT_TRANSFER})
 assert GATEWAY_TO_SERVER | SERVER_TO_GATEWAY == KNOWN_TYPES
 assert not (GATEWAY_TO_SERVER & SERVER_TO_GATEWAY)
 

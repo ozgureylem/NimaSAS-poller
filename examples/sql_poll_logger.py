@@ -167,21 +167,39 @@ skipping or going non-contiguous) needs the actual server-issued
 sequential/batch numbering named above as out of scope, so it isn't
 attempted here either — age is the one signal available without it.
 
-What this does NOT do: authorize or redeem tickets *coming in*. A
-ticket-in event is read and logged (amount, validation data) but this
-tool never calls redeem_ticket() — deciding whether to pay a ticket is
-a real business/security decision (see the project's own Decisions
-Annex on this), and a reference poller has no way to make that decision
-correctly. Left unredeemed, the machine safely returns the ticket to
-the player after its own 30-second timeout (spec-guaranteed), so
-running this against a real machine does not risk paying out
-incorrectly. ticket_in_events records that a ticket came in;
-ticket_in_completions (exception 0x68) separately records how that
-cycle ended — stacked or rejected, via the same safe, read-only status
-query (redeem_ticket_status(), LP 71/FF) redeem_ticket() itself is
-never used for — but "safe to observe" and "safe to decide" stay
-different things throughout: this tool still never authorizes, rejects,
-or influences a ticket-in outcome, only reads what already happened.
+What this does NOT do BY DEFAULT: authorize or redeem tickets *coming
+in*. A ticket-in event is read and logged (amount, validation data) and
+`redeem_ticket()` is not called — deciding whether to pay a ticket is a
+real business/security decision (see the project's own Decisions Annex),
+and a reference poller has no way to make it correctly. Left unanswered,
+the machine safely returns the ticket to the player after its own
+30-second timeout (spec-guaranteed), so running this against a real
+machine does not risk paying out incorrectly.
+
+**--server-ticket-authority CHANGES THAT, and it is in the floor
+configuration.** This paragraph said "this tool never calls
+redeem_ticket()" long after it did; corrected 2026-11-16, found by
+another session reading the file for the RamSys guide. Under that flag
+the poller DOES answer ticket-in, in two places:
+
+  * `_refuse_locally()` sends TICKET_UNABLE_TO_VALIDATE (0x80) when the
+    gateway cannot ask — no client, no answer inside
+    --ticket-query-timeout, or the backoff still running. A refusal is
+    the safe direction and the customer keeps the ticket.
+  * the server's verdict is sent as the transfer code it chose, with the
+    amount, restricted expiration and pool id it named.
+
+The authority is ALWAYS the server; the gateway never decides a ticket's
+worth, and there is no local ticket file any more (--lab-ticket-authority
+was removed 2026-11-15). But "the gateway does not decide" and "the
+gateway does not act" are different claims, and only the first is true
+under this flag. Without it the original paragraph still holds exactly.
+
+ticket_in_events records that a ticket came in, with the
+authority_decision column carrying what was answered;
+ticket_in_completions (exception 0x68) separately records how that cycle
+ended — stacked or rejected — via the safe, read-only status query
+(redeem_ticket_status(), LP 71/FF).
 
 Ticket-in history. Those two tables are the raw, append-only record of
 what each exception actually reported; the ticket_in_history VIEW joins
@@ -358,7 +376,31 @@ LP18_METER_COLUMNS = (  # LP 0x18 (Table 7.7)
     "lp18_games_since_door_closure",
 )
 
-LP1E_METER_COLUMNS = (  # LP 0x1E — 6 "bills in" count meters by denomination
+# LP 0x1E — 6 "bills in" counts by DENOMINATION, in the machine's own
+# configured currency. NOT US-only: the '$' in the specification's labels
+# for these (and for Table C-7's 0x40-0x4F) is the spec's notation, not a
+# constraint on the cabinet. Operator, 2026-11-17: "it works with
+# machine's current currency settings", and the live C-7 values on the
+# lab cabinet show it.
+#
+# THE REASON C-7 IS THE PRIMARY IS COVERAGE, NOT CURRENCY. Six fields
+# here (1/5/10/20/50/100) against C-7's sixteen (adds 2, 25, 200, 250,
+# 500, 1000, 2000, 2500, 5000, 10000).
+#
+# THE MISSING 2 IS NOT A BELIZE PROBLEM. LP 0x1E has no field for a 2,
+# and the 2 is a circulating note in BOTH currencies this project will
+# meet: BZD $2 and USD $2. Operator, 2026-11-17, correcting an earlier
+# framing of this as BZD-specific: "USD Bill Denominations are
+# 1,2,5,10,20,50,100". So a host reading only LP 0x1E under-counts the
+# 2 silently, in any currency, while every other denomination looks
+# right. C-7 code 0x41 carries it.
+#
+# MEASURED on the lab cabinet, 2026-11-17: the Bill Accounting screen
+# held 32 notes / 440.00, of which LP 0x1E's six fields can see 17 /
+# 410.00. The fifteen it cannot see were all 2s -- 47% of the count.
+# C-7's c7_total_number_of_2_00_bills_accepted read 15 against the
+# screen's 15. See HANDOVER 15b.
+LP1E_METER_COLUMNS = (
     "lp1e_bills_1",
     "lp1e_bills_5",
     "lp1e_bills_10",
@@ -570,19 +612,51 @@ GROUPED_METER_POLL_COUNT = 8
 
 _METER_COLUMN_DDL = ",\n    ".join(f"{field} INTEGER" for field in ALL_METER_FIELDS)
 
+# KEEP IN STEP WITH gateway/db.py's LINK_SCHEMA, which defines pool_fills
+# too because either process may reach a fresh database first, and
+# examples/ does not import gateway/. A test asserts they match.
+POOL_FILLS_DDL = """CREATE TABLE IF NOT EXISTS pool_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filled_at TEXT NOT NULL,
+    source TEXT NOT NULL,              -- 'server-batch' | 'pool_replace' | 'poller-seed'
+    issued INTEGER NOT NULL,           -- numbers this fill added
+    revoked INTEGER NOT NULL DEFAULT 0,-- numbers it revoked, if a replacement
+    available_after INTEGER NOT NULL,  -- THE POOL SIZE, counted after the fill
+    pool_epoch INTEGER,
+    batch_uuid TEXT
+);"""
+
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS meters_current (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     polled_at TEXT NOT NULL,
     epoch_id INTEGER,
-    {_METER_COLUMN_DDL}
+    {_METER_COLUMN_DDL},
+    -- Drained like every other table. ON BOTH METER TABLES, and the second
+    -- one is not redundant: latest_c7_meters is
+    --   SELECT * FROM meters_current UNION ALL SELECT * FROM meters_history
+    -- so the two must keep identical column lists or the view pairs the
+    -- wrong columns. Requested by the server side on 2026-11-16 for exactly
+    -- that reason.
+    --
+    -- meters_current is NEVER drained even so: it is one row rewritten in
+    -- place, so a single drain would leave the server holding a reading that
+    -- is stale for ever. The column exists here to keep the view honest.
+    -- gateway/db.py refuses the table by name.
+    synced_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS meters_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     polled_at TEXT NOT NULL,
     epoch_id INTEGER,
-    {_METER_COLUMN_DDL}
+    {_METER_COLUMN_DDL},
+    -- The table this column is actually for. Until it existed, meter
+    -- history was the one thing the gateway collected that the server never
+    -- received -- so a server restored from backup had no way to get it
+    -- back, which is the hole in the disaster-recovery argument the
+    -- retention spec rests on.
+    synced_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS machine_epochs (
@@ -660,7 +734,16 @@ CREATE TABLE IF NOT EXISTS interrogations (
     ticket_out_records INTEGER,
     last_redeemed TEXT,              -- JSON, LP 0x71/FF
     duration_seconds REAL,
-    note TEXT
+    note TEXT,
+    -- DRAINS. gateway/client.py:drain_tables() ships every table that has
+    -- BOTH `id` and `synced_at`, read from the database rather than a list,
+    -- so this column is the whole subscription. Without it this table stayed
+    -- on the gateway -- while the crash handler in main() told the reader
+    -- that a crash loop "shows up on the server as a burst of first_connect".
+    -- It did not. A headless gateway whose technicians have no SSH has no
+    -- other way to say it is restarting; found 2026-11-16 when the query to
+    -- confirm that claim returned `no such column: synced_at`.
+    synced_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS interrogation_games (
@@ -712,7 +795,14 @@ CREATE TABLE IF NOT EXISTS poller_lifecycle (
     event TEXT NOT NULL,          -- 'started' | 'stopped'
     reason TEXT,                  -- 'signal 15', an exception repr, 'end of run'
     pid INTEGER,
-    argv TEXT
+    argv TEXT,
+    -- DRAINS, for the same reason interrogations does, and it is the better
+    -- of the two signals: it carries the REASON a run ended ('signal 15', an
+    -- exception repr) and the argv it ran with. An interrogation burst says
+    -- only that something restarted; this says what killed it and how it was
+    -- configured, which is the difference between "the gateway is flapping"
+    -- and "the gateway is flapping on a NameError in the meter sweep".
+    synced_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS ticket_out_history (
@@ -847,10 +937,18 @@ CREATE TABLE IF NOT EXISTS stream_gaps (
 );
 
 CREATE TABLE IF NOT EXISTS lab_auto_actions (
-    -- LAB ONLY. Every time this poller moved money or cleared a lockup by
-    -- itself. A gateway that does either without a human is a cash-dispensing
-    -- defect on a floor; in a lab running overnight it is the only way to keep
-    -- a cabinet spinning. The row is the audit trail that says which it was.
+    -- EVERY TIME THIS POLLER MOVED MONEY OR ANSWERED A MONEY REQUEST. The
+    -- audit trail for anything on this gateway with a financial effect.
+    --
+    -- THE NAME IS NOW WRONG and is kept on purpose. It was written when the
+    -- only writers were the lab auto-credit and auto-handpay-reset flags,
+    -- which were removed on 2026-11-15 with the lab ticket authority
+    -- (MIGRATION-SPEC-AMENDMENTS A27). What writes here now is the SERVER
+    -- path: --allow-server-aft credit pushes and --decline-aft-cashout
+    -- refusals, neither of which is lab-only. Renaming it is a schema change
+    -- that the server's drain and retention config have to move with, so it
+    -- waits for a release where both ends change together rather than being
+    -- done quietly here. Read it as money_actions.
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     occurred_at TEXT NOT NULL,
     action TEXT NOT NULL,          -- 'handpay_reset' | 'aft_credit'
@@ -858,13 +956,24 @@ CREATE TABLE IF NOT EXISTS lab_auto_actions (
     outcome TEXT,
     synced_at TEXT
 );
+-- pool_fills, injected from POOL_FILLS_DDL. pool_replace.py has to create
+-- it too, on a database that predates it, and one definition is the only
+-- way the writers agree on its shape.
+{POOL_FILLS_DDL}
+
 CREATE TABLE IF NOT EXISTS validation_pool (
     validation_number INTEGER PRIMARY KEY,
     validation_system_id INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'available',
     issued_at TEXT,
     assigned_at TEXT,
-    assigned_amount_cents INTEGER
+    assigned_amount_cents INTEGER,
+    -- issue_seq: the per-gateway order numbers were issued in, and what the
+    -- assignment orders by. issued_at TIES INSIDE A BATCH -- every row of
+    -- one top-up shares a timestamp to the second -- so ordering by it
+    -- alone falls through to validation_number, i.e. numeric order, the one
+    -- order §11.2 forbids. Spec change 2026-11-12, rule 3.
+    issue_seq INTEGER
 );
 
 -- THE INBOUND COMMAND CHANNEL. Every other table in this schema is
@@ -919,6 +1028,11 @@ CREATE TABLE IF NOT EXISTS host_requests (
     latency_ms INTEGER,
     amount_cents INTEGER,
     result_json TEXT,
+    -- What the SERVER asked for, as opposed to what came back. A WfA pull
+    -- needs only validation_number; an AFT push needs three amounts, a
+    -- pool and an expiration, and inventing a column per field would make
+    -- this table grow with every request kind.
+    request_json TEXT,
     error TEXT
 );
 
@@ -1089,7 +1203,77 @@ CREATE VIEW ticket_in_history AS
 # meters that DO move fast are still read every cycle. The default is
 # therefore a minute rather than every cycle -- strictly more data than
 # skipping and strictly less traffic than before.
-DEFAULT_TABLE_C7_INTERVAL = 60.0
+# 0 = every cycle, because it is the cheapest meter source this gateway
+# has and the operator confirmed it on hardware 2026-11-13: "I tried
+# table-c7-interval 0. It works better."
+DEFAULT_TABLE_C7_INTERVAL = 0.0
+
+# The same cadence, for the two sweeps that never got one.
+#
+# C-7 got an interval in November because it was the sweep blowing the
+# budget. The arithmetic says the priority was backwards:
+#
+#   sweep                    polls   meters   meters per poll
+#   core (every cycle)           8      ~39        4.9
+#   single-meter sweep          39       39        1.0
+#   validation meters (0x50)    12       24        2.0
+#   Table C-7 (0x6F/0xAF)       13      154       11.8
+#
+# The cheapest sweep per meter is the only one with a cadence, and the
+# dearest -- one poll per meter -- runs every cycle. 0 keeps that
+# behaviour, which is what these default to: a cadence is a judgement
+# about a particular floor, not something to impose on every gateway in
+# an upgrade. 1800 is the recommended floor setting.
+#
+# C-7 IS THE PRIMARY SOURCE. The other two are the fallback.
+#
+# An earlier version of this comment said SINGLE_METER_COLUMNS and
+# TABLE_C7_EXTENDED_COLUMNS "share NOTHING", on the strength of a set
+# intersection that compared LongPoll ENUM MEMBERS against COLUMN NAME
+# STRINGS and therefore could only ever return zero. It was repeated into
+# the interlock, the CLI help, the startup banner and amendment A26
+# before anybody measured it.
+#
+# What is actually true: TABLE_C7_EXTENDED_CODES is
+#
+#     tuple(c for c in MeterCode if c not in TICKET_METER_CODES)
+#
+# -- EVERY Table C-7 code bar the ticket ones, not "codes with no
+# dedicated long poll". So C-7 largely SUPERSEDES the single-meter sweep.
+# Coin in, coin out, drop, jackpot, cancelled credits, games played, won
+# and lost are all in both; so are the per-denomination bill meters, 60
+# columns of them. Thirteen chunked polls fetch what thirty-nine single
+# ones fetch, and about 115 meters besides.
+#
+# Operator, 2026-11-13: "C7 will poll more frequently than full meter and
+# validation intervals. Because as far as I understand, c7 costs less
+# than the meter sweeps. Only time we will fallback to other meters is
+# going to be if any machine doesn't provide c7 meters in future."
+#
+# So the defaults follow the arithmetic: C-7 every cycle, the dear sweeps
+# on a long cadence. 8 core + 13 C-7 + 1 bill is 22 polls a cycle against
+# the 73 that running everything costs.
+#
+# THE INTERLOCK IS STILL REQUIRED, for a narrower reason than the one
+# first given. C-7 is the only CHEAP source, not the only source: a
+# cabinet that does not answer LP 0x6F still has those meters behind the
+# 39 single polls, and they are then the only way to reach them. So
+# decide_c7_support() forces both intervals back to every cycle when it
+# turns C-7 off. See --c7-probation-minutes.
+DEFAULT_FULL_METER_INTERVAL = 1800.0
+DEFAULT_VALIDATION_METERS_INTERVAL = 1800.0
+
+# How long a run may spend deciding whether this cabinet answers Table C-7
+# at all. §4.4 lets a machine ignore a long poll it does not implement, so
+# a cabinet without 0x6F does not refuse -- it says nothing, and every
+# chunk costs a full timeout. Thirteen of those per sweep is dead air the
+# exception queue does not survive, which is why the decision is also
+# allowed to come early.
+DEFAULT_C7_PROBATION_MINUTES = 10.0
+# Empty sweeps before giving up without waiting out the probation window.
+# Three, because one can be a machine still booting and two can be a bad
+# cable; three in a row with zero codes is the cabinet telling us.
+C7_EMPTY_SWEEPS_BEFORE_GIVING_UP = 3
 
 DEFAULT_HISTORY_CAP = 200
 DEFAULT_HISTORY_INTERVAL = 60.0
@@ -1111,6 +1295,30 @@ STARTUP_DRAIN_MAX = 64
 # is a PHYSICAL-ACT threshold: the time it takes to unplug a cable, walk to
 # another cabinet and plug it in. Nobody does that in less.
 DEFAULT_COMMS_GAP_SECONDS = 30.0
+
+# How many cycles a FORCED identity check may go unanswered before it gives
+# up. A cabinet whose cable was just reconnected is often not ready to answer
+# LP 0x54 on the first ask, and §4.4 lets one decline it forever -- so the
+# retry has to exist and has to be bounded. Five cycles is about ten seconds
+# at the lab interval, and a cabinet that has said nothing by then is one no
+# identity check could have identified anyway.
+FORCE_IDENTITY_MAX_ATTEMPTS = 5
+
+# How long a §8.7 decline that answered 0x40 "transfer pending" may stay
+# pending before another one is allowed.
+#
+# MEASURED 2026-11-16, two cashouts four minutes apart on one cabinet. The
+# first decline completed in 0.84 s. The second took 7.05 s, and during it
+# the cabinet re-raised 0x6A once a second -- each repeat drawing a fresh
+# decline that the cabinet rejected with transfer status 0xC0, "not
+# compatible with current transfer in progress" (Table 8.3e). Six futile
+# LP 0x72 exchanges, spent in exactly the window where the channel matters.
+#
+# A decline already pending cannot be hurried by sending another; 0xC0 says
+# so. The only reason to allow one at all is that an exception 0x69 which
+# never arrives would otherwise wedge the decline off for the rest of the
+# run -- so this is a stuck-state escape, not a retry interval.
+AFT_DECLINE_PENDING_TIMEOUT_S = 12.0
 DEFAULT_POOL_AGE_ALERT_HOURS = 36.0
 # AGE IS NOT DEPTH, and the age alert cannot see this one.
 #
@@ -1125,7 +1333,24 @@ DEFAULT_POOL_AGE_ALERT_HOURS = 36.0
 # credit type printing correctly and the host answering in time. And it
 # fails CORRELATED -- if the top-up stops, every gateway on the floor
 # drains at once.
-DEFAULT_POOL_DEPTH_ALERT = 25
+#
+# A FIXED COUNT IS THE WRONG SHAPE for this, which is why 25 is now only a
+# floor. 25 left out of 200 is six hours' warning on a busy cabinet; 25 left
+# out of 30 is an alert that was already firing when the pool was full. The
+# threshold has to scale with the pool, so the live one is
+#
+#     max(--pool-depth-alert, 20% of the pool size at the last fill)
+#
+# and --pool-depth-alert drops to 10: the floor that keeps a small pool from
+# alerting at 2 or 3 numbers, where there is no time left to act. 20% binds
+# above a pool of 50; the floor binds below it.
+#
+# "At the last fill", NOT the live available count. Twenty percent of a
+# number that is itself shrinking is a threshold that runs away from the
+# pool it is meant to measure -- it would never be crossed. pool_fills
+# records the size, so the denominator stands still.
+DEFAULT_POOL_DEPTH_ALERT = 10
+POOL_LOW_WATER_FRACTION = 0.20
 
 # SAS 6.02 §2.3.3 ("Polling Rate"): "The host may not issue general polls
 # or long polls to any single gaming machine at a rate faster than once
@@ -1159,6 +1384,18 @@ class PollState:
     # Same shape, for the Table C-7 sweep: None forces one on the first
     # cycle, so a run always captures C-7 at least once however long it lives.
     last_c7_sweep: float | None = None
+    # Same shape again, for the two sweeps that gained a cadence on
+    # 2026-11-12. None forces one on the first cycle.
+    last_full_sweep: float | None = None
+    last_validation_sweep: float | None = None
+    # TABLE C-7 CAPABILITY, decided by measurement rather than assumed.
+    # None = still deciding, True = answers, False = does not and the
+    # sweep is off for the rest of this run.
+    c7_supported: bool | None = None
+    c7_sweeps_done: int = 0
+    c7_sweeps_with_data: int = 0
+    c7_empty_streak: int = 0
+    c7_first_sweep_at: float | None = None
     burst_remaining: int = 0
     # DRAIN PRIORITY. When the cabinet is producing events faster than the
     # sweep leaves room to collect, the optional meter polls are deferred
@@ -1176,6 +1413,25 @@ class PollState:
     epoch_id: int | None = None
     identity: dict | None = None
     cycles_since_identity: int = 0
+    # SET BY A LINK RECOVERY, CONSUMED BY maintain_epoch() IN THE SAME CYCLE.
+    #
+    # Operator, 2026-11-16: "in real life technicians maybe won't even turn
+    # anything off and they will plug the sas cable like nothing. That's why,
+    # after a sas disconnect and reconnect, identity check must become a
+    # standard. Without the need of waiting identity check cycle."
+    #
+    # The scheduled check is every IDENTITY_CHECK_CYCLES cycles -- four
+    # minutes at the lab interval -- and a gap of DEFAULT_COMMS_GAP_SECONDS
+    # or more already triggers a full interrogation. What fell between them
+    # was the SHORT gap: a cable moved between two cabinets within reach of
+    # each other, back on the wire in under thirty seconds, with every row
+    # until the scheduled check filed under the previous cabinet's epoch.
+    force_identity_check: bool = False
+    force_identity_attempts: int = 0
+    # Monotonic, set when a §8.7 decline answers 0x40 (transfer pending) and
+    # cleared when exception 0x69 reports it complete. While it is set, a
+    # further decline would be answered 0xC0 and achieve nothing.
+    aft_decline_pending_since: float | None = None
     # Consecutive cycles whose general poll failed outright, and when the
     # first of them was. Together they are how long the link has been down,
     # which is the only thing that distinguishes a flaky byte from somebody
@@ -1214,6 +1470,22 @@ class PollState:
     # read it anyway and therefore could never fire, which is why
     # --drain-priority did nothing on its first burst (2026-11-09T00:18).
     events_seen_live: int = 0
+    # EVENTS THE HEARTBEAT NEVER SEES, because they arrived as §12.3
+    # pre-emptions of a long poll instead of between polls. Counted
+    # separately and added to events_seen_live by the drain probe.
+    #
+    # MEASURED 2026-11-16: a button burst pre-empted one Table C-7 chunk 24
+    # times over 24.033 s. Every reissue carried a real event away, and not
+    # one of them reached events_seen_live -- so the probe computed
+    # 0.00 events/s and declined to fire, 24 times in a row. Drain priority
+    # engaged only when the poll finally exhausted max_requeue and raised
+    # SASPreempted.
+    #
+    # This is HANDOVER §14h's bug 1 one layer down: the probe went blind in
+    # exactly the conditions it exists to detect, because the busier the
+    # channel the more events arrive as pre-emptions rather than through
+    # the heartbeat.
+    preempted_events_live: int = 0
     # LOSS THAT ACTUALLY HAPPENED, this cycle. Two independent witnesses:
     # the cabinet's own 0x70, and §12.5.3's arithmetic on the coin-in
     # carried inside each game start. Neither is a model of the queue --
@@ -1249,17 +1521,19 @@ class PollState:
     pool_stale_last_print: float | None = None
     clear_candidate_cycles: int = 0
     clear_first_seen_at: str | None = None
-    # LAB ONLY, and None unless --lab-ticket-authority was given. See
-    # _capture_ticket_in() for why this tool is otherwise read-only on
-    # ticket-in, and why a file is what lifts that rather than a flag alone.
-    ticket_authority: dict | None = None
-    ticket_authority_binding: object | None = None  # ticket_lab_authority.MachineBinding
-    ticket_authority_path: str | None = None
-    # THE FLOOR PATH for ticket-in (§9), and the opposite of the three
-    # fields above: with --server-ticket-authority the poller asks the
-    # SERVER what an escrowed ticket is worth, through validation_queries
-    # and the gateway client, and holds no authority of its own. Mutually
-    # exclusive with the lab file.
+    # THE ONLY ticket-in path there is (§9). With --server-ticket-authority
+    # the poller asks the SERVER what an escrowed ticket is worth, through
+    # validation_queries and the gateway client, and holds no authority of
+    # its own. Without it the poller records the insertion and answers
+    # nothing, and the cabinet hands the ticket back on its own §15.12
+    # timeout.
+    #
+    # There used to be a second path: --lab-ticket-authority answered from a
+    # JSON file on the gateway. It was removed on 2026-11-15, on the
+    # operator's instruction, once the server round trip was proven on
+    # hardware -- see MIGRATION-SPEC-AMENDMENTS A27. A gateway that decides
+    # what a ticket is worth can pay a ticket the cage already paid, and
+    # nothing on the gateway can know that.
     server_ticket_authority: bool = False
     ticket_query_timeout_s: float = 2.0
     ticket_query_backoff_s: float = 30.0
@@ -1268,8 +1542,9 @@ class PollState:
     # Monotonic. None means "not backing off".
     ticket_query_backoff_until: float | None = None
     ticket_query_times: list | None = None
-    # LAB ONLY, and only ever set when --lab-ticket-authority is also in
-    # effect. See LabAutoConfig for why that file is the gate.
+    # Set by the handpay detection below and read by nothing that acts on
+    # it any more: --lab-auto-handpay-reset was removed with the lab ticket
+    # authority on 2026-11-15. Kept because the AGE of a lockup is reported.
     #
     # handpay_pending_since is monotonic, not wall clock: it is measuring how
     # long a lockup has gone unattended, and a clock that can step backwards
@@ -1289,6 +1564,17 @@ class PollState:
     # Consumed by the next maintain_epoch() call, which needs no further
     # evidence: the machine has already said so.
     clear_announced_at: str | None = None
+
+    def count_preempted_event(self) -> None:
+        """One §12.3 pre-emption just took an event out of the heartbeat.
+
+        Passed into _poll_all_meters() as ``on_preempted`` so the live
+        drain probe can see events that never reach events_seen_live.
+        A method rather than a closure over ``state`` because the sweep
+        function has no state to close over -- that mistake shipped on
+        2026-11-16 and crashed the poller on its first optional poll.
+        """
+        self.preempted_events_live += 1
 
 
 # --- Continuity: epochs -----------------------------------------------------
@@ -1383,9 +1669,32 @@ def open_gateway_db(path: str, *, busy_timeout_ms: int = GATEWAY_DB_BUSY_TIMEOUT
 
     journal_mode is persistent: set once, it stays in the file. busy_timeout
     is per-connection and must be set by every process that writes.
+
+    AND A THIRD, WHOSE ORDER IS LOAD-BEARING. auto_vacuum can only be
+    changed on a database that is still NEW -- no table created yet -- or
+    by running a full VACUUM, which takes the write lock for as long as it
+    takes to rewrite the file. On a gateway that is §15.7's ten seconds
+    gone and a cashout turned into a handpay, so a database that was not
+    created in INCREMENTAL mode can never be converted while the poller
+    runs. Setting it HERE means no gateway ever needs that conversion.
+
+    It must be set BEFORE journal_mode, and this is not style. Switching to
+    WAL writes the database header, after which the file is no longer new
+    and `PRAGMA auto_vacuum` is accepted, silently ignored, and reads back
+    as NONE. MEASURED, both orders, on sqlite 3.45.1:
+
+        auto_vacuum then WAL  ->  auto_vacuum = 2 (INCREMENTAL)
+        WAL then auto_vacuum  ->  auto_vacuum = 0 (NONE), no error
+
+    A database that already has tables is left exactly as it is. This
+    function never runs a VACUUM: doing that on open would put the lock
+    at poller startup, which is the one moment a gateway cannot afford it.
+    `examples/db_maintain.py enable-auto-vacuum` converts an existing file,
+    deliberately, with the poller stopped.
     """
     conn = sqlite3.connect(path, timeout=busy_timeout_ms / 1000)
     conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+    conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
     conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
@@ -1411,68 +1720,12 @@ def read_identity(client) -> dict:
     return identity
 
 
-def ticket_authority_binding_verdict(binding, identity: dict | None, *,
-                                     allow_unverified: bool) -> tuple[str, str] | None:
-    """Whether a run holding a bound ticket file may talk to this cabinet.
-
-    Returns None to proceed, or (reason, detail). Three cases that look alike
-    and are not:
-
-    MISMATCHED -- the machine identified itself and it is the wrong one.
-    Always fatal. No flag overrides it, because an operator cannot know better
-    than the cabinet's own identifiers.
-
-    UNVERIFIABLE -- nothing comparable. §4.4 lets a machine ignore LP 0x54 and
-    the lab EGM does, so a file bound only by serial cannot be checked against
-    it at all. Fatal by default (an unenforceable binding is not a binding),
-    overridable by an operator standing at the machine.
-
-    UNBOUND -- the file names no cabinet. Permitted, because whoever wrote the
-    file chose that, but it is said loudly.
-
-    SERIAL WINS WHERE BOTH EXIST, AND AN ASSET MISMATCH DOES NOT VETO IT. A
-    RAM clear wipes the asset number while the serial survives, so refusing a
-    cabinet whose serial matches because its asset was retyped would block a
-    legitimate machine after every clear. The fallback runs only where the
-    serial cannot be compared at all.
-
-    The original check was ``if seen and seen.strip() != bound``, which
-    silently treated UNVERIFIABLE as fine. Replacing that with a bare refusal
-    treated it as MISMATCHED and killed a running soak on a command line that
-    had worked minutes before. Both failures came from one conflation.
-    """
-    if binding is None or not binding.is_bound():
-        return ("unbound", "the ticket file names no cabinet at all")
-
-    seen_serial = usable_serial(identity)
-    if binding.serial is not None and seen_serial is not None:
-        if seen_serial != binding.serial.strip():
-            return ("mismatch",
-                    f"ticket file is for serial {binding.serial!r} but this "
-                    f"cabinet is {seen_serial!r}")
-        return None  # Serial is authoritative; the asset cannot overrule it.
-
-    seen_asset = usable_asset(identity)
-    if binding.asset is not None and seen_asset is not None:
-        if seen_asset != binding.asset:
-            return ("mismatch",
-                    f"ticket file is for asset {binding.asset} but this "
-                    f"cabinet is asset {seen_asset}")
-        return None
-
-    if allow_unverified:
-        return None
-    return ("unverifiable",
-            f"this cabinet reports {machine_key(identity) or 'no identity at all'} "
-            f"and the ticket file is bound to {binding.describe()}, so the "
-            "binding cannot be checked")
 
 
 # Imported, never copied: two placeholder lists drift, and the floor lessons
 # that built this one (an empty serial, all zeros, "n/a", and an IGT cabinet
 # reporting asset 7 with serial "7") were paid for once already in
-# survey_store.py. The sibling directory is on the path for the same reason
-# ticket_lab_authority is imported rather than reimplemented.
+# survey_store.py, so the sibling directory is on the path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from saspy.constants import is_placeholder_identifier  # noqa: E402
 
@@ -1612,6 +1865,129 @@ def machine_key(identity: dict | None) -> tuple[str, str] | None:
     if asset is not None:
         return ("asset", str(asset))
     return None
+
+
+# SYSTEMD WATCHDOG. A dead poller restarts itself; a HUNG one does not.
+#
+# Operator, 2026-11-15: after commissioning the server re-provisions the
+# HMAC key, technicians lose SSH, "and we don't want them to restart the
+# gateway through its power button". Restart=always covers a process that
+# EXITED. It cannot see one that is alive, holding the serial port, and no
+# longer polling -- which is the failure the server would otherwise have to
+# notice and command a restart for, over a link that may be the thing that
+# broke.
+#
+# WatchdogSec closes it locally. systemd kills and restarts the unit when
+# the pings stop, with no new inbound command and no new attack surface.
+#
+# PINGED FROM THE INNER POLL, NOT THE CYCLE. A cycle can legitimately run
+# for tens of seconds -- the lab has measured 185s, and a drain-priority
+# sweep is routinely 10-20s -- so a watchdog keyed on cycles would need an
+# interval so long it would catch nothing. Every exchange pings instead, so
+# WatchdogSec can be 60s and still never fire on a healthy sweep: a sweep
+# IS exchanges.
+#
+# No dependency: sd_notify is a datagram to the socket in $NOTIFY_SOCKET.
+# Absent (run by hand, or Type=simple) the whole thing is a no-op.
+_WATCHDOG_SOCK = None
+_WATCHDOG_ADDR = None
+_WATCHDOG_EVERY_S = 5.0
+_watchdog_last = 0.0
+
+
+def _watchdog_setup() -> bool:
+    """Open the notify socket once. False when not under systemd."""
+    global _WATCHDOG_SOCK, _WATCHDOG_ADDR
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return False
+    # A leading '@' is Linux's abstract namespace, spelled with a NUL.
+    _WATCHDOG_ADDR = "\0" + addr[1:] if addr.startswith("@") else addr
+    try:
+        import socket as _socket
+        _WATCHDOG_SOCK = _socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM)
+    except OSError:
+        _WATCHDOG_SOCK = None
+        return False
+    return True
+
+
+def _watchdog_notify(message: bytes = b"WATCHDOG=1",
+                     monotonic_fn=time.monotonic) -> None:
+    """Best-effort ping, rate-limited. Never raises: a missing watchdog
+    must not be able to stop a gateway polling."""
+    global _watchdog_last
+    if _WATCHDOG_SOCK is None:
+        return
+    if message == b"WATCHDOG=1":
+        now = monotonic_fn()
+        if now - _watchdog_last < _WATCHDOG_EVERY_S:
+            return
+        _watchdog_last = now
+    try:
+        _WATCHDOG_SOCK.sendto(message, _WATCHDOG_ADDR)
+    except OSError:
+        pass
+
+
+def learn_identity(conn: sqlite3.Connection, now: str,
+                   identity: dict) -> list[str]:
+    """Fill in a serial or asset the open epoch did not have yet.
+
+    AN EPOCH THAT NEVER LEARNS ITS NAME KEEPS NONE FOR LIFE.
+
+    identity_changed() compares only fields present on BOTH sides:
+
+        if was_asset is not None and now_asset is not None and was_asset != now_asset
+
+    so NULL -> 246 is not a change, no epoch opens, and nothing updated
+    the one already open. The only UPDATE on machine_epochs sets
+    ended_at.
+
+    That is precisely the operator's commissioning path, 2026-11-15: "a
+    ram cleared machine isn't open for gaming until asset number is
+    filled and bill in, ticket out and ticket in tests are done." The
+    epoch opens at the clear with both fields NULL, the technician types
+    the asset in, and the epoch keeps NULL anyway -- for the rest of its
+    life, not merely for the commissioning window. Every row of that
+    cabinet's play is then attributed to a machine with no name, and
+    _current_asset_number() returns 0, so --decline-aft-cashout silently
+    skips every cashout on it.
+
+    Filling the field in place is right, and opening a new epoch would be
+    wrong: it is the same cabinet and the same accounting period, just
+    now named, and a new epoch would cut the commissioning rows away
+    from the play that follows. It is also what the server already does
+    on its side -- it accepts a corrected serial or asset for an
+    existing epoch on the next drain.
+
+    Returns a description of each field learned, for the caller to log.
+    Adds no new epoch reason, so the reason set stays as it was.
+    """
+    learned = []
+    for column, key, label in (("serial_number", "serial_number", "serial"),
+                               ("asset_number", "asset_number", "asset")):
+        value = identity.get(key)
+        if value in (None, "", 0):
+            continue
+        try:
+            row = conn.execute(
+                f"SELECT id, {column} FROM machine_epochs "
+                "WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+        except sqlite3.Error:
+            return learned
+        if row is None or row[1] is not None:
+            continue
+        try:
+            conn.execute(
+                f"UPDATE machine_epochs SET {column} = ? WHERE id = ?",
+                (value, row[0]))
+        except sqlite3.Error:
+            continue
+        learned.append(f"{label} {value!r}")
+    if learned:
+        _safe_commit(conn, now)
+    return learned
 
 
 def identity_changed(previous: dict | None, current: dict) -> tuple[str, str] | None:
@@ -1780,6 +2156,115 @@ def open_epoch(conn, now: str, reason: str, identity: dict, detail: str) -> int:
     return int(cursor.lastrowid)
 
 
+
+def next_issue_seq(conn: sqlite3.Connection) -> int:
+    """The next value for validation_pool.issue_seq.
+
+    MAX over the WHOLE table -- revoked and assigned rows included. The
+    counter must never go backwards: a revoke that reset it would make a
+    freshly minted number sort AHEAD of an older one still sitting in the
+    pool, which is the ordering bug this column exists to close.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(issue_seq), 0) FROM validation_pool").fetchone()
+    return int(row[0] or 0) + 1
+
+
+def backfill_issue_seq(conn: sqlite3.Connection) -> int:
+    """Stamp issue_seq on rows that predate the column. Returns how many.
+
+    IN THE ORDER THE POOL WAS ALREADY BEING CONSUMED -- oldest issue first,
+    NULL issued_at last, validation_number only as a tiebreak -- which is
+    exactly the ORDER BY the assignment used before this column existed. So
+    adding the column changes nothing about which number goes out next: the
+    lab's current pool keeps its order across the upgrade.
+
+    The ordering is done here rather than in a window function inside the
+    UPDATE on purpose. ROW_NUMBER() over the whole table restarts at 1, so
+    the first time a LATER batch of NULL rows arrived it would mint
+    sequences that collide with ones already handed out. Offsetting from
+    MAX cannot, and it does not depend on how SQLite materializes a CTE
+    whose own WHERE clause the same UPDATE is busy invalidating.
+    """
+    rows = conn.execute(
+        "SELECT validation_number FROM validation_pool WHERE issue_seq IS NULL "
+        "ORDER BY issued_at IS NULL, issued_at, validation_number").fetchall()
+    if not rows:
+        return 0
+    base = conn.execute(
+        "SELECT COALESCE(MAX(issue_seq), 0) FROM validation_pool").fetchone()[0]
+    conn.executemany(
+        "UPDATE validation_pool SET issue_seq = ? WHERE validation_number = ?",
+        [(int(base or 0) + i, number) for i, (number,) in enumerate(rows, 1)])
+    return len(rows)
+
+
+
+def record_pool_fill(conn: sqlite3.Connection, now: str, *, source: str,
+                     issued: int, revoked: int = 0,
+                     pool_epoch: int | None = None,
+                     batch_uuid: str | None = None) -> int:
+    """Record a fill and return the pool size it left behind.
+
+    Does NOT commit: a fill is part of the transaction that issued the
+    numbers. A fills row without its numbers, or numbers without their fills
+    row, would each be a lie about the same event.
+
+    available_after is COUNTED, not computed from `issued`. The three paths
+    that fill a pool do different things -- a replacement revokes first, a
+    top-up does not, and a batch may arrive on a pool that already has rows
+    -- and the count is the one answer that is right for all three.
+    """
+    available = conn.execute(
+        "SELECT COUNT(*) FROM validation_pool WHERE status = 'available'"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO pool_fills (filled_at, source, issued, revoked, "
+        "available_after, pool_epoch, batch_uuid) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (now, source, int(issued), int(revoked), int(available),
+         pool_epoch, batch_uuid))
+    return int(available)
+
+
+def pool_size_at_last_fill(conn: sqlite3.Connection) -> int | None:
+    """The pool size the last recorded fill left behind, or None.
+
+    None is NOT zero and must not be rendered as one. It means no fill has
+    been recorded on this database -- a pool seeded before pool_fills
+    existed, or hand-inserted rows -- so the pool's intended size is
+    genuinely unknown and 20% of it is not a number anyone should quote.
+    """
+    try:
+        row = conn.execute("SELECT available_after FROM pool_fills "
+                           "ORDER BY id DESC LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def pool_low_water(conn: sqlite3.Connection, floor: int) -> tuple[int, str]:
+    """The live low-water mark, and a phrase saying where it came from.
+
+    Returns (threshold, why). `why` is for the alert text: an operator
+    reading "below 40" needs to know whether that is 20% of a 200-number
+    pool or a floor standing in for a pool size nobody recorded.
+    """
+    size = pool_size_at_last_fill(conn)
+    if size is None:
+        return floor, (f"--pool-depth-alert floor {floor}; no fill recorded "
+                       "on this database, so there is no pool size to take "
+                       f"{POOL_LOW_WATER_FRACTION:.0%} of")
+    scaled = int(size * POOL_LOW_WATER_FRACTION)
+    if scaled > floor:
+        return scaled, (f"{POOL_LOW_WATER_FRACTION:.0%} of the {size} this "
+                        "pool held after its last fill")
+    return floor, (f"--pool-depth-alert floor {floor}; "
+                   f"{POOL_LOW_WATER_FRACTION:.0%} of the last fill's {size} "
+                   f"would be {scaled}, too few to act on")
+
+
 def migrate_epoch_columns(conn: sqlite3.Connection) -> None:
     """Add epoch_id to meter tables created before epochs existed.
 
@@ -1799,6 +2284,16 @@ def migrate_epoch_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN epoch_id INTEGER")
             print(f"migrated: added epoch_id to {table} "
                   "(existing rows keep NULL -- they predate epoch tracking)")
+        # BOTH TABLES, in this order, so a migrated database ends up with the
+        # same column order as a fresh one and latest_c7_meters pairs the
+        # same columns on either. Existing rows keep NULL, which reads as
+        # "never sent" -- correct, because they never were, and the drain
+        # will pick them up on its first pass rather than skipping history
+        # that predates the column.
+        if columns and "synced_at" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN synced_at TEXT")
+            print(f"migrated: added synced_at to {table} "
+                  "(existing rows keep NULL -- they have never been sent)")
     # Same reasoning for the RTE payload column: a database from a run before
     # --rte existed keeps its old machine_events shape, and every insert
     # naming rte_fields would fail on it.
@@ -1807,11 +2302,41 @@ def migrate_epoch_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE ticket_in_events ADD COLUMN authority_decision TEXT")
         print("migrated: added authority_decision to ticket_in_events "
               "(existing rows keep NULL -- nothing answered them)")
+    # THE DIAGNOSTIC TABLES A HEADLESS GATEWAY CANNOT SHIP WITHOUT.
+    # Added 2026-11-16. Both existed for runs before this, and on those
+    # databases every row predates the column and reads as never sent --
+    # which is exactly true, so the drain picks the backlog up on its first
+    # pass rather than skipping the history that predates the column.
+    for table in ("interrogations", "poller_lifecycle"):
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if columns and "synced_at" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN synced_at TEXT")
+            print(f"migrated: added synced_at to {table} "
+                  "(existing rows keep NULL -- they have never been sent, "
+                  "and now they can be)")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(machine_events)")}
     if columns and "rte_fields" not in columns:
         conn.execute("ALTER TABLE machine_events ADD COLUMN rte_fields TEXT")
         print("migrated: added rte_fields to machine_events "
               "(existing rows keep NULL -- they predate real time events)")
+    # issue_seq, unlike the columns above, must NOT stay NULL: the
+    # assignment orders by it, and a NULL would sort to the end and strand
+    # the lab's existing pool behind every number minted after the upgrade.
+    # So this one is backfilled, in the order the pool was already being
+    # consumed. gateway/db.py adds the same column -- either process may run
+    # first, and a legacy soak database may see neither pool_replace.py nor
+    # the gateway before the poller opens it.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(host_requests)")}
+    if columns and "request_json" not in columns:
+        conn.execute("ALTER TABLE host_requests ADD COLUMN request_json TEXT")
+        print("migrated: added request_json to host_requests "
+              "(existing rows keep NULL -- WfA pulls never needed it)")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(validation_pool)")}
+    if columns and "issue_seq" not in columns:
+        conn.execute("ALTER TABLE validation_pool ADD COLUMN issue_seq INTEGER")
+        stamped = backfill_issue_seq(conn)
+        print(f"migrated: added issue_seq to validation_pool ({stamped} "
+              "existing rows stamped in their current issue order)")
     conn.commit()
 
 
@@ -1933,11 +2458,78 @@ def maintain_epoch(conn, client, state, values: dict, now: str) -> None:
     # Identity is read on a slow schedule, and immediately whenever the meters
     # look cleared -- a RAM clear and a machine swap are indistinguishable in
     # the meters, and only the identity tells them apart.
-    if cleared or state.cycles_since_identity >= IDENTITY_CHECK_CYCLES:
+    forced = state.force_identity_check
+    if cleared or forced or state.cycles_since_identity >= IDENTITY_CHECK_CYCLES:
         identity = read_identity(client)
         state.cycles_since_identity = 0
+        if forced:
+            # A cabinet that answered NOTHING has not been identified, and
+            # letting a silent machine consume the one check a cable swap
+            # gets would be worse than not forcing it at all. Ask again next
+            # cycle, up to FORCE_IDENTITY_MAX_ATTEMPTS.
+            named = any(identity.get(f) is not None
+                        for f in ("serial_number", "asset_number"))
+            attempts = state.force_identity_attempts
+            if named or state.force_identity_attempts >= FORCE_IDENTITY_MAX_ATTEMPTS:
+                state.force_identity_check = False
+                state.force_identity_attempts = 0
+                if not named:
+                    print(f"[{now}] the cabinet did not identify itself in "
+                          f"{FORCE_IDENTITY_MAX_ATTEMPTS} cycles after the "
+                          "link came back. Whatever is on this cable is "
+                          "being logged under the open epoch.")
+                else:
+                    # SAY THAT IT RAN, AND WHAT IT FOUND.
+                    #
+                    # This path used to clear in silence. The forced check
+                    # exists because of the operator's 2026-11-15 rule --
+                    # "after a sas disconnect, and reconnect, identity check
+                    # must become a standard. Without the need of waiting
+                    # identity check cycle" -- and on a SHORT gap it is the
+                    # only thing that runs: under --comms-gap-seconds (30s)
+                    # there is no full interrogation to leave a row behind.
+                    #
+                    # So on the one path that matters most, a successful
+                    # check produced no log line, no table row and no
+                    # observable difference from not having run at all.
+                    # Asked to verify it by pulling the cable for five
+                    # seconds, the operator would have seen "link restored"
+                    # and nothing else, and could not have told a working
+                    # check from a missing one. Added 2026-11-17.
+                    #
+                    # A MACHINE CHANGE IS NOT ANNOUNCED HERE. maintain_epoch
+                    # raises it, with an epoch, which is the record that
+                    # matters; this line reports only what the cabinet just
+                    # said about itself.
+                    print(f"[{now}] identity re-read after the link came "
+                          f"back (attempt {attempts + 1} of "
+                          f"{FORCE_IDENTITY_MAX_ATTEMPTS}): serial "
+                          f"{identity.get('serial_number')}, asset "
+                          f"{identity.get('asset_number')}. A different "
+                          "cabinet from here on raises its own epoch.")
+            else:
+                state.force_identity_attempts += 1
+        for gained in learn_identity(conn, now, identity):
+            print(f"[{now}] epoch {state.epoch_id} learned its {gained} "
+                  f"(it opened without one). Same cabinet, same epoch -- "
+                  f"a name arriving late is not a machine change.")
         changed = identity_changed(state.identity, identity)
-        state.identity = identity
+        # A READ THAT NAMED NOTHING MUST NOT ERASE WHAT WE KNEW.
+        #
+        # identity_changed() only compares fields present on BOTH sides, so
+        # an unreadable identity is correctly not a machine change. But
+        # overwriting state.identity with that empty read ALSO destroys the
+        # previous cabinet's name, and the next read -- the one where the
+        # machine finally answers -- then has nothing to compare against and
+        # cannot see the swap either. One silent cycle was enough to blind
+        # the detector permanently.
+        #
+        # Found by the retry added for the cable-swap case on 2026-11-16: a
+        # cabinet that stays silent for one cycle and then reports a
+        # DIFFERENT serial opened no epoch at all.
+        if any(identity.get(f) is not None
+               for f in ("serial_number", "asset_number", "sas_version")):
+            state.identity = identity
         if changed and changed[0] == "machine_changed":
             state.clear_candidate_cycles = 0
             state.clear_first_seen_at = None
@@ -2127,16 +2719,88 @@ def _apply_drain_poll_rate(client, state: "PollState", now: str, *,
                   f"{state.normal_poll_interval:.3f}s (drain priority off).")
 
 
+# HOW MANY PRE-EMPTIONS OF ONE LONG POLL MEAN "THE QUEUE IS BURSTING".
+#
+# The rate probe (_live_drain_probe) cannot answer this. It has a 5-second
+# floor, and for a good reason -- one event in the first 50 ms reads as
+# 20/s and would abandon every sweep. But a burst that arrives at the TOP
+# of a sweep is inside that floor, and that is exactly where the measured
+# one landed: 2026-11-16T21:59:02, send_meters_10_through_15, the first
+# poll of the cycle, 24 pre-emptions and 9.617 s before anything engaged.
+#
+# Consecutive pre-emptions of a SINGLE long poll are not a rate and need
+# no floor. Each one means the cabinet had an event queued and chose to
+# deliver it instead of answering (§12.3), so N in a row is N events the
+# cabinet was holding during one exchange.
+#
+# THE FIRST VALUE HERE WAS 3 AND IT WAS WRONG. The reasoning was: this
+# cabinet reports 0.93 events/s against a 5.0/s budget, so under one
+# event per poll, so three in a row is abnormal. That conflates the
+# AVERAGE RATE with ARRIVAL CLUMPING, and events do not arrive evenly.
+#
+# Measured on the cabinet, 2026-11-16, over 2666 inter-event gaps:
+#
+#     under 50 ms                        1450
+#     50-200 ms (stacks on one poll)      674   <- 80% cumulative
+#     200 ms - 1 s                        167
+#     over 1 s                            375   <- clump boundaries
+#
+# 80% of events arrive within one poll interval of the one before, and
+# 2291 events fall inside 375 clumps: a MEAN CLUMP OF 7.1 EVENTS. One
+# spin is a game start, several reel stops, a game end and a train of
+# 0x71/0x72 lamp toggles, all inside a few hundred milliseconds. At 200
+# ms pacing they stack onto one long poll.
+#
+# So 3 fires on an ORDINARY SPIN. The operator saw it within minutes:
+# "although there's no burst, drain priority is kicking in" -- toggling
+# every 30-60 s with nothing happening, 57 abandoned
+# send_meters_10_through_15 reads in twelve minutes, and the Table C-7
+# sweep starved to 10 readings against 134 core ones.
+#
+# 12 is twice the measured mean clump and half of max_requeue's 24. It is
+# PROVISIONAL: --drain-burst-preemptions exists so it can be tuned
+# against a cabinet rather than argued about.
+#
+# Operator, 2026-11-16, setting the priority this serves:
+#
+#   "ticket out is the first priority, nothing else is more important,
+#    then next priority is to get customer bets correctly, their win/loss
+#    should be accurate (2 spins lost in 3 minute button burst isn't a
+#    problem at all), then if there's enough headroom; only then c7 or
+#    meter polling ... in other words, drain priority must start
+#    immediately"
+#
+# A meter read abandoned here costs nothing permanent: the meters are
+# cumulative and the next sweep reads them in full. An undrained event is
+# gone. See HANDOVER §14q for the A/B measurement that set this at 3
+# rather than at 24.
+DRAIN_BURST_PREEMPTIONS = 12
+
+
 def _never_give_up() -> bool:
     """The default: finish the sweep whatever happens, as it always did."""
     return False
+
+
+def _count_nothing() -> None:
+    """The default pre-emption counter: count nowhere.
+
+    _poll_all_meters() does NOT take a PollState and must not start to.
+    It is the one function in this file that can be called with a bare
+    fake client and no run behind it, which is why the meter tests are
+    cheap. The counting the live drain probe needs is therefore injected
+    as a callable from the one place that HAS the state, and absent one
+    the sweep still runs -- it just cannot see pre-empted events, which
+    is exactly where this tool was before 2026-11-16.
+    """
+    return None
 
 
 def _live_drain_probe(state: "PollState", started: float, *,
                       monotonic_fn=time.monotonic,
                       min_seconds: float = 5.0,
                       enter: float = DRAIN_ENTER_FRACTION,
-                      on_fire=None):
+                      on_fire=None, on_probe_fire=None):
     """Abandon the rest of the optional sweep WHILE it is running.
 
     WHY MID-SWEEP AND NOT NEXT CYCLE. The first hardware run of drain
@@ -2161,7 +2825,11 @@ def _live_drain_probe(state: "PollState", started: float, *,
         capacity = state.baseline_capacity or state.last_capacity
         if not capacity:
             return False
-        if (state.events_seen_live / elapsed) < enter * capacity:
+        # BOTH COUNTERS. A pre-empted long poll collects a real event per
+        # reissue and none of them pass through the heartbeat, so measuring
+        # events_seen_live alone reads a saturated channel as a silent one.
+        seen = state.events_seen_live + state.preempted_events_live
+        if (seen / elapsed) < enter * capacity:
             return False
         # FIRE EVERYTHING AT ONCE, not just the sweep.
         #
@@ -2178,6 +2846,50 @@ def _live_drain_probe(state: "PollState", started: float, *,
         # instead of sleep, which was subject to the same lag.
         if not state.draining:
             state.draining = True
+            # SAY SO. The cycle-top transition print compares `draining`
+            # against `state.draining`, and this has just set the second
+            # one -- so by the next cycle they agree and the ON line never
+            # prints. The OFF line still does, when the burst ends.
+            #
+            # Operator, 2026-11-12, reading a burst that lost 13 buffers:
+            # "drain priority didn't start for more than 15 seconds during
+            # button burst. Actually i am not sure if it ever started but
+            # here it says 'drain priority OFF'". It had started -- here,
+            # mid-sweep, which is the path that exists precisely because
+            # the cycle-top one is too slow. The feature worked and the
+            # log said nothing, so the only evidence it ran was the line
+            # announcing it had stopped.
+            #
+            # Same class as the bugs this file keeps finding: something
+            # that happened, rendered as nothing. Worse than useless here,
+            # because it reads as the opposite of what occurred.
+            if on_probe_fire is not None:
+                # REPORT THE NUMBER THE DECISION USED, and its parts.
+                #
+                # This line read `state.events_seen_live / elapsed` --
+                # the heartbeat count ALONE -- while the test three lines
+                # above fired on events_seen_live + preempted_events_live.
+                # So the log announced a rate LOWER than the one it had
+                # just acted on, and the gap was exactly the pre-emptions
+                # the counter was added to see on 2026-11-16.
+                #
+                # Operator, 2026-11-17, reading six of these: "should we
+                # move the threshold of drain priority trigger just a
+                # little bit higher?" The lines he was reading said 1.29
+                # to 1.79 events/s against a 5.0/s budget -- 26% to 36%,
+                # apparently firing far under the 50% enter fraction and
+                # looking over-eager. It was not: the real rate was at or
+                # above 2.5/s every time. He would have tuned a threshold
+                # against a number that was never the one in force.
+                #
+                # Same class as the bug the comment above this one
+                # describes, and introduced by the fix for it: the
+                # counter went into the DECISION and not into the
+                # REPORT. A measurement that disagrees with the act it
+                # describes is worse than no measurement.
+                on_probe_fire(seen / elapsed, elapsed,
+                              state.events_seen_live,
+                              state.preempted_events_live)
             if on_fire is not None:
                 on_fire()
         return True
@@ -2479,17 +3191,27 @@ def seed_validation_pool(
     now = now_fn()
     existing = conn.execute("SELECT COUNT(*) FROM validation_pool WHERE status = 'available'").fetchone()[0]
     added = 0
+    # Minting order IS issue order. The candidates are random, so with no
+    # issue_seq the assignment would fall back to validation_number and hand
+    # them out in numeric order -- the one order §11.2 forbids.
+    base_seq = next_issue_seq(conn) - 1
     while existing + added < target_available:
         candidate = random_fn(53) % 10**16
         try:
             conn.execute(
-                "INSERT INTO validation_pool (validation_number, validation_system_id, status, issued_at) "
-                "VALUES (?, ?, 'available', ?)",
-                (candidate, validation_system_id, now),
+                "INSERT INTO validation_pool (validation_number, validation_system_id, status, issued_at, issue_seq) "
+                "VALUES (?, ?, 'available', ?, ?)",
+                (candidate, validation_system_id, now, base_seq + added + 1),
             )
         except sqlite3.IntegrityError:
             continue  # collided with an existing validation_number (primary key) — try another
         added += 1
+    if added:
+        # Before the commit: the fills row and the numbers it describes are
+        # one event. Recorded even in the lab, because the depth alert's
+        # denominator comes from here and a lab pool with no fills row
+        # would silently fall back to the floor.
+        record_pool_fill(conn, now, source="poller-seed", issued=added)
     _safe_commit(conn, now)
     return added
 
@@ -2593,21 +3315,29 @@ def _handle_cashout_request(client, conn: sqlite3.Connection, now: str) -> None:
     # ages in the pool, which is the opposite of what the ticket's own
     # validity window wants.
     #
-    # NULLS LAST, deliberately. A NULL issued_at is a hand-inserted number
-    # with no batch info (see the pool-age check) -- its age is UNKNOWN, and
-    # unknown is not evidence of being oldest. SQLite's plain ORDER BY sorts
-    # NULLs FIRST, which would hand out the one number whose age nobody can
-    # vouch for, first.
+    # NULLS LAST, deliberately, for both keys. A NULL issued_at is a
+    # hand-inserted number with no batch info (see the pool-age check) -- its
+    # age is UNKNOWN, and unknown is not evidence of being oldest. SQLite's
+    # plain ORDER BY sorts NULLs FIRST, which would hand out the one number
+    # whose age nobody can vouch for, first.
     #
-    # validation_number is the final tiebreak, which keeps the lab
-    # deterministic: --seed-validation-pool stamps every row with the same
-    # issued_at, so seeded pools behave exactly as they did before this
-    # change. That is why the old ordering was never wrong in the lab and
-    # would have been wrong on the floor.
+    # issue_seq LEADS, because issued_at TIES. Every row of one top-up or one
+    # server batch carries the same timestamp to the second, so issued_at
+    # alone falls through to validation_number -- numeric order, scoped to a
+    # batch, which is the one order §11.2 forbids. issue_seq is the order the
+    # numbers were actually issued in, per gateway, and it cannot tie.
+    # issued_at and validation_number stay behind it as the fallback for a
+    # row no migration has reached yet.
+    #
+    # That is why the old ordering was never wrong in the LAB --
+    # --seed-validation-pool stamps one issued_at and mints ascending, so
+    # numeric order and issue order coincided -- and would have been wrong on
+    # the floor, where the server mints at random.
     row = conn.execute(
         "SELECT validation_number, validation_system_id FROM validation_pool "
         "WHERE status = 'available' "
-        "ORDER BY issued_at IS NULL, issued_at, validation_number LIMIT 1"
+        "ORDER BY issue_seq IS NULL, issue_seq, "
+        "issued_at IS NULL, issued_at, validation_number LIMIT 1"
     ).fetchone()
     if row is None:
         conn.execute(
@@ -2658,6 +3388,10 @@ def check_pool_depth(conn: sqlite3.Connection, now: str, *,
     not tell an operator when to top up. Ten numbers left is comfortable
     on a cabinet that dispenses one a day and an emergency on one doing
     six an hour, and assigned_at is already recorded, so the rate is free.
+
+    ``min_available`` is the FLOOR under the threshold, not the threshold:
+    the live mark is max(min_available, 20% of the pool size at the last
+    fill). 0 disables the check entirely, which is what the tests use.
     """
     if min_available <= 0:
         return
@@ -2667,7 +3401,10 @@ def check_pool_depth(conn: sqlite3.Connection, now: str, *,
         ).fetchone()[0]
     except sqlite3.Error:
         return
-    low = available < min_available
+    # --pool-depth-alert is the FLOOR, not the threshold. See
+    # DEFAULT_POOL_DEPTH_ALERT: the live mark scales with the pool.
+    threshold, why = pool_low_water(conn, min_available)
+    low = available < threshold
 
     if not low:
         if state is not None and state.pool_low_since is not None:
@@ -2682,9 +3419,34 @@ def check_pool_depth(conn: sqlite3.Connection, now: str, *,
             state.pool_low_since = None
         return
 
+    # WHAT COUNTS AS USED (spec change 2026-11-12, open item 2): a number
+    # that LEFT THE POOL BY ASSIGNMENT, whatever became of it afterwards.
+    #
+    # The open item asked whether a number assigned and then voided for a
+    # printer jam (VOID_ISSUE_ERROR) counts. It does, and the reason is
+    # §11.2: a number is never reused after assignment or void, so the pool
+    # has lost it either way. A jam that burns fifty numbers in an hour
+    # really does empty the pool in an hour, and the refill really does have
+    # to replace fifty. Excluding voids would size the refill from numbers
+    # that are not coming back.
+    #
+    # Revocation is NOT use, and is excluded for free: a revoked row was
+    # 'available', so its assigned_at is NULL. That is right -- a revoke
+    # comes with a refill, and counting it would spike the rate at exactly
+    # the moment the pool is fullest.
+    #
+    # datetime() ON BOTH SIDES, deliberately. assigned_at is written by
+    # datetime.isoformat(), so it carries a 'T' and a '+00:00'; SQLite's
+    # datetime() returns ' ' and no offset. Comparing the raw string against
+    # datetime(now, '-24 hours') is a LEXICOGRAPHIC comparison in which 'T'
+    # (0x54) beats ' ' (0x20), so every row whose calendar date matched the
+    # cutoff's counted, whatever its time -- a window that stretched to
+    # nearly 48 hours and roughly doubled the rate on the alert that is
+    # supposed to say how long is left.
     used = conn.execute(
         "SELECT COUNT(*) FROM validation_pool WHERE assigned_at IS NOT NULL "
-        "AND assigned_at >= datetime(?, '-24 hours')", (now,)).fetchone()[0]
+        "AND datetime(assigned_at) >= datetime(?, '-24 hours')",
+        (now,)).fetchone()[0]
     rate = used / 24.0
     if rate > 0:
         left = f"about {available / rate:.1f}h left at {rate:.1f}/h"
@@ -2697,14 +3459,14 @@ def check_pool_depth(conn: sqlite3.Connection, now: str, *,
             "INSERT INTO poll_errors (occurred_at, poll_name, error_type, "
             "message) VALUES (?, ?, ?, ?)",
             (now, "validation_pool", "PoolLow",
-             f"{available} available, below --pool-depth-alert "
-             f"{min_available}; {used} used in 24h"))
+             f"{available} available, below {threshold} ({why}); "
+             f"{used} assigned in 24h"))
         _safe_commit(conn, now)
         if state is not None:
             state.pool_low_since = now
 
     print(f"[{now}] ALERT: validation_pool has {available} number(s) "
-          f"available, below --pool-depth-alert {min_available} -- {left}. "
+          f"available, below {threshold} ({why}) -- {left}. "
           f"At zero every cashout becomes a handpay, whatever the printer "
           f"limit says. Top up with examples/pool_replace.py.")
 
@@ -2843,27 +3605,24 @@ TICKET_ESCROW_READS = 4
 def _capture_ticket_in(client, conn: sqlite3.Connection, now: str,
                        state: "PollState | None" = None,
                        escrow_reads: int = TICKET_ESCROW_READS) -> None:
-    """Called on exception 0x67: read the ticket's validation data, and
-    answer it ONLY if a lab ticket file was handed to this run.
+    """Called on exception 0x67: read the ticket's validation data, and ask
+    the SERVER what it is worth. Never decide that here.
 
-    Without --lab-ticket-authority this stays exactly as read-only as it
-    has always been: the ticket is recorded and never redeemed, the machine
-    returns it after its own thirty-second timeout (§15.12), and nothing
-    here decides what a ticket is worth. That refusal is deliberate and is
-    the right default for a gateway — a poller that pays tickets by itself
-    is a cash-dispensing defect.
+    Without --server-ticket-authority this is read-only: the ticket is
+    recorded and never redeemed, the machine returns it after its own
+    thirty-second timeout (§15.12), and nothing on this gateway decides
+    what a ticket is worth. With the flag, the question goes to the server
+    through validation_queries and the answer comes back the same way; the
+    gateway still decides nothing (§9.1).
 
-    What lifts it is a FILE, not a flag: the operator has to hand this run
-    a specific list of validation numbers bound to a specific cabinet
-    serial. That is the same boundary ticket_lab_authority.py draws, and
-    the lookup, the transfer codes and the expiry date are imported from it
-    rather than copied, so the two cannot drift apart.
-
-    The reason to have it here at all is the serial port: one port, one
-    master. ticket_lab_authority.py cannot run while a soak holds
-    /dev/ttyS0, so ticket-in was the one path a soak could never exercise
-    — which is why §3 of every rte_reconcile run so far has printed
-    [NO DATA].
+    THERE IS NO THIRD OPTION, and there used to be. --lab-ticket-authority
+    answered from a JSON file of validation numbers on the gateway, bound
+    to one cabinet serial. It was removed on 2026-11-15 on the operator's
+    instruction — "a server outage must always halt ticket in" — once the
+    server round trip was proven on hardware. See
+    MIGRATION-SPEC-AMENDMENTS A27 for why the cashdesk makes that stricter
+    rather than looser: a ticket issued at the cage is the exact case where
+    this process cannot know whether it was already paid.
     """
     # ONE READ USED TO BE ENOUGH, AND IT WAS NOT.
     #
@@ -2918,10 +3677,12 @@ def _capture_ticket_in(client, conn: sqlite3.Connection, now: str,
         _safe_commit(conn, now)
         print(f"[{now}] {note}")
         return
+    # ONE AUTHORITY, AND IT IS NEVER THIS PROCESS (§9.1, operator
+    # 2026-11-15: "a server outage must always halt ticket in"). With no
+    # server answering, `decision` stays None, the insertion is recorded,
+    # and the cabinet hands the ticket back on its own §15.12 timeout.
     decision = None
-    if state is not None and state.ticket_authority is not None:
-        decision = _answer_ticket_in(client, conn, ticket, state, now)
-    elif state is not None and state.server_ticket_authority:
+    if state is not None and state.server_ticket_authority:
         decision = _ask_server_ticket_in(client, conn, ticket, state, now)
 
     conn.execute(
@@ -2939,152 +3700,8 @@ def _capture_ticket_in(client, conn: sqlite3.Connection, now: str,
               f"-> {decision}")
 
 
-def _pool_issued_ticket(conn: sqlite3.Connection, number: int):
-    """Did THIS gateway print the ticket now being inserted?
-
-    The two halves of ticket handling use different books. Ticket-OUT draws
-    a number from validation_pool and marks it 'assigned' with the amount
-    once the machine acknowledges the print; ticket-IN looks numbers up in
-    lab_tickets.json. Nothing joined them, so a ticket the cabinet printed
-    thirty seconds earlier came back as DENIED 0x82 "not in system" -- the
-    gateway refusing to recognise its own issuance.
-
-    Honouring one is a weaker claim than the lab file makes, not a stronger
-    one: the host is not deciding what an unknown ticket is worth, it is
-    reading back an amount it recorded when it authorised the print. That
-    is what a real CMS does. It stays behind the same lab gate only because
-    it still moves money.
-
-    Returns the (status, amount_cents) row, or None if this gateway never
-    issued that number.
-    """
-    return conn.execute(
-        "SELECT status, assigned_amount_cents FROM validation_pool "
-        "WHERE validation_number = ?", (number,)).fetchone()
 
 
-def _answer_ticket_in(client, conn: sqlite3.Connection, ticket,
-                      state: "PollState", now: str) -> str:
-    """LAB ONLY. Look the ticket up in the file this run was given and
-    answer LP 0x71 with it.
-
-    Returns what happened, as one line, for ticket_in_events. A denied
-    ticket moves no meter at all, so if this is not written down the
-    decision is unrecoverable afterwards.
-
-    The answer is the only thing here that changes machine state, and the
-    file is what authorises it. A number that is not in the file is denied
-    with 0x82, "not in system" — never silently ignored, which would leave
-    the machine holding the ticket for its full thirty seconds and tell the
-    player nothing.
-    """
-    # From the LIBRARY, not from examples/ticket_lab_authority.py.
-    #
-    # These are Table 15.12 and 15.12c -- spec tables, not lab logic. Taking
-    # them from the lab module made the product depend at runtime on the
-    # scaffolding that stands in for a server, so the public mirror could not
-    # drop the scaffolding without breaking the gateway. Validation numbers
-    # are always issued by the server; nothing here may need that module.
-    from saspy.constants import (  # noqa: E402
-        TICKET_NOT_IN_SYSTEM as NOT_IN_SYSTEM,
-        TICKET_TRANSFER_CODES as TRANSFER_CODES,
-        describe_redemption_status as describe,
-    )
-
-    # Table 15.11b: parsing code 00 means the 9 bytes are BCD, an 18-digit
-    # decimal number (2-digit system ID + 16). Any other shape is not
-    # something this file knows how to look up, and guessing at it would
-    # mean answering a ticket we have not actually identified.
-    if ticket.parsing_code != 0x00 or len(ticket.validation_data) != 9:
-        return (f"NOT ANSWERED: parsing code 0x{ticket.parsing_code:02X} with "
-                f"{len(ticket.validation_data)} bytes is not Table 15.11b's 00 "
-                "with 9 BCD bytes")
-
-    number = decode_bcd(ticket.validation_data)
-    digits = f"{number:018d}"
-    spec = state.ticket_authority.get(digits)
-
-    # A ticket this gateway printed itself is not in the lab file and never
-    # will be. Recognise it from validation_pool instead -- see
-    # _pool_issued_ticket() for why that is the weaker claim, not the
-    # stronger one.
-    reserved_number = None
-    deny_reason = "not in file"
-    if spec is None:
-        row = _pool_issued_ticket(conn, number)
-        if row is not None and row[0] == "assigned" and row[1]:
-            # RESERVE IT BEFORE SENDING LP 0x71, not after. If this process
-            # dies between the poll and the update, 'redeeming' blocks a
-            # second redemption of the same ticket -- which is the failure
-            # that costs real money. It is released again only on a clean
-            # refusal from the machine, where we know nothing moved.
-            conn.execute(
-                "UPDATE validation_pool SET status = 'redeeming' "
-                "WHERE validation_number = ? AND status = 'assigned'", (number,))
-            _safe_commit(conn, now)
-            reserved_number = number
-            spec = {"kind": "cashable", "cents": int(row[1]),
-                    "expiration": 0, "pool_id": 0}
-        elif row is not None and row[0] in ("redeemed", "redeeming"):
-            deny_reason = (f"this gateway issued ...{digits[-6:]} but it is "
-                           f"already '{row[0]}' -- a ticket is redeemable once")
-        elif row is not None:
-            # 'available' or 'retired': the number exists in the pool but was
-            # never put on a ticket, so there is nothing to pay.
-            deny_reason = (f"...{digits[-6:]} is '{row[0]}' in the pool, never "
-                           "issued on a ticket")
-
-    if spec is None:
-        # NEVER an early return. Silence leaves the machine holding the ticket
-        # for §15.12's full thirty seconds and tells the player nothing; that
-        # was the single most visible defect this file ever had.
-        code, amount = NOT_IN_SYSTEM, 0
-        note = f"DENIED 0x{NOT_IN_SYSTEM:02X} {deny_reason}"
-    else:
-        code = TRANSFER_CODES[spec["kind"]]
-        amount = spec["cents"]
-        note = f"honoured as {spec['kind']} for {amount} cents"
-        if ticket.amount_cents and ticket.amount_cents != amount:
-            note += f" (machine reported {ticket.amount_cents})"
-
-    try:
-        result = client.redeem_ticket(
-            transfer_code=code,
-            transfer_amount_cents=amount,
-            validation_number=number,
-            restricted_expiration=(spec["expiration"]
-                                   if spec and spec["kind"] == "restricted" else 0),
-            pool_id=(spec["pool_id"]
-                     if spec and spec["kind"] == "restricted" else 0),
-            parsing_code=ticket.parsing_code,
-        )
-    except SASError as e:
-        # Deliberately leaves a reserved number in 'redeeming'. The exchange
-        # may have failed after the machine took the ticket, and those two
-        # look identical from here; blocking a second redemption is the safe
-        # direction, and the row is visible for a human afterwards.
-        return f"{note}; LP 0x71 failed: {type(e).__name__}: {e}"
-    if reserved_number is not None:
-        # The outcome is the CATEGORY (status >> 5), not a single code: 0x01
-        # is "restricted promotional ticket redeemed" and is a success. Three
-        # outcomes, not two --
-        #   SUCCESS (0b000)            -> redeemed, the money moved
-        #   FAILED/incompatible/none   -> back to assigned; the player is
-        #                                 still holding a spendable ticket
-        #   waiting/pending (0b001/010) -> LEAVE IT RESERVED. The machine has
-        #                                 not said yet, and releasing a ticket
-        #                                 that then completes pays it twice.
-        category = result.machine_status >> 5
-        settled = {0b000: "redeemed"}.get(category)
-        if settled is None and category not in (0b001, 0b010):
-            settled = "assigned"
-        if settled is not None:
-            conn.execute(
-                "UPDATE validation_pool SET status = ? WHERE validation_number = ?",
-                (settled, reserved_number))
-            _safe_commit(conn, now)
-        note += f" (issued by this gateway; now {settled or 'redeeming'})"
-    return f"{note}; machine status 0x{result.machine_status:02X} {describe(result.machine_status)}"
 
 
 # Created ONLY when --server-ticket-authority is given. A lab gateway run
@@ -3148,8 +3765,8 @@ def _ask_server_ticket_in(client, conn: sqlite3.Connection, ticket,
     """§9: ask the SERVER what the escrowed ticket is worth, and tell the
     machine exactly what the server said.
 
-    This is the floor path, and it is the reverse of _answer_ticket_in() in
-    the one way that matters: the gateway holds no authority. It does not
+    This is the ONLY path, and the thing that matters about it is that the
+    gateway holds no authority. It does not
     look the number up in its own pool, even for a ticket it printed thirty
     seconds ago -- §7.1, "the pool is a routing and issuing mechanism, not a
     validity list" -- because whether that ticket was already paid at the
@@ -3332,7 +3949,8 @@ def _ask_server_ticket_in(client, conn: sqlite3.Connection, ticket,
     return note
 
 
-def _acknowledge_aft_transfer(client, conn: sqlite3.Connection, now: str) -> None:
+def _acknowledge_aft_transfer(client, conn: sqlite3.Connection, now: str,
+                              state=None) -> None:
     """Called on exception 0x69: read the completion status and ACKNOWLEDGE it.
 
     THE ACKNOWLEDGEMENT IS NOT OPTIONAL. §8.8: a transfer answered with
@@ -3385,6 +4003,13 @@ def _acknowledge_aft_transfer(client, conn: sqlite3.Connection, now: str) -> Non
          result.transaction_id, result.transaction_date,
          result.transaction_time, result.asset_number, note))
     _safe_commit(conn, now)
+    # WHATEVER THE TRANSFER WAS, it is no longer in progress -- so a §8.7
+    # decline may be sent again. Cleared unconditionally rather than only
+    # for transactions whose id starts DECLINE: a credit push completing
+    # also ends the transfer that would have made the next decline answer
+    # 0xC0, and the cabinet has only one transfer in progress at a time.
+    if state is not None:
+        state.aft_decline_pending_since = None
     print(f"[{now}] AFT transfer complete (0x69) acknowledged: {note}; "
           f"cashable={result.cashable_amount} restricted={result.restricted_amount} "
           f"nonrestricted={result.nonrestricted_amount} "
@@ -3486,12 +4111,11 @@ def _capture_handpay(client, conn: sqlite3.Connection, now: str,
     poll 0x94, it moves money, and it belongs to a human running
     examples/handpay_clear.py, not to a logger.
 
-    The one exception is an explicitly licensed lab run: with
-    --lab-auto-handpay-reset the clock started here is what
-    _lab_auto_handpay_reset() later measures against. Starting it is free
-    and unconditional -- the decision to act on it is not made in this
-    function, and is refused outright unless a bound lab ticket file is
-    also in effect.
+    Nothing in this file acts on that clock. --lab-auto-handpay-reset,
+    which once sent LP 0x94 when it ran long, was removed on 2026-11-15
+    with the lab ticket authority (MIGRATION-SPEC-AMENDMENTS A27). The
+    clock is kept because the AGE of an unattended lockup is worth
+    reporting even when nothing is allowed to clear it.
     """
     try:
         info = client.send_handpay_information()
@@ -3646,32 +4270,25 @@ def handpay_composition(conn: sqlite3.Connection) -> list[str]:
 HANDPAY_LEVEL_JACKPOT = 0x00
 HANDPAY_LEVEL_CANCELLED_CREDITS = 0x80
 
-LAB_AUTO_HANDPAY_MIN_SECONDS = 60.0
 # Below a minute you are not clearing an unattended lockup, you are racing the
 # attendant walking towards the machine.
 
-LAB_AUTO_AFT_MAX_PUSHES = 40
-LAB_AUTO_AFT_MAX_TOTAL_CENTS = 200_000
-LAB_AUTO_AFT_MIN_INTERVAL_S = 120.0
+# Table 8.3e. Named because the message it produces has to name the pool,
+# and a bare 0x8F in a condition is the kind of literal nobody recognises.
+AFT_STATUS_RESTRICTED_POOL_MISMATCH = 0x8F
+# Table 8.3e's category for a transfer that fully succeeded, taken from
+# the decoder itself so the two can never drift.
+AFT_CATEGORY_SUCCESSFUL = describe_aft_transfer_status(0x00)[0]
+
+AFT_PUSH_MAX_PER_RUN = 40
+AFT_PUSH_MAX_TOTAL_CENTS = 200_000
+AFT_PUSH_MIN_INTERVAL_S = 120.0
 # Three independent ceilings, because the failure mode that matters is a loop:
 # a credit read that always comes back zero (a machine that stops answering LP
 # 0x74 reads as broke, not as silent) would otherwise push every cycle until
 # morning. Whichever ceiling is hit first stops the feature for the rest of
 # the run -- it does not pause and retry, because a run that has pushed forty
 # times has something wrong with it that another push will not fix.
-
-
-@dataclass
-class LabAutoConfig:
-    """LAB ONLY. Off unless explicitly constructed from the lab flags."""
-
-    handpay_reset_after_s: float = 0.0     # 0 = off
-    aft_credit_cents: int = 0              # 0 = off
-    aft_floor_cents: int = 0
-    aft_pool_id: int = 0
-
-    def any_enabled(self) -> bool:
-        return bool(self.handpay_reset_after_s or self.aft_credit_cents)
 
 
 def _record_lab_action(conn: sqlite3.Connection, now: str, action: str,
@@ -3683,157 +4300,8 @@ def _record_lab_action(conn: sqlite3.Connection, now: str, action: str,
     print(f"[{now}] LAB AUTO {action}: {detail} -> {outcome}")
 
 
-def _lab_auto_handpay_reset(client, conn: sqlite3.Connection, now: str,
-                            state: "PollState", *, after_seconds: float,
-                            monotonic_fn=time.monotonic) -> bool:
-    """LP 0x94 on a lockup nobody has come to clear. Returns True if sent.
-
-    §7.9 makes two outcomes possible and the reset code does not tell them
-    apart. Where the W2-G Reset To Credit Meter function has been enabled
-    (LP 0xA8, which this tool does not send), the money goes back onto the
-    machine as credits; otherwise the handpay is recorded as paid by an
-    attendant who was never there. Code 0x00 is returned either way.
-
-    THAT AMBIGUITY IS THE WHOLE REASON --lab-auto-aft-credit EXISTS. On a
-    cabinet without reset-to-credit-meter the lockup clears and the credit
-    meter stays at zero, so the soak stops spinning anyway unless something
-    puts credits back. The handpay information read at 0x51 carries
-    reset_id, which says which kind of reset this machine offers; it is
-    recorded in handpay_queue every time, so the morning's reconciliation
-    can say which outcome actually happened rather than guessing.
-    """
-    if after_seconds <= 0 or state.handpay_pending_since is None:
-        return False
-    waited = monotonic_fn() - state.handpay_pending_since
-    if waited < after_seconds:
-        return False
-    try:
-        code = client.reset_handpay()
-    except SASError as e:
-        # §7.9: a machine not configured for remote handpay reset "must
-        # ignore long poll 94", and ignoring means silence. So a timeout
-        # here says the feature is off at the cabinet -- a different fact
-        # from code 0x01, which says the feature is on and the machine
-        # declined. Do not retry it every cycle; stop the clock and let a
-        # human find the row in the morning.
-        state.handpay_pending_since = None
-        _record_lab_action(
-            conn, now, "handpay_reset", f"after {waited:.0f}s",
-            f"NO ANSWER ({type(e).__name__}: {e}) -- §7.9 says a machine not "
-            "configured for remote handpay reset ignores LP 0x94 entirely, so "
-            "this most likely means the feature is off at the cabinet. Not "
-            "retried; clear it by hand.")
-        return False
-    outcome = HANDPAY_RESET_CODES.get(code, f"unknown reset code 0x{code:02X}")
-    state.handpay_resets += 1
-    if code == 0x00:
-        state.handpay_pending_since = None
-    else:
-        # 0x01 "unable to reset" and 0x02 "not currently in a handpay
-        # condition" both mean nothing changed. Stop the clock either way:
-        # 0x02 means the lockup is already gone and our clock was stale,
-        # and 0x01 retried every cycle is a machine being nagged.
-        state.handpay_pending_since = None
-    _record_lab_action(
-        conn, now, "handpay_reset",
-        f"LP 0x94 after {waited:.0f}s unattended (reset #{state.handpay_resets})",
-        f"code 0x{code:02X} {outcome}")
-    return True
 
 
-def _lab_auto_aft_credit(client, conn: sqlite3.Connection, now: str,
-                         state: "PollState", *, amount_cents: int,
-                         floor_cents: int, pool_id: int = 0,
-                         monotonic_fn=time.monotonic,
-                         sleep_fn=time.sleep) -> bool:
-    """Push credits when the cabinet has run dry. Returns True if it did.
-
-    Reads the three balances with LP 0x74 (lock code 0xFF, status only, no
-    lock) rather than trusting a meter column: under --skip-full-meter-sweep
-    every sm_ column is NULL, and c7_current_credits only refreshes on the
-    C-7 sweep, which routine runs throttle to once every five minutes. A
-    five-minute-old credit figure is not a basis for moving money.
-    """
-    if amount_cents <= 0:
-        return False
-    if state.aft_pushes >= LAB_AUTO_AFT_MAX_PUSHES:
-        return False
-    if state.aft_cents_pushed >= LAB_AUTO_AFT_MAX_TOTAL_CENTS:
-        return False
-    if (state.aft_last_push_mono is not None
-            and monotonic_fn() - state.aft_last_push_mono < LAB_AUTO_AFT_MIN_INTERVAL_S):
-        return False
-    try:
-        lock = client.aft_game_lock_and_status_request(lock_code=0xFF)
-    except SASError as e:
-        conn.execute(
-            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) "
-            "VALUES (?, ?, ?, ?)",
-            (now, "aft_game_lock_and_status_request(lab auto credit)",
-             type(e).__name__, str(e)))
-        _safe_commit(conn, now)
-        # Silence is NOT zero credits. Refusing to push on a failed read is
-        # the whole difference between this and a money printer.
-        return False
-    on_machine = (int(lock.current_cashable_amount or 0)
-                  + int(lock.current_restricted_amount or 0)
-                  + int(lock.current_non_restricted_amount or 0))
-    if on_machine > floor_cents:
-        return False
-    transaction_id = f"LABAUTO{int(time.time())}"
-    try:
-        result = client.aft_transfer_funds(
-            transfer_code=AFT_TRANSFER_CODE_FULL_ONLY,
-            transaction_index=0x00,
-            transfer_type=int(AftTransferType.IN_HOUSE_TO_GAMING_MACHINE),
-            cashable_amount=amount_cents,
-            restricted_amount=0,
-            nonrestricted_amount=0,
-            pool_id=pool_id,
-            expiration=0,
-            asset_number=lock.asset_number,
-            registration_key=bytes(20),
-            transaction_id=transaction_id,
-        )
-    except SASError as e:
-        # An exchange that fails AFTER the machine acted looks identical to
-        # one that failed before. Do not retry with a fresh transaction ID --
-        # that is how a cabinet gets paid twice. Count it against the cap and
-        # let the morning reconcile it from the meters.
-        state.aft_pushes += 1
-        state.aft_last_push_mono = monotonic_fn()
-        _record_lab_action(
-            conn, now, "aft_credit", f"{amount_cents / 100:,.2f} as {transaction_id}",
-            f"FAILED ({type(e).__name__}: {e}) -- it may or may not have "
-            "landed. Not retried: reusing the ID risks status 0x81, a fresh "
-            "one risks paying twice. Reconcile from the meters.")
-        return False
-    state.aft_pushes += 1
-    state.aft_cents_pushed += amount_cents
-    state.aft_last_push_mono = monotonic_fn()
-    category, _ = describe_aft_transfer_status(result.transfer_status)
-    if category == "PENDING":
-        # §8.8, and not optional: an unacknowledged completion makes the
-        # machine reissue exception 0x69 every fifteen seconds forever, as a
-        # PRIORITY exception delivered ahead of anything queued. Left alone
-        # overnight that is a permanent beat in the event stream.
-        for _ in range(12):
-            sleep_fn(1.0)
-            try:
-                final = client.aft_interrogate_transfer(0x00, acknowledge=True)
-            except SASError:
-                break
-            category, _ = describe_aft_transfer_status(final.transfer_status)
-            if category != "PENDING":
-                result = final
-                break
-    _record_lab_action(
-        conn, now, "aft_credit",
-        f"{amount_cents / 100:,.2f} cashable, machine had "
-        f"{on_machine / 100:,.2f} (floor {floor_cents / 100:,.2f}), "
-        f"push #{state.aft_pushes}/{LAB_AUTO_AFT_MAX_PUSHES}",
-        f"status 0x{result.transfer_status:02X} {category}")
-    return True
 
 
 class _MeterSupport:
@@ -3923,6 +4391,8 @@ def _poll_all_meters(
     heartbeat=None,
     heartbeat_every: int = 8,
     give_up_optional=None,
+    on_preempted=None,
+    burst_preemptions: int = DRAIN_BURST_PREEMPTIONS,
 ) -> dict:
     """Poll every meter this tool knows how to read, in one pass, and
     return {column: value} covering every name in ALL_METER_FIELDS.
@@ -3959,11 +4429,58 @@ def _poll_all_meters(
     def beat():
         nonlocal exchanges
         exchanges += 1
+        # Every exchange, rate-limited inside. A sweep IS exchanges, so a
+        # long sweep keeps the watchdog fed while a wedged poller does not.
+        _watchdog_notify()
         if heartbeat is not None and exchanges % heartbeat_every == 0:
             heartbeat()
 
     if give_up_optional is None:
         give_up_optional = _never_give_up
+    if on_preempted is None:
+        on_preempted = _count_nothing
+
+    def _arm(probe):
+        """Hand the transport a give-up hook for ONE long poll.
+
+        Returns (transport, gave_up) where gave_up is a one-element list
+        the hook sets to True when it tells the transport to stop. The
+        caller clears the hook in a finally and reads gave_up to tell
+        "we yielded on purpose" from "the retry budget ran out", which
+        are the same exception and need opposite handling.
+
+        TWO TRIGGERS, AND THEY ANSWER DIFFERENT QUESTIONS.
+
+        `probe` is the rate probe: events per second across the sweep so
+        far, against the pacing budget. It cannot fire in the sweep's
+        first 5 s because a rate over a fraction of a second is noise.
+
+        `burst_preemptions` is a COUNT of consecutive pre-emptions of
+        THIS poll. Not a rate, so no floor, so it works at the top of a
+        sweep where the rate probe is structurally blind -- which is
+        where the 2026-11-16T21:59:02 burst landed and cost 9.617 s.
+        """
+        transport = getattr(client, "transport", None)
+        gave_up = [False]
+        if transport is None:
+            return None, gave_up
+        seen = [0]
+
+        def _hook(_count=on_preempted, _probe=probe):
+            # COUNT FIRST, THEN DECIDE. The transport calls this once per
+            # §12.3 pre-emption, after the event has been collected, so
+            # each call is exactly one event the heartbeat will never
+            # see. Counting before asking is what lets the rate probe
+            # answer on this call rather than one pre-emption late.
+            _count()
+            seen[0] += 1
+            if seen[0] >= burst_preemptions or _probe():
+                gave_up[0] = True
+                return True
+            return False
+
+        transport.give_up_requeue = _hook
+        return transport, gave_up
 
     def poll(name, fn, *args):
         """One long poll, with §12.4's requeue rather than a failure.
@@ -3990,9 +4507,29 @@ def _poll_all_meters(
         failure -- and even then it is recorded under its own error type,
         so a mashing customer never again looks like a dying cable.
         """
+        transport, gave_up = _arm(give_up_optional)
         try:
             result = fn(*args)
         except SASPreempted as first:
+            # THE SWEEP YIELDS WHEN THE QUEUE IS BURSTING. Added
+            # 2026-11-16 on the operator's instruction: "drain priority
+            # must start immediately".
+            #
+            # §12.4's requeue is right for an ORDINARY pre-emption -- the
+            # event was carried away, the queue is shorter, send the poll
+            # again. It is wrong once the hook has told the transport to
+            # stop, because the retry will be abandoned on its first
+            # pre-emption too: two attempts to be told the same thing,
+            # with the port held throughout.
+            #
+            # Abandoning the meter read costs nothing permanent. The
+            # meters are CUMULATIVE and the next sweep reads them in
+            # full; §12.5.3's game starts are not, and an undrained one
+            # is gone. The operator's order is ticket out, then the
+            # customer's bets, then meters -- so the meter read is what
+            # yields.
+            if gave_up[0]:
+                raise _MeterPollFailure(name, first) from first
             # §12.4's requeue. Drain cheaply, then send it again.
             beat()
             # `now` IS A PARAMETER, and was not until 2026-11-08.
@@ -4016,12 +4553,36 @@ def _poll_all_meters(
                 raise _MeterPollFailure(name, e) from e
         except SASError as e:
             raise _MeterPollFailure(name, e) from e
+        finally:
+            # ALWAYS, on every path. A hook left armed would answer for
+            # the NEXT poll with this one's count, and a money poll must
+            # never inherit a meter poll's give-up state.
+            if transport is not None:
+                transport.give_up_requeue = None
         METER_SUPPORT.record_success(name)
         beat()
         return result
 
     def poll_optional(name, fn, *args):
-        result = _poll_optional(METER_SUPPORT, name, fn, *args)
+        # ARM THE ABANDON HOOK FOR THE DURATION OF THIS POLL ONLY.
+        #
+        # give_up_optional() is checked BETWEEN optional polls, which is
+        # too coarse: on 2026-11-13 a Table C-7 chunk was pre-empted 24
+        # times and held the port for 19.829s before failing, and drain
+        # priority could not engage until it did. The operator: "drain
+        # priority should interrupt meter sweep and first focus on ticket
+        # out then RTE then if there's room c7."
+        #
+        # Armed here and cleared in finally, so a mandatory poll -- a
+        # ticket, a handpay, a validation answer -- keeps its whole
+        # retry budget. That ordering is the whole point: the optional
+        # read yields, the money poll does not.
+        transport, _gave_up = _arm(give_up_optional)
+        try:
+            result = _poll_optional(METER_SUPPORT, name, fn, *args)
+        finally:
+            if transport is not None:
+                transport.give_up_requeue = None
         beat()
         return result
 
@@ -4184,8 +4745,32 @@ AFT_CASHOUT_REQUEST = 0x6A       # §8.7, AFT request for host cashout
 AFT_WIN_CASHOUT_REQUEST = 0x6B   # §8.7, AFT request for host to cash out a win
 
 
+def _current_asset_number(conn: sqlite3.Connection) -> int:
+    """The asset number of the machine this gateway is on, or 0.
+
+    Read at interrogation and stored on the open epoch, so no extra poll
+    is needed. Returns 0 when there is none -- a cabinet that reports no
+    asset number, or an epoch opened before one was typed in -- and the
+    caller must treat 0 as "do not send", because §8.3 rejects it with
+    0x93 rather than ignoring it.
+    """
+    try:
+        row = conn.execute(
+            "SELECT asset_number FROM machine_epochs "
+            "WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return 0
+    if not row or row[0] is None:
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return 0
+
+
 def _decline_aft_cashout(client, conn: sqlite3.Connection, now: str,
-                         exception_code: int) -> None:
+                         exception_code: int, state=None,
+                         monotonic_fn=time.monotonic) -> None:
     """Answer §8.7's 0x6A with an all-zeros LP 0x72: "not by AFT, use your
     own means."
 
@@ -4226,6 +4811,53 @@ def _decline_aft_cashout(client, conn: sqlite3.Connection, now: str,
     enabling anywhere.
     """
     try:
+        # THE ASSET NUMBER IS NOT OPTIONAL, EVEN ON A DECLINE.
+        #
+        # 2026-11-14, the operator's rig: every decline came back
+        # "transfer status 0x93", which Table 8.3e defines as "asset
+        # number zero or does not match". This call left asset_number at
+        # its default of 0, so the machine rejected the §8.7 decline --
+        # the cashout then fell through to the ticket path on the
+        # machine's own timeout, which is why it still worked and why the
+        # failure was easy to miss.
+        #
+        # A rejected decline buys none of the ~8s it exists to save. The
+        # machine's own asset number is read at interrogation and stored
+        # on the open epoch, so it is already here.
+        # ONE DECLINE AT A TIME. The cabinet re-raises 0x6A about once a
+        # second while it works through the decline it already has, and
+        # answering each repeat gets transfer status 0xC0 -- "not compatible
+        # with current transfer in progress". Those exchanges cannot speed
+        # anything up and they spend long-poll slots during a cashout.
+        if state is not None and state.aft_decline_pending_since is not None:
+            waited = monotonic_fn() - state.aft_decline_pending_since
+            if waited < AFT_DECLINE_PENDING_TIMEOUT_S:
+                print(f"[{now}] 0x{exception_code:02X} again while a decline "
+                      f"has been pending {waited:.1f}s. Not sending another: "
+                      f"the cabinet would answer 0xC0 (not compatible with "
+                      f"the transfer in progress) and nothing would move.")
+                return
+            # A 0x69 that never came. Say so -- §8.8 has the cabinet
+            # reissuing it every 15 s until acknowledged, so silence here is
+            # itself a finding.
+            print(f"[{now}] a decline has been pending {waited:.1f}s with no "
+                  f"exception 0x69. Allowing another; if this repeats, the "
+                  f"completion exception is not arriving and §8.8 says it "
+                  f"should.")
+            state.aft_decline_pending_since = None
+        asset = _current_asset_number(conn)
+        if not asset:
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, "
+                "error_type, message) VALUES (?, ?, ?, ?)",
+                (now, f"decline_aft_cashout(0x{exception_code:02X})",
+                 "NoAssetNumber",
+                 "no asset number on the open epoch, so a decline would be "
+                 "rejected with 0x93 (asset number zero or does not match). "
+                 "Not sent; the machine falls through to its own cashout on "
+                 "its timeout, which costs the ~8s this flag exists to save."))
+            _safe_commit(conn, now)
+            return
         result = client.aft_transfer_funds(
             transfer_code=AFT_TRANSFER_CODE_FULL_ONLY,
             transaction_index=0x00,
@@ -4233,6 +4865,7 @@ def _decline_aft_cashout(client, conn: sqlite3.Connection, now: str,
             cashable_amount=0,
             restricted_amount=0,
             nonrestricted_amount=0,
+            asset_number=asset,
             transaction_id=f"DECLINE{int(time.time())}",
         )
     except SASError as e:
@@ -4253,6 +4886,13 @@ def _decline_aft_cashout(client, conn: sqlite3.Connection, now: str,
          f"0x{exception_code:02X}: all-zeros LP 0x72 (§8.7)",
          f"status 0x{int(getattr(result, 'transfer_status', 0) or 0):02X}"))
     _safe_commit(conn, now)
+    status = int(getattr(result, "transfer_status", 0) or 0)
+    # 0x40 is "transfer pending": accepted, and the cabinet will report
+    # completion with exception 0x69. 0xC0 means one was ALREADY in
+    # progress, which the guard above should now prevent -- but if it is
+    # ever seen, the right response is still to stop sending.
+    if state is not None and status in (0x40, 0xC0):
+        state.aft_decline_pending_since = monotonic_fn()
     print(f"[{now}] declined the AFT cashout request (§8.7 all-zeros LP "
           f"0x72). The machine goes straight to its own cashout means "
           f"instead of burning ~8s waiting for a host that is not there.")
@@ -4411,10 +5051,11 @@ def _dispatch_exception(
     elif exception_code == ExceptionCode.SYSTEM_VALIDATION_REQUEST:
         _handle_cashout_request(client, conn, now)
     elif int(exception_code) == 0x69:
-        _acknowledge_aft_transfer(client, conn, now)
+        _acknowledge_aft_transfer(client, conn, now, state=state)
     elif (int(exception_code) in (AFT_CASHOUT_REQUEST, AFT_WIN_CASHOUT_REQUEST)
           and state is not None and state.decline_aft_cashout):
-        _decline_aft_cashout(client, conn, now, int(exception_code))
+        _decline_aft_cashout(client, conn, now, int(exception_code),
+                             state=state)
     elif int(exception_code) == 0x3C:
         # "Operator changed options" -- the ONLY in-band signal that this
         # cabinet's configuration has moved, a denomination among the things
@@ -4622,6 +5263,17 @@ def _interrogate_games(client, conn, interrogation_id: int, heartbeat) -> int:
              getattr(extended, "paytable_name", None),
              getattr(extended, "progressive_levels", None),
              getattr(extended, "wager_categories", None)))
+        # COMMIT PER GAME, not once at the end. An INSERT with no commit
+        # leaves this connection holding the database's write lock, and the
+        # next two long polls take the better part of a second -- times
+        # forty-eight games. Measured on the lab gateway 2026-11-12: the
+        # gateway client, a second process on this file, waited out its
+        # whole 30 s busy timeout behind this loop and died with "database
+        # is locked", so every ticket after that was refused for want of
+        # anyone to carry the question. §6.1 makes a second writer a normal
+        # part of the design; a writer that sits on the lock across a wire
+        # exchange makes it a matter of luck.
+        _safe_commit(conn, utc_now())
     return found
 
 
@@ -4658,7 +5310,328 @@ def _interrogate_last_redeemed(client, heartbeat) -> dict | None:
 # that it empties the queue and the sweep resumes with nothing waiting.
 HEARTBEAT_DRAIN_CAP = 20
 
-LATENCY_CRITICAL_EXCEPTIONS = frozenset({0x67, 0x57})
+# Codes dispatched THE MOMENT the heartbeat drains them, instead of being
+# queued in `seen` and handled after the sweep. Every entry costs poll slots
+# mid-sweep and can displace an event, so this set is a deliberate trade and
+# stays short.
+#
+#   0x67  ticket inserted         -- a customer is standing there
+#   0x57  system validation req   -- §15.7's ten-second window
+#   0x68  ticket transfer complete -- the server's 45 s lease (below)
+#   0x51  handpay pending         -- §7.8.1: until LP 0x1B is read the
+#         machine re-sends 0x51 every 15 s and the queue entry stays
+#         unreported. Deferring it behind a 56 s sweep means the cabinet
+#         spends the sweep shouting, and every reissue is an event slot
+#         spent on a message we already have. One LP 0x1B.
+#   0x3D  cash out ticket printed -- feeds the WfA fast path. A cashier
+#         scanning a ticket the gateway has not filed yet falls through to
+#         the LP 0x4D wire walk: 31 exchanges, ~2.6 s, which blows §11's
+#         1 s hard budget on its own. This is the one entry that is NOT a
+#         single poll -- it drains ticket_out_history -- so it is the one
+#         to reconsider first if the sweep starts losing events.
+#
+# 0x68 WAS MISSING, and it is the one the SERVER waits on. 0x67 produced the
+# ALLOW promptly; 0x68 produces the REDEMPTION_RESULT, and it sat in `seen`
+# until the sweep ended. Measured on the lab cabinet 2026-11-12 with the
+# laptop serving: sweeps of 45.9 s and 56.4 s against the server's
+# LEASE_DURATION_S of 45.0, and
+#
+#   22:01:07  ticket-in ...131189: ALLOW 0x00 Open, 716716 cents
+#   22:01:52  lease_expired: had no REDEMPTION_RESULT in 45s; now
+#             UNKNOWN_REDEMPTION, locked
+#   22:01:59  redemption_without_lease: machine status 0x00 (redeemed)
+#
+# The gateway HAD the answer and was holding it. On a machine being played
+# the sweep is reliably longer than the lease, so this was not a race that
+# sometimes lost -- every redemption during a sweep was guaranteed to miss,
+# and the server was locking tickets that had in fact redeemed cleanly.
+#
+# The cost is one LP 0x71/FF, and §15.12b makes it read-only.
+LATENCY_CRITICAL_EXCEPTIONS = frozenset({0x67, 0x57, 0x68, 0x51, 0x3D})
+
+
+
+
+def sweep_remedies(*, drain_priority: bool, was_draining: bool,
+                   full_meter_sweep: bool, full_meter_interval: float,
+                   validation_meters_sweep: bool,
+                   validation_meters_interval: float,
+                   table_c7_sweep: bool, table_c7_interval: float,
+                   poll_interval: float,
+                   drain_fast_poll: bool = False,
+                   decline_aft_cashout: bool = False) -> str:
+    """What is ALREADY shortening this sweep, and what is left to try.
+
+    The warning this feeds used to recommend --drain-priority flatly. That
+    flag has been ON BY DEFAULT since 2026-11-11, so on every modern run it
+    advised turning on a thing already running -- and the operator went
+    looking for it, on 2026-11-12, during a burst that lost 13 buffers.
+
+    Advice that names a remedy already in force is worse than no advice:
+    it reads as "you have not done the obvious thing yet" to someone who
+    has, and it hides the remedies that ARE still available.
+    """
+    in_force, left = [], []
+
+    # THE TWO THAT RAISE THE CEILING, named first because the sweep-cost
+    # remedies below do not address the thing that costs a handpay.
+    #
+    # 2026-11-13, button burst with the machine on autoplay: 126.85
+    # events/s against the 5.0/s §2.3.3 allows. The warning named only
+    # "--table-c7-interval 300", which shortens a sweep. Meanwhile the
+    # cabinet asked for a validation number ELEVEN times over 9.996 s --
+    # §15.7's window to the millisecond -- every LP 0x57 was pre-empted,
+    # and the cashout became a handpay for 8,587.67 with a restricted
+    # portion of 0. The validation pool had 191 numbers available. The
+    # pool was never the problem; the drain rate was.
+    #
+    # Shortening the sweep does not help there. Raising the drain ceiling
+    # and removing a stage from the cashout ladder do.
+    if drain_fast_poll:
+        in_force.append("--drain-fast-poll (40ms while draining)")
+    else:
+        left.append("--drain-fast-poll (THE ONE THAT RAISES THE CEILING: "
+                    "one poll drains one event, so 40ms polling lifts the "
+                    "drain rate from 3.3/s to 25/s and cuts each pre-empted "
+                    "long poll's retry budget from ~7s to ~1s. Needs Table "
+                    "7.14e bit 0: check with examples/polling_capability.py)")
+    if decline_aft_cashout:
+        in_force.append("--decline-aft-cashout")
+    else:
+        left.append("--decline-aft-cashout (§8.7 stage 1 of the cashout "
+                    "ladder burns ~7.6s before the 0x57 stage even starts, "
+                    "measured 2026-10-28: 0x6A x8 over 7.652s, then 0x57 x10 "
+                    "over 9.796s, then handpay at 17.884s. Declining moves "
+                    "money nowhere and hands those seconds to the ticket)")
+
+    (in_force if drain_priority else left).append(
+        "--drain-priority" + (" (engaged this cycle)" if was_draining
+                              else " (armed, not engaged this cycle)")
+        if drain_priority else "--drain-priority (defers the optional polls "
+        "automatically under load)")
+
+    if not full_meter_sweep:
+        in_force.append("--skip-full-meter-sweep")
+    elif full_meter_interval > 0:
+        in_force.append(f"--full-meter-interval {full_meter_interval:g}")
+    else:
+        left.append("--full-meter-interval 1800 (39 polls for 39 meters, "
+                    "nearly all of which Table C-7 already fetches in 13) "
+                    "or --skip-full-meter-sweep")
+
+    if not validation_meters_sweep:
+        in_force.append("--skip-validation-meters-sweep")
+    elif validation_meters_interval > 0:
+        in_force.append(
+            f"--validation-meters-interval {validation_meters_interval:g}")
+    else:
+        left.append("--validation-meters-interval 1800 or "
+                    "--skip-validation-meters-sweep")
+
+    if not table_c7_sweep:
+        in_force.append("--skip-table-c7-sweep")
+    elif table_c7_interval > 0:
+        in_force.append(f"--table-c7-interval {table_c7_interval:g}")
+    else:
+        left.append("--table-c7-interval 300")
+
+    # THE BIGGEST LEVER, and the one nobody reaches for, because it is not
+    # about the sweep at all. §2.3.3's floor is 200 ms; anything slower
+    # leaves legal collection capacity unused, and no amount of sweep
+    # shortening recovers it.
+    if poll_interval and poll_interval > SAS_MIN_POLL_INTERVAL_S:
+        now_rate = 1.0 / poll_interval
+        best = 1.0 / SAS_MIN_POLL_INTERVAL_S
+        left.insert(0, (
+            f"--min-poll-interval {SAS_MIN_POLL_INTERVAL_S} (you are at "
+            f"{poll_interval:g}s = {now_rate:.1f} events/s; §2.3.3's floor "
+            f"allows {best:.1f}/s, so {(best / now_rate - 1) * 100:.0f}% more "
+            "collection is being left on the table)"))
+
+    parts = []
+    if in_force:
+        parts.append("ALREADY IN FORCE: " + ", ".join(in_force) + ".")
+    parts.append(("STILL AVAILABLE: " + ", ".join(left) + "."
+                  ) if left else
+                 "Nothing is left to shorten: every lever is already "
+                 "applied, and the cabinet is simply out-producing what "
+                 "§2.3.3 lets any host collect.")
+    return " ".join(parts)
+
+
+
+# The same meter, reachable by two independent long polls: a dedicated
+# single-meter poll and a Table C-7 code. Derived once, here, rather than
+# matched by name at run time -- a pairing that guesses is a pairing that
+# will one day compare two different meters and call them a disagreement.
+SINGLE_VS_C7_PAIRS: tuple[tuple[str, str], ...] = (
+    ("sm_total_cancelled_credits", "c7_total_cancelled_credits"),
+    ("sm_total_coin_in", "c7_total_coin_in_credits"),
+    ("sm_total_coin_out", "c7_total_coin_out_credits"),
+    ("sm_total_drop", "c7_total_drop_credits"),
+    ("sm_total_jackpot", "c7_total_jackpot_credits"),
+    ("sm_games_played", "c7_games_played"),
+    ("sm_games_won", "c7_games_won"),
+    ("sm_games_lost", "c7_games_lost"),
+    ("sm_current_credits", "c7_current_credits"),
+)
+
+
+def crosscheck_single_against_c7(values: dict, previous: dict | None
+                                 ) -> list[tuple[str, int, int, int]]:
+    """Where both paths read the same meter, do they agree?
+
+    Operator, 2026-11-13: "C7 must become our main while meter sweep is
+    there to verify/crosscheck/fallback." The first two of those are now
+    the defaults and the third is the interlock; this is the middle one,
+    which nothing was doing.
+
+    THE TOLERANCE IS MEASURED, NOT CHOSEN. The two polls happen at
+    different moments inside one sweep, so on a machine being played a
+    cumulative meter legitimately advances between them -- comparing for
+    equality would cry wolf on every cycle of a busy cabinet. But the
+    most it can advance WITHIN a sweep is bounded by how far it moved
+    across the whole cycle, which the previous row gives for free. So a
+    difference larger than this cycle's own movement is one the two
+    reads cannot both be right about.
+
+    That makes the check silent on a quiet machine (nothing moved,
+    nothing may differ) and silent on a busy one (plenty moved, a little
+    skew is allowed), while still catching the thing worth catching: a
+    decoding error, a wrong meter code, or a cabinet that answers
+    differently through its two paths. Those do not scale with play.
+
+    Returns (single_column, single_value, c7_value, allowed) per
+    disagreement, empty when they agree or when there is nothing to
+    compare.
+    """
+    if not previous:
+        return []
+    found = []
+    for single, c7 in SINGLE_VS_C7_PAIRS:
+        a, b = values.get(single), values.get(c7)
+        if a is None or b is None:
+            continue
+        was = previous.get(single)
+        if was is None or not isinstance(was, (int, float)):
+            continue
+        moved = abs(a - was)
+        if abs(a - b) > moved:
+            found.append((single, a, b, moved))
+    return found
+
+
+def c7_codes_answered(values: dict) -> int:
+    """How many Table C-7 columns this sweep actually filled.
+
+    Not how many were asked for. §7.21b lets a machine answer the poll and
+    report an individual meter as unsupported (size 0), which arrives here
+    as None -- a known absence, correctly NULL. The lab cabinet answers 125
+    of 162 that way and is perfectly healthy. ZERO answered is the different
+    thing: the cabinet is not doing Table C-7 at all.
+    """
+    return sum(1 for column in TABLE_C7_EXTENDED_COLUMNS
+               if values.get(column) is not None)
+
+
+def decide_c7_support(state: "PollState", values: dict, now: str,
+                      conn: sqlite3.Connection | None = None, *,
+                      probation_minutes: float = DEFAULT_C7_PROBATION_MINUTES,
+                      mono_now: float = 0.0,
+                      sweep_completed: bool = True) -> None:
+    """Decide, by measurement, whether this cabinet does Table C-7.
+
+    Operator, 2026-11-12: "this only applies to machines that are giving
+    c7, if c7 doesn't answer or comes empty on a machine, fallback is the
+    current state even disabling c7 in that case automatically. First time
+    connection with the EGM will help the program to decide which strategy
+    it will use automatically."
+
+    Decides ONCE per run and then stops looking: a strategy that flips back
+    and forth produces meter history nobody can read, with gaps whose cause
+    is the gateway rather than the machine. A cabinet that is swapped gets
+    a new run; a cabinet whose C-7 dies mid-run keeps sweeping and logs
+    NULLs, which is honest and visible.
+
+    Turning C-7 off also forces BOTH new intervals back to every cycle. It
+    has to: without C-7 the 39 single polls are the only way left to
+    reach most of those meters, so a stretched single-meter sweep on a
+    C-7-less cabinet would leave the gateway reading 8 core polls and
+    calling it meter coverage.
+    """
+    if state.c7_supported is not None or probation_minutes <= 0:
+        return
+    # AN ABANDONED SWEEP IS NOT A MEASUREMENT.
+    #
+    # The live drain probe abandons the remaining C-7 chunks mid-sweep and
+    # setdefault()s every unread column to None. Fire it on the first
+    # chunk and the row looks exactly like a cabinet that does not
+    # implement LP 0x6F -- 0 of 154 answered. Three of those and this
+    # turned C-7 off for the run, which ALSO forces both meter intervals
+    # back to every cycle through the interlock.
+    #
+    # Seen on the lab cabinet 2026-11-13: a gateway whose own floor survey
+    # recorded 125 of 162 C-7 codes answered was running 60 long polls a
+    # cycle with no C-7 at all, because drain priority had fired during
+    # the first sweeps and the detector believed it.
+    #
+    # The local `draining` flag the caller passes is the CYCLE-TOP
+    # decision; the probe sets state.draining mid-sweep, after it. So a
+    # sweep that started undrained and was abandoned looks undrained from
+    # the top and is exactly the case that must not be counted.
+    if not sweep_completed:
+        return
+    # THE CYCLE'S OWN CLOCK READING, passed in rather than taken here. A
+    # second call to monotonic_fn() would be a different instant from the
+    # one the cadence arithmetic above used, and -- as eight tests found
+    # within a minute of this being written the other way -- it also
+    # silently changes how many times the clock is read per cycle, which
+    # several tests measure as a proxy for poll count.
+    if state.c7_first_sweep_at is None:
+        state.c7_first_sweep_at = mono_now
+    state.c7_sweeps_done += 1
+    answered = c7_codes_answered(values)
+    if answered:
+        state.c7_sweeps_with_data += 1
+        state.c7_empty_streak = 0
+        state.c7_supported = True
+        print(f"[{now}] Table C-7 CONFIRMED on this cabinet: {answered} of "
+              f"{len(TABLE_C7_EXTENDED_COLUMNS)} extended meters answered on "
+              f"the first sweep that carried any. --full-meter-interval and "
+              "--validation-meters-interval stay as given.")
+        return
+
+    state.c7_empty_streak += 1
+    elapsed_min = (mono_now - state.c7_first_sweep_at) / 60.0
+    give_up = (state.c7_empty_streak >= C7_EMPTY_SWEEPS_BEFORE_GIVING_UP
+               or elapsed_min >= probation_minutes)
+    if not give_up:
+        print(f"[{now}] Table C-7 answered nothing on sweep "
+              f"{state.c7_sweeps_done} ({state.c7_empty_streak} in a row, "
+              f"{elapsed_min:.1f} of {probation_minutes:.0f} probation "
+              "minutes used). Still deciding.")
+        return
+
+    state.c7_supported = False
+    why = (f"{state.c7_empty_streak} consecutive sweeps answered 0 of "
+           f"{len(TABLE_C7_EXTENDED_COLUMNS)} extended meters over "
+           f"{elapsed_min:.1f} minute(s)")
+    print(f"[{now}] Table C-7 NOT SUPPORTED on this cabinet: {why}. "
+          f"Disabling the C-7 sweep for the rest of this run -- {TABLE_C7_CHUNK_COUNT} "
+          "chunks per sweep against a machine that ignores LP 0x6F is "
+          "thirteen timeouts of dead air, and §2.2.1's queue does not "
+          "survive that. FALLING BACK to the single-meter sweep and the "
+          "validation sweep on EVERY cycle: those meters and C-7's share "
+          "nothing, so there is no other source for them.")
+    if conn is not None:
+        try:
+            conn.execute(
+                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, "
+                "message) VALUES (?, ?, ?, ?)",
+                (now, "table_c7", "C7Unsupported", why))
+            _safe_commit(conn, now)
+        except sqlite3.Error:
+            pass
 
 
 def _make_credit_sampler(client, conn: sqlite3.Connection, every: int):
@@ -4720,6 +5693,10 @@ def _make_credit_sampler(client, conn: sqlite3.Connection, every: int):
             # A sample is diagnostics. It must never abort a cycle.
             sample.failed += 1
             return
+        # Committed here for the same reason as each interrogated game: an
+        # uncommitted INSERT holds the write lock until whatever commits
+        # next, which from inside a meter sweep can be many polls away.
+        _safe_commit(conn, utc_now())
         sample.taken += 1
 
     sample.beats = 0
@@ -4789,10 +5766,154 @@ def _lookup_ticket_out_local(conn: sqlite3.Connection, validation_number: int):
             "ticket_number": row[4], "captured_at": row[5]}
 
 
+
+def _server_aft_credit(client, conn: sqlite3.Connection, now: str,
+                       state: "PollState", *, cashable_cents: int,
+                       restricted_cents: int, nonrestricted_cents: int,
+                       pool_id: int, expiration: int, transfer_id: str,
+                       monotonic_fn=time.monotonic, sleep_fn=time.sleep) -> bool:
+    """Perform a server-requested AFT credit. §8.3.
+
+    THE SAME CAPS AS THE LAB AUTO-CREDIT, deliberately. A server is not
+    more trustworthy than a local flag for this purpose -- the caps exist
+    because a bug that pushes money in a loop is the worst thing in this
+    file, and a bug on the far end of a socket is no less likely than one
+    here. AFT_PUSH_MAX_PER_RUN and AFT_PUSH_MAX_TOTAL_CENTS bound
+    the run; the minimum interval bounds the rate.
+
+    NO FLOOR CHECK, unlike the auto-credit. That one decides FOR ITSELF
+    whether to push, so it must not push onto a machine that already has
+    credits. This one was asked by a human through the server, who can see
+    the floor; second-guessing it would make the command unreliable for no
+    safety gain.
+    """
+    total = cashable_cents + restricted_cents + nonrestricted_cents
+    if total <= 0:
+        return False
+    if state.aft_pushes >= AFT_PUSH_MAX_PER_RUN:
+        _record_lab_action(conn, now, "aft_credit", f"server {transfer_id}",
+                           f"REFUSED: this run has already made "
+                           f"{state.aft_pushes} AFT pushes, the cap")
+        return False
+    if state.aft_cents_pushed + total > AFT_PUSH_MAX_TOTAL_CENTS:
+        _record_lab_action(conn, now, "aft_credit", f"server {transfer_id}",
+                           f"REFUSED: would take this run past the "
+                           f"{AFT_PUSH_MAX_TOTAL_CENTS / 100:,.2f} cap")
+        return False
+    if (state.aft_last_push_mono is not None
+            and monotonic_fn() - state.aft_last_push_mono
+            < AFT_PUSH_MIN_INTERVAL_S):
+        _record_lab_action(conn, now, "aft_credit", f"server {transfer_id}",
+                           f"REFUSED: inside the "
+                           f"{AFT_PUSH_MIN_INTERVAL_S}s minimum interval")
+        return False
+    # LP 0x74 with lock code 0xFF: status only, no lock. Needed for the
+    # asset number the transfer must carry, and it is the one read that
+    # proves the cabinet is actually answering before money is sent.
+    try:
+        lock = client.aft_game_lock_and_status_request(lock_code=0xFF)
+    except SASError as e:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, "
+            "message) VALUES (?, ?, ?, ?)",
+            (now, "aft_game_lock_and_status_request(server push)",
+             type(e).__name__, str(e)))
+        _safe_commit(conn, now)
+        # Silence is not consent. Refusing to push on a failed read is the
+        # difference between this and a money printer.
+        return False
+    tag = f"SRV{transfer_id[:8]}" if transfer_id else f"SRV{int(time.time())}"
+    try:
+        result = client.aft_transfer_funds(
+            transfer_code=AFT_TRANSFER_CODE_FULL_ONLY,
+            transaction_index=0x00,
+            transfer_type=int(AftTransferType.IN_HOUSE_TO_GAMING_MACHINE),
+            cashable_amount=cashable_cents,
+            restricted_amount=restricted_cents,
+            nonrestricted_amount=nonrestricted_cents,
+            pool_id=pool_id,
+            expiration=expiration,
+            asset_number=lock.asset_number,
+            registration_key=bytes(20),
+            transaction_id=tag,
+        )
+    except SASError as e:
+        # An exchange that fails AFTER the machine acted looks identical to
+        # one that failed before. NOT retried with a fresh transaction ID:
+        # that is how a cabinet gets paid twice.
+        state.aft_pushes += 1
+        state.aft_last_push_mono = monotonic_fn()
+        _record_lab_action(
+            conn, now, "aft_credit", f"server {transfer_id} as {tag}",
+            f"FAILED ({type(e).__name__}: {e}) -- it may or may not have "
+            "landed. Not retried: reusing the ID risks status 0x81, a fresh "
+            "one risks paying twice. Reconcile from the meters.")
+        return False
+    state.aft_pushes += 1
+    state.aft_cents_pushed += total
+    state.aft_last_push_mono = monotonic_fn()
+    category, _ = describe_aft_transfer_status(result.transfer_status)
+    if category == "PENDING":
+        # §8.8: an unacknowledged completion makes the machine reissue
+        # exception 0x69 every fifteen seconds forever, as a PRIORITY
+        # exception ahead of anything queued.
+        for _ in range(12):
+            sleep_fn(1.0)
+            try:
+                final = client.aft_interrogate_transfer(0x00, acknowledge=True)
+            except SASError:
+                break
+            category, _ = describe_aft_transfer_status(final.transfer_status)
+            if category != "PENDING":
+                result = final
+                break
+    # WHAT THE MACHINE WAS HOLDING WHEN IT ANSWERED, recorded with the
+    # answer. LP 0x74 told us this a second before the transfer and the
+    # first version threw it away, so a 0x8F -- "existing restricted
+    # amounts from a DIFFERENT POOL" -- named the problem without naming
+    # the pool, and the one number needed to fix it was already in hand.
+    # Operator, 2026-11-13, on the first real server push: status 0x8F,
+    # and nothing anywhere said which pool the cabinet was on.
+    held = (f"machine held {lock.current_cashable_amount / 100:,.2f} "
+            f"cashable, {lock.current_restricted_amount / 100:,.2f} "
+            f"restricted (pool {lock.restricted_pool_id}), "
+            f"{lock.current_non_restricted_amount / 100:,.2f} nonrestricted")
+    hint = ""
+    if (result.transfer_status == AFT_STATUS_RESTRICTED_POOL_MISMATCH
+            and restricted_cents):
+        hint = (f" -- §8.3: a machine holds ONE restricted pool at a time "
+                f"and this one is on pool {lock.restricted_pool_id}, not "
+                f"{pool_id}. Either push to pool "
+                f"{lock.restricted_pool_id}, or clear the "
+                f"{lock.current_restricted_amount / 100:,.2f} restricted "
+                "balance first.")
+    _record_lab_action(
+        conn, now, "aft_credit",
+        f"server {transfer_id} as {tag}: "
+        + ", ".join(f"{v / 100:,.2f} {k}" for k, v in
+                    (("cashable", cashable_cents),
+                     ("restricted", restricted_cents),
+                     ("nonrestricted", nonrestricted_cents)) if v)
+        + (f", pool {pool_id}" if pool_id else "")
+        + f"; {held}",
+        f"status 0x{result.transfer_status:02X} {category}{hint}")
+    # "SUCCESSFUL", not "COMPLETE". Table 8.3e's own category for 0x00 is
+    # SUCCESSFUL, and this compared against a word that never appears --
+    # so the first AFT push that actually worked, 2026-11-13T01:29:33,
+    # recorded "status 0x00 SUCCESSFUL" in lab_auto_actions and `failed`
+    # in host_requests, for the same transfer. The money moved and the
+    # server was told it had not.
+    #
+    # Compared against the decoder rather than a literal, so the next
+    # person to rename a category breaks a test instead of a report.
+    return category == AFT_CATEGORY_SUCCESSFUL
+
+
 def _make_request_servicer(client, conn: sqlite3.Connection, state=None, *,
                            now_fn=utc_now, clock=time.monotonic,
                            polls_per_visit: int = WFA_POLLS_PER_VISIT,
-                           rate_cap_s: float = WFA_PULL_RATE_CAP_S):
+                           rate_cap_s: float = WFA_PULL_RATE_CAP_S,
+                           allow_server_aft: bool = False):
     """Serve inbound host_requests at poll-slot boundaries.
 
     Returns a callable taking no arguments. Call it from the heartbeat and
@@ -4837,6 +5958,59 @@ def _make_request_servicer(client, conn: sqlite3.Connection, state=None, *,
         delta = datetime.datetime.now(datetime.timezone.utc) - started
         return delta.total_seconds() * 1000.0
 
+    def _service_aft_push(req_id: int, started) -> None:
+        """A server-pushed AFT credit (§8.3), performed here because this
+        process owns the serial port.
+
+        REFUSED BY DEFAULT. The operator's standing instruction of
+        2026-11-08 was "no AFT fund transfer, no machine state change,
+        read only"; he asked for server AFT on 2026-11-12. Both hold: the
+        capability exists and moving money needs somebody to have typed
+        --allow-server-aft on this cabinet. A refusal is recorded in the
+        row, not swallowed, so the server learns why nothing happened --
+        which is exactly what the hand-written script it replaces could
+        not do.
+        """
+        try:
+            asked = json.loads(conn.execute(
+                "SELECT request_json FROM host_requests WHERE id = ?",
+                (req_id,)).fetchone()[0] or "{}")
+        except (sqlite3.Error, TypeError, ValueError) as e:
+            _finish(req_id, started, state_name="failed",
+                    error=f"unreadable aft_push payload: {e}")
+            return
+        if not allow_server_aft:
+            _finish(req_id, started, state_name="refused",
+                    error="this poller was not started with "
+                          "--allow-server-aft, so it will not move money "
+                          "onto the machine. Nothing was sent to the EGM.")
+            print(f"[{now_fn()}] REFUSED a server AFT push "
+                  f"({asked.get('transfer_id')}): --allow-server-aft was not "
+                  "given. The gateway is read-only to the EGM.")
+            return
+        if state is None:
+            _finish(req_id, started, state_name="failed",
+                    error="no poll state; cannot account for AFT caps")
+            return
+        spent_before = state.aft_pushes
+        ok = _server_aft_credit(
+            client, conn, now_fn(), state,
+            cashable_cents=int(asked.get("cashable") or 0),
+            restricted_cents=int(asked.get("restricted") or 0),
+            nonrestricted_cents=int(asked.get("nonrestricted") or 0),
+            pool_id=int(asked.get("pool_id") or 0),
+            expiration=int(asked.get("expiration") or 0),
+            transfer_id=str(asked.get("transfer_id") or ""))
+        _finish(req_id, started,
+                state_name="done" if ok else "failed",
+                served_from="aft",
+                amount=(int(asked.get("cashable") or 0)
+                        + int(asked.get("restricted") or 0)
+                        + int(asked.get("nonrestricted") or 0)),
+                error=None if ok else "the transfer did not complete; see "
+                                      "lab_auto_actions and poll_errors",
+                polls=max(0, state.aft_pushes - spent_before))
+
     def service() -> None:
         try:
             row = conn.execute(
@@ -4852,6 +6026,9 @@ def _make_request_servicer(client, conn: sqlite3.Connection, state=None, *,
         req_id, kind, number, deadline_ms, requested_at, req_state = row
         started = clock()
 
+        if kind == "aft_push":
+            _service_aft_push(req_id, started)
+            return
         if kind != "wfa_pull":
             _finish(req_id, None, state_name="failed",
                     error=f"unknown request kind {kind!r}")
@@ -4970,7 +6147,8 @@ def _make_request_servicer(client, conn: sqlite3.Connection, state=None, *,
 
 def _make_heartbeat(client, conn: sqlite3.Connection, now: str, seen: list,
                     *, rte: bool = False, state: "PollState | None" = None,
-                    credit_sampler=None, request_servicer=None):
+                    credit_sampler=None, request_servicer=None,
+                    now_fn=utc_now):
     """A general poll to run between long polls, so the machine's exception
     queue is drained while the meter sweep is in progress.
 
@@ -5024,7 +6202,8 @@ def _make_heartbeat(client, conn: sqlite3.Connection, now: str, seen: list,
     poll had been converted; this one had not.
     """
 
-    def note(code: int, fields: dict | None, source: str) -> None:
+    def note(code: int, fields: dict | None, source: str,
+             at: str | None = None) -> None:
         """Queue the code, or act on it now if its deadline is short.
 
         THE DEFERRAL MISSES THE DEADLINE, and the lab proved it. A 0x67
@@ -5050,16 +6229,30 @@ def _make_heartbeat(client, conn: sqlite3.Connection, now: str, seen: list,
             # before the latency-critical branch, so both paths weigh the
             # same.
             state.events_seen_live += 1
+        # WHEN IT WAS DRAINED, not when the cycle began.
+        #
+        # `now` is computed once per cycle. On a 2-second cycle that is
+        # harmless; on the 56.4-second sweep measured 2026-11-12 it means
+        # every event in the sweep claims the same instant, up to 56
+        # seconds before it actually arrived. The screenshot that found it
+        # showed forty-odd lines all stamped 22:01:05.271459.
+        #
+        # The row ids still carry arrival ORDER, which is why nothing has
+        # mis-ordered -- but every DURATION measured from this table was
+        # wrong, and unwanted_handpays.py carries a `gap == 0 and
+        # _id > button_id` special case that exists only to work around
+        # it. The fix belongs here, at the source.
+        at = at or now_fn()
         if int(code) in LATENCY_CRITICAL_EXCEPTIONS:
             try:
-                _dispatch_exception(client, conn, now, int(code),
+                _dispatch_exception(client, conn, at, int(code),
                                     source=source, state=state, fields=fields)
             except SASError:
                 # Best-effort, exactly like the heartbeat itself: the sweep
                 # must not abort because a ticket could not be answered.
                 pass
             return
-        seen.append((int(code), fields, source))
+        seen.append((int(code), fields, source, at))
 
     def _drain_interleaved() -> None:
         """Anything that pre-empted a long poll arrived BEFORE whatever this
@@ -5069,7 +6262,8 @@ def _make_heartbeat(client, conn: sqlite3.Connection, now: str, seen: list,
             return
         try:
             for event in client.drain_rte_events():
-                note(int(event.code), event.fields or None, "rte-interleaved")
+                note(int(event.code), event.fields or None,
+                     "rte-interleaved", getattr(event, "arrived_at", None))
         except SASError:
             pass
 
@@ -5137,7 +6331,8 @@ def _make_heartbeat(client, conn: sqlite3.Connection, now: str, seen: list,
                         if credit_sampler is not None:
                             credit_sampler()
                         return
-                    note(int(event.code), event.fields or None, "rte-heartbeat")
+                    note(int(event.code), event.fields or None,
+                         "rte-heartbeat", getattr(event, "arrived_at", None))
                 else:
                     code = client.general_poll()
                     if code == ExceptionCode.NONE:
@@ -5246,6 +6441,9 @@ def poll_and_log(
     table_c7_sweep: bool = True,
     table_c7_interval: float = DEFAULT_TABLE_C7_INTERVAL,
     validation_meters_sweep: bool = True,
+    full_meter_interval: float = DEFAULT_FULL_METER_INTERVAL,
+    validation_meters_interval: float = DEFAULT_VALIDATION_METERS_INTERVAL,
+    c7_probation_minutes: float = DEFAULT_C7_PROBATION_MINUTES,
     heartbeat_every: int = 8,
     last_accepted_bill_poll: bool = True,
     interval: float | None = None,
@@ -5261,11 +6459,12 @@ def poll_and_log(
     rte: bool = False,
     credit_poll_every: int = 0,
     serve_host_requests: bool = False,
+    allow_server_aft: bool = False,
     comms_gap_seconds: float = DEFAULT_COMMS_GAP_SECONDS,
-    lab_auto: "LabAutoConfig | None" = None,
     drain_priority: bool = False,
     drain_fast_poll: bool = False,
     drain_fast_poll_interval: float = SAS_FAST_POLL_INTERVAL_S,
+    burst_preemptions: int = DRAIN_BURST_PREEMPTIONS,
     drain_fast_poll_fallback: float = 0.0,
 ) -> None:
     """Run one full cycle: a general poll (retried immediately, up to
@@ -5318,31 +6517,6 @@ def poll_and_log(
     # the next cashout printing.
     check_pool_depth(conn, now, min_available=pool_depth_alert, state=state)
 
-    # LAB ONLY, and off unless the lab flags built a LabAutoConfig. Placed
-    # here, before the general poll, on purpose: it then runs on every cycle
-    # including ones whose meter sweep aborts, and a one-cycle lag against a
-    # threshold measured in minutes is not worth a second code path. See the
-    # block comment above LabAutoConfig for why these exist at all.
-    if lab_auto is not None:
-        try:
-            _lab_auto_handpay_reset(
-                client, conn, now, state,
-                after_seconds=lab_auto.handpay_reset_after_s,
-                monotonic_fn=monotonic_fn)
-            _lab_auto_aft_credit(
-                client, conn, now, state,
-                amount_cents=lab_auto.aft_credit_cents,
-                floor_cents=lab_auto.aft_floor_cents,
-                pool_id=lab_auto.aft_pool_id,
-                monotonic_fn=monotonic_fn)
-        except SASError as e:
-            # Never let a lab convenience take the soak down with it.
-            conn.execute(
-                "INSERT INTO poll_errors (occurred_at, poll_name, error_type, "
-                "message) VALUES (?, ?, ?, ?)",
-                (now, "lab_auto", type(e).__name__, str(e)))
-            _safe_commit(conn, now)
-
     try:
         exception_code, attempt, rte_fields = _general_poll_with_retry(
             client, conn, now, max_attempts=general_poll_retries,
@@ -5368,6 +6542,20 @@ def poll_and_log(
             gap = monotonic_fn() - state.gap_started_mono
             print(f"[{now}] link restored after {gap:.0f}s and "
                   f"{state.consecutive_poll_failures} failed cycle(s)")
+            # EVERY recovery forces an identity read, not just a long one.
+            # On a USB adapter an unplug re-enumerates the device, pyserial
+            # raises and the process exits into its supervisor, which comes
+            # back through first_connect and reads identity at once. On a
+            # BUILT-IN port -- /dev/ttyS0, which is what the lab gateway and
+            # the floor units use -- the device node never goes away, so a
+            # pulled cable is indistinguishable from a quiet machine and the
+            # process keeps running against whatever is plugged in next.
+            # This is the only thing that notices.
+            #
+            # It costs 2-3 long polls, against the ~150 of the full
+            # interrogation below, so it is affordable on every recovery.
+            state.force_identity_check = True
+            state.force_identity_attempts = 0
             if gap >= comms_gap_seconds:
                 # Deferred, not run here: the interrogation needs the
                 # heartbeat that only exists once the meter sweep is set up,
@@ -5427,10 +6615,36 @@ def poll_and_log(
     if state.rte_wanted:
         rte = state.rte_enabled
 
+    # Once detection has ruled, it rules. state.c7_supported is False only
+    # after decide_c7_support() measured it, never by assumption.
+    if state.c7_supported is False:
+        table_c7_sweep = False
+
     c7_due = table_c7_sweep and (
         table_c7_interval <= 0
         or state.last_c7_sweep is None
         or (mono_now - state.last_c7_sweep) >= table_c7_interval
+    )
+
+    # THE INTERLOCK. C-7 is the CHEAP source, not the only one: a cabinet
+    # that does not answer LP 0x6F still has most of those meters behind
+    # the 39 single polls, which then become the only way to reach them.
+    # So a cadence that is right alongside C-7 is wrong without it.
+    if state.c7_supported is False:
+        full_interval, validation_interval = 0.0, 0.0
+    else:
+        full_interval, validation_interval = (full_meter_interval,
+                                              validation_meters_interval)
+
+    full_due = full_meter_sweep and (
+        full_interval <= 0
+        or state.last_full_sweep is None
+        or (mono_now - state.last_full_sweep) >= full_interval
+    )
+    validation_due = validation_meters_sweep and (
+        validation_interval <= 0
+        or state.last_validation_sweep is None
+        or (mono_now - state.last_validation_sweep) >= validation_interval
     )
 
     heartbeat_codes: list = []
@@ -5439,7 +6653,9 @@ def poll_and_log(
     # polls and the one thing it must not do is get longer.
     credit_sampler = (_make_credit_sampler(client, conn, credit_poll_every)
                       if credit_poll_every > 0 else None)
-    request_servicer = (_make_request_servicer(client, conn, state)
+    request_servicer = (_make_request_servicer(
+                            client, conn, state,
+                            allow_server_aft=allow_server_aft)
                         if serve_host_requests else None)
     heartbeat = _make_heartbeat(client, conn, now, heartbeat_codes,
                                 rte=rte, state=state,
@@ -5476,9 +6692,20 @@ def poll_and_log(
         values = _poll_all_meters(
             client,
             now=now,
+            on_preempted=state.count_preempted_event,
+            burst_preemptions=burst_preemptions,
             give_up_optional=(
                 _live_drain_probe(
                     state, monotonic_fn(), monotonic_fn=monotonic_fn,
+                    on_probe_fire=(lambda rate, secs, beat, pre: print(
+                        f"[{now}] drain priority ON (mid-sweep probe): "
+                        f"{rate:.2f} events/s over the first {secs:.1f}s of "
+                        f"this sweep ({beat} via the heartbeat + {pre} "
+                        f"pre-empted), against the "
+                        f"{(state.baseline_capacity or state.last_capacity):.1f}/s "
+                        "BASELINE budget. Abandoning the rest of the optional "
+                        "sweep now rather than at the next cycle; coin in, coin "
+                        "out and games played still read every cycle.")),
                     on_fire=((lambda: _apply_drain_poll_rate(
                         client, state, now, want_fast=True,
                         fast_interval=drain_fast_poll_interval,
@@ -5487,13 +6714,52 @@ def poll_and_log(
                 if drain_priority else None),
             heartbeat=heartbeat,
             heartbeat_every=heartbeat_every,
-            full_sweep=full_meter_sweep and not draining,
+            full_sweep=full_due and not draining,
             table_c7_sweep=c7_due and not draining,
-            validation_meters_sweep=validation_meters_sweep and not draining,
+            validation_meters_sweep=validation_due and not draining,
             last_accepted_bill_poll=last_accepted_bill_poll and not draining,
         )
     except _MeterPollFailure as failure:
         meter_poll_elapsed = monotonic_fn() - mono_now
+        # A DEAD LONG POLL IS A DEAD LINK, AND IT STARTS THE GAP CLOCK.
+        #
+        # Operator, 2026-11-17, stating the rule after a five-second cable
+        # pull went unnoticed: 'clean rule "meters poll failed after
+        # 1.000s (send_meters_10_through_15): SASTimeoutError: got 0/2
+        # bytes before timeout" should trigger interrogation (am i
+        # wrong)'. He is not wrong.
+        #
+        # Until now the gap clock started ONLY in the general poll's
+        # except branch. So a cable pull that the general poll's retry
+        # budget absorbed -- or that fell between general polls -- left
+        # the meter sweep timing out loudly while the thing built to
+        # notice link outages watched a different signal. No gap, no
+        # "link restored", no forced identity check. The 2026-11-15 rule
+        # that a reconnect must re-identify the cabinet did not fire,
+        # because nothing told it a disconnect had happened.
+        #
+        # WHY IT IS GUARDED ON is_known_good, and this is the whole
+        # subtlety: §4.4 requires a machine to ignore a long poll it does
+        # not support SILENTLY, which is byte-for-byte identical to a
+        # dead link. On a cashless cabinet send_current_hopper_status
+        # times out forever and always will. A poll that has ANSWERED
+        # BEFORE is different: the cabinet proved it supports that poll,
+        # so silence now is the link and not the feature set.
+        #
+        # Starting the clock is all this does. The existing recovery path
+        # then owns everything that follows -- "link restored after Ns",
+        # force_identity_check on ANY recovery, and the full
+        # interrogation past --comms-gap-seconds. Re-using it beats
+        # duplicating the decision in two places that could drift.
+        if (isinstance(failure.original, SASTimeoutError)
+                and not isinstance(failure.original, SASPreempted)
+                and METER_SUPPORT.is_known_good(failure.poll_name)
+                and state.gap_started_mono is None):
+            state.gap_started_mono = mono_now
+            print(f"[{now}] {failure.poll_name} has answered before and "
+                  "answered nothing now: treating this as the link going "
+                  "down, not as an unsupported poll. The clock starts "
+                  "here; a recovery re-reads identity.")
         # THE RATE MUST BE UPDATED HERE TOO.
         #
         # This path returns early, before the headroom block that records
@@ -5508,7 +6774,8 @@ def poll_and_log(
         state.last_capacity = (1.0 / _pace) if _pace > 0 else 0.0
         if meter_poll_elapsed > 0:
             state.last_event_rate = max(
-                state.events_seen_live, state.events_this_cycle
+                state.events_seen_live + state.preempted_events_live,
+                state.events_this_cycle
             ) / meter_poll_elapsed
         # A 24-REISSUE PRE-EMPTION IS A BURST. Act on it here, not next
         # cycle.
@@ -5578,6 +6845,32 @@ def poll_and_log(
             if stranded:
                 print(f"[{now}] {len(stranded)} event(s) collected during the "
                       f"failed sweep were still filed")
+                # RECOMPUTE THE RATE. The counters above are the whole
+                # evidence of the burst, and the rate was computed before
+                # they existed.
+                #
+                # Operator, 2026-11-13: "drain priority didn't work as it
+                # was supposed to be". He is right, and his own log carries
+                # the proof -- the SAME burst reported 0.10 events/s at
+                # 21:18:59 and 126.85 events/s at 21:19:53.
+                #
+                # The failure path sets last_event_rate near the top, then
+                # files these stranded events further down. So the rate was
+                # 1 event over a 9.613 s sweep = 0.10/s, i.e. 2% of the
+                # 5.0/s budget -- under DRAIN_LEAVE_FRACTION, so the next
+                # cycle turned drain priority OFF, resumed the full sweep,
+                # and was pre-empted 24 times again. ON, OFF, ON, OFF, four
+                # times in ninety seconds, while a cashout went to handpay.
+                #
+                # The real figure is 48 events over 9.613 s = 4.99/s, which
+                # is 99.9% of the budget. The metric was discarding its own
+                # evidence: a saturated channel COLLECTS almost nothing
+                # precisely because the long poll is stalled, so measuring
+                # collection throughput reads a burst as silence.
+                if meter_poll_elapsed > 0:
+                    state.last_event_rate = max(
+                        state.events_seen_live, state.events_this_cycle
+                    ) / meter_poll_elapsed
         return
 
     # Only a cycle that actually READ C-7 consumes the cadence. Two ways a
@@ -5605,6 +6898,47 @@ def poll_and_log(
     # not draining` is the sweep. Only the second one happened.
     if c7_due and not draining:
         state.last_c7_sweep = mono_now
+    # THE SAME EXPRESSION THE CALL SITE USES, for the same reason. See the
+    # paragraph above: `X_due` is the decision, `X_due and not draining` is
+    # the sweep, and stamping the first would make a drained cycle count as
+    # a sweep that never happened.
+    if full_due and not draining:
+        state.last_full_sweep = mono_now
+    if validation_due and not draining:
+        state.last_validation_sweep = mono_now
+
+    # VERIFY. On the cycles where both paths read, the nine meters they
+    # share must agree. C-7 is the primary source now, so the single-meter
+    # sweep's remaining job is to be a second opinion -- and a second
+    # opinion nobody compares is just more polling.
+    if full_due and c7_due and not draining and values is not None:
+        for single, a, b, moved in crosscheck_single_against_c7(
+                values, state.last_meters):
+            message = (f"{single}={a} but its Table C-7 twin reads {b}, a "
+                       f"difference of {abs(a - b)} while the meter moved "
+                       f"{moved} this cycle. Two reads of one meter cannot "
+                       "both be right; suspect a decoding error or a "
+                       "cabinet that answers differently on each path.")
+            print(f"[{now}] METER DISAGREEMENT: {message}")
+            try:
+                conn.execute(
+                    "INSERT INTO poll_errors (occurred_at, poll_name, "
+                    "error_type, message) VALUES (?, ?, ?, ?)",
+                    (now, single, "MeterDisagreement", message))
+                _safe_commit(conn, now)
+            except sqlite3.Error:
+                pass
+
+    # Decide C-7 capability from the sweep that just ran, not from a probe.
+    # values is what the machine actually answered this cycle.
+    if c7_due and not draining and values is not None:
+        decide_c7_support(state, values, now, conn,
+                          probation_minutes=c7_probation_minutes,
+                          mono_now=mono_now,
+                          # state.draining is True only if the mid-sweep
+                          # probe fired, since `draining` was False at the
+                          # top. That means the C-7 chunks were abandoned.
+                          sweep_completed=not state.draining)
 
     # A gap long enough for the cable to have moved. Run here, after the
     # sweep, so the heartbeat is available to keep the exception queue
@@ -5647,16 +6981,16 @@ def poll_and_log(
     # AFTER the comms-restored interrogation above and BEFORE the options
     # re-read below, deliberately: a 0x3C found by a heartbeat in this sweep
     # should be acted on in this cycle, not the next one.
-    for code, hb_fields, hb_source in heartbeat_codes:
-        print(f"[{now}] exception 0x{code:02X} drained during the meter sweep: "
-              f"{describe_exception(code)}")
+    for code, hb_fields, hb_source, hb_at in heartbeat_codes:
+        print(f"[{hb_at}] exception 0x{code:02X} drained during the meter "
+              f"sweep: {describe_exception(code)}")
         # Table A-1's own name for a handful of codes misleads a reader badly
         # enough to have cost this project days. The spec name is what gets
         # logged; this is what a person needs beside it.
         _clarify = clarify_exception(code)
         if _clarify:
             print(f"    ^ {_clarify}")
-        _dispatch_exception(client, conn, now, code, source=hb_source,
+        _dispatch_exception(client, conn, hb_at, code, source=hb_source,
                             state=state, fields=hb_fields)
 
     # Exception 0x3C said the operator changed options. Re-read the
@@ -5744,13 +7078,25 @@ def poll_and_log(
     # rule this keeps failing: **this count must be computed from the same
     # expressions the call site uses, never from the flags they are
     # derived from.**
+    # AND A THIRD TIME, 2026-11-13, by me. --full-meter-interval and
+    # --validation-meters-interval gave those two sweeps a cadence; the
+    # call site moved to `full_due` and `validation_due` and this count
+    # did not. 8 + 1 + 39 + 12 = 60, so every cadenced cycle reported
+    # "60lp" while making 9. The operator read it as the intervals not
+    # working -- "Is still don't see any c7" -- and so did I, and I spent
+    # two rounds diagnosing a sweep that was behaving perfectly.
+    #
+    # The rule above is right and is now enforced by a test that counts
+    # the client's actual calls and compares them with this number, which
+    # is the only form of the rule that cannot be broken by the next
+    # person to add a term.
     meter_poll_count = (
         GROUPED_METER_POLL_COUNT
         + (1 if last_accepted_bill_poll and not draining else 0)
-        + (len(SINGLE_METER_COLUMNS) if full_meter_sweep and not draining else 0)
+        + (len(SINGLE_METER_COLUMNS) if full_due and not draining else 0)
         + (TABLE_C7_CHUNK_COUNT if c7_due and not draining else 0)
         + (len(VALIDATION_METER_TYPES)
-           if validation_meters_sweep and not draining else 0)
+           if validation_due and not draining else 0)
     )
     # The heartbeats are general polls, and §2.3.3 counts general polls and
     # long polls against ONE budget. Reporting them separately keeps both
@@ -5832,11 +7178,46 @@ def poll_and_log(
         )
         state.last_history_write = mono_now
         if history.mode == "ring" and history.cap:
-            conn.execute(
-                "DELETE FROM meters_history WHERE id NOT IN "
-                "(SELECT id FROM meters_history ORDER BY id DESC LIMIT ?)",
-                (history.cap,),
-            )
+            # NEVER EVICT A ROW THE SERVER HAS NOT ACKNOWLEDGED.
+            #
+            # Found by the server side on 2026-11-16: the eviction used to
+            # delete the oldest rows BY COUNT, whatever their synced_at. The
+            # ring holds history.cap rows at history.interval seconds, which
+            # at the defaults is about three hours -- so a link down longer
+            # than that silently deleted meter history the server never
+            # received. That is the one thing the retention spec says never
+            # happens, and the gateway is supposed to be the server's backup
+            # of last resort.
+            #
+            # WHAT THIS COSTS, SAID PLAINLY: during an outage the ring stops
+            # evicting and meters_history grows like append mode until the
+            # link returns. That is the correct trade -- disk is recoverable
+            # and a deleted unacknowledged row is not -- but it does mean
+            # ring is a soft cap, not a hard one, and a gateway left offline
+            # for weeks grows at the append rate. db_maintain reports the
+            # row count; --db-size-warning-mb is the backstop.
+            #
+            # A gateway with no server link at all has no synced_at on any
+            # row, so this would never evict anything and the ring would
+            # stop capping. That is not the floor configuration -- the floor
+            # has a link -- but it IS the bench, so the unlinked case keeps
+            # the old behaviour deliberately.
+            linked = conn.execute(
+                "SELECT COUNT(*) FROM meters_history "
+                "WHERE synced_at IS NOT NULL").fetchone()[0]
+            if linked:
+                conn.execute(
+                    "DELETE FROM meters_history WHERE synced_at IS NOT NULL "
+                    "AND id NOT IN (SELECT id FROM meters_history "
+                    "ORDER BY id DESC LIMIT ?)",
+                    (history.cap,),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM meters_history WHERE id NOT IN "
+                    "(SELECT id FROM meters_history ORDER BY id DESC LIMIT ?)",
+                    (history.cap,),
+                )
 
     _safe_commit(conn, now)
     state.last_meters = values
@@ -5942,12 +7323,21 @@ def poll_and_log(
             f"§12.5.3's own arithmetic. The sweep took "
             f"{meter_poll_elapsed:.1f}s across {meter_poll_count} long "
             f"polls and {heartbeat_count} general polls, collecting "
-            f"{rate:.2f} of a {capacity:.1f}/s budget. Shorten the sweep: "
-            f"--drain-priority (defers the optional polls automatically "
-            f"under load), --skip-validation-meters-sweep, "
-            f"--table-c7-interval 300, or --skip-full-meter-sweep. A larger "
-            f"--interval is NOT the remedy — it is the sleep between "
-            f"cycles, and {SAS_MAX_POLL_INTERVAL_S}s is the §2.3.3 ceiling."
+            f"{rate:.2f} of a {capacity:.1f}/s budget. "
+            + sweep_remedies(
+                drain_priority=drain_priority, was_draining=draining,
+                full_meter_sweep=full_meter_sweep,
+                full_meter_interval=full_meter_interval,
+                validation_meters_sweep=validation_meters_sweep,
+                validation_meters_interval=validation_meters_interval,
+                table_c7_sweep=table_c7_sweep,
+                table_c7_interval=table_c7_interval,
+                poll_interval=state.normal_poll_interval,
+                drain_fast_poll=drain_fast_poll,
+                decline_aft_cashout=state.decline_aft_cashout)
+            + f" A larger --interval is NOT the remedy — it is the sleep "
+            f"between cycles, and {SAS_MAX_POLL_INTERVAL_S}s is the §2.3.3 "
+            "ceiling."
         )
     elif interval is not None and meter_poll_elapsed >= interval:
         # A long sweep that loses nothing is a COST, not a fault: it buys
@@ -5960,10 +7350,21 @@ def poll_and_log(
         print(f"[{now}] ** EVENT HEADROOM {used:.0f}% -- {rate:.2f} events/s "
               f"against the {capacity:.1f}/s that §2.3.3 pacing allows us to "
               f"collect. Above this the queue builds, and a stalled long poll "
-              f"is dead air where nothing drains. Shorten the sweep or widen "
-              f"--min-poll-interval's budget.")
+              f"is dead air where nothing drains. "
+              + sweep_remedies(
+                  drain_priority=drain_priority, was_draining=draining,
+                  full_meter_sweep=full_meter_sweep,
+                  full_meter_interval=full_meter_interval,
+                  validation_meters_sweep=validation_meters_sweep,
+                  validation_meters_interval=validation_meters_interval,
+                  table_c7_sweep=table_c7_sweep,
+                  table_c7_interval=table_c7_interval,
+                  poll_interval=state.normal_poll_interval,
+                  drain_fast_poll=drain_fast_poll,
+                  decline_aft_cashout=state.decline_aft_cashout))
     state.events_this_cycle = 0
     state.events_seen_live = 0
+    state.preempted_events_live = 0
     state.overflows_this_cycle = 0
     state.gaps_this_cycle = 0
 
@@ -6153,6 +7554,24 @@ def build_parser() -> argparse.ArgumentParser:
              "OFF by default: it changes what goes on the wire",
     )
     parser.add_argument(
+        "--drain-burst-preemptions",
+        type=int,
+        default=DRAIN_BURST_PREEMPTIONS,
+        metavar="N",
+        help="how many times ONE long poll may be pre-empted before the "
+             "meter sweep gives up and lets drain priority engage "
+             f"(default {DRAIN_BURST_PREEMPTIONS}). The rate probe cannot "
+             "answer this: it has a 5-second floor, because one event in "
+             "the first 50 ms reads as 20/s. A burst arriving at the TOP "
+             "of a sweep is inside that floor. This is a COUNT, not a "
+             "rate, so it needs no floor. Set it ABOVE one spin's worth "
+             "of events -- a game start, its reel stops, a game end and "
+             "the lamp toggles, a mean of 7.1 on the lab cabinet -- or "
+             "drain priority engages on ordinary play and starves the "
+             "Table C-7 sweep. Set it below 24, which is only max_requeue "
+             "doing duty as a burst detector",
+    )
+    parser.add_argument(
         "--drain-fast-poll-interval",
         type=float,
         default=SAS_FAST_POLL_INTERVAL_S,
@@ -6221,20 +7640,6 @@ def build_parser() -> argparse.ArgumentParser:
         "'pending lab'). Stops customer reinsertion amplifying a slow server.",
     )
     parser.add_argument(
-        "--lab-ticket-authority",
-        metavar="PATH",
-        default=None,
-        help="LAB ONLY. Answer ticket-in (exception 0x67 / LP 0x70 / LP 0x71) from "
-        "this file of validation numbers, instead of only recording the insertion. "
-        "Without it this tool never calls redeem_ticket() and the machine returns "
-        "every ticket after its own 30-second timeout, which is the correct default "
-        "for a gateway. The file is the authorisation, not the flag: it binds to one "
-        "cabinet by serial and the run refuses any other. Same format, same expiry "
-        "date and same lookup as examples/ticket_lab_authority.py, imported from it "
-        "rather than copied. A gateway that decides what tickets are worth has no "
-        "place on a floor -- delete both before one goes near one.",
-    )
-    parser.add_argument(
         "--decline-aft-cashout",
         action="store_true",
         help="answer §8.7's AFT host-cashout request (0x6A/0x6B) with an "
@@ -6246,57 +7651,6 @@ def build_parser() -> argparse.ArgumentParser:
         "pool. Declining skips it. OFF BY DEFAULT and PER-MODEL: on a "
         "cabinet with no printer 'other means' is an attendant, so there "
         "this makes a handpay arrive sooner rather than a ticket.")
-    parser.add_argument(
-        "--lab-auto-handpay-reset",
-        type=float,
-        metavar="SECONDS",
-        default=0.0,
-        help="LAB ONLY, REQUIRES --lab-ticket-authority. Send LP 0x94 (remote "
-        "handpay reset) when a lockup has gone this many seconds with nobody "
-        "clearing it, so an unattended overnight soak does not stop at the "
-        f"first jackpot. Minimum {LAB_AUTO_HANDPAY_MIN_SECONDS:.0f}s. On a "
-        "floor this records a jackpot as PAID when nobody paid it, and the "
-        "meters will agree with the gateway because both are wrong the same "
-        "way. §7.9 also means the financial outcome is ambiguous: with W2-G "
-        "Reset To Credit Meter enabled the money returns as credits, "
-        "otherwise it is recorded as handed to a player, and reset code 0x00 "
-        "comes back either way. Every reset is written to lab_auto_actions.",
-    )
-    parser.add_argument(
-        "--lab-auto-aft-credit",
-        type=float,
-        metavar="AMOUNT",
-        default=0.0,
-        help="LAB ONLY, REQUIRES --lab-ticket-authority. Push this many "
-        "dollars of cashable credit by AFT whenever the cabinet's balance "
-        "falls to --lab-aft-credit-floor or below, so a soak keeps spinning "
-        "after it cashes out or a handpay clears without returning credits. "
-        f"Hard ceilings: {LAB_AUTO_AFT_MAX_PUSHES} pushes per run, "
-        f"{LAB_AUTO_AFT_MAX_TOTAL_CENTS / 100:,.0f} total, one every "
-        f"{LAB_AUTO_AFT_MIN_INTERVAL_S:.0f}s. Balances are read with LP 0x74 "
-        "rather than a meter column, and a FAILED read never counts as zero "
-        "credits -- that distinction is what keeps this from being a money "
-        "printer with a cron job. Every push is written to lab_auto_actions.",
-    )
-    parser.add_argument(
-        "--lab-aft-credit-floor",
-        type=float,
-        metavar="AMOUNT",
-        default=1.0,
-        help="The balance at or below which --lab-auto-aft-credit tops up. "
-        "Default 1.00.",
-    )
-    parser.add_argument(
-        "--ticket-authority-unverified-serial",
-        action="store_true",
-        help="Run --lab-ticket-authority against a cabinet that will not report "
-        "its serial number. §4.4 lets a machine ignore LP 0x54, and on such a "
-        "cabinet the ticket file's serial binding cannot be checked at all -- so "
-        "the default is to refuse, because an unenforceable binding is not a "
-        "binding. This says the operator is at the machine and knows which one it "
-        "is. It does NOT weaken the mismatch check: a cabinet that reports the "
-        "WRONG serial is still refused, flag or no flag.",
-    )
     parser.add_argument(
         "--min-poll-interval",
         type=float,
@@ -6380,14 +7734,78 @@ def build_parser() -> argparse.ArgumentParser:
         "(Decisions Annex D-09) — this re-polls right away rather than losing that cycle. N=1 disables retrying.",
     )
     parser.add_argument(
+        "--allow-server-aft",
+        action="store_true",
+        help="let the SERVER move money onto this machine (AFT_TRANSFER, "
+        "§8.3). OFF BY DEFAULT, and the default is the point: the standing "
+        "posture for this gateway is read-only to the EGM, and reversing "
+        "that should be something somebody typed for this cabinet rather "
+        "than something a server can decide. Needs --serve-host-requests, "
+        "which is the channel the push arrives on. The run's existing AFT "
+        "caps still apply -- same maximum pushes, same total, same minimum "
+        "interval the removed lab auto-credit used -- because a bug on the far end of "
+        "a socket is no less likely than one here. A refusal is recorded in "
+        "the host_requests row and reaches the server, so a push that was "
+        "declined never looks like one that silently vanished.",
+    )
+    parser.add_argument(
+        "--full-meter-interval",
+        type=float,
+        default=DEFAULT_FULL_METER_INTERVAL,
+        metavar="SECONDS",
+        help="run the ~39-poll single-meter sweep at most this often "
+        "instead of every cycle (default %(default)s = every cycle, which "
+        "is what this did before the flag existed). THE DEAREST SWEEP PER "
+        "METER: 39 polls for 39 meters, against Table C-7's 13 polls for "
+        "154 -- and C-7 already fetches nearly all of the same meters, "
+        "coin in, coin out, drop, jackpot, games played and the "
+        "per-denomination bill counts among them. So this sweep is the "
+        "FALLBACK, not the primary, and 1800 is the sensible floor "
+        "setting. Forced back to every cycle if --c7-probation-minutes "
+        "finds this cabinet does not answer Table C-7: C-7 is the cheap "
+        "source, not the only one, and these 39 polls are what is left "
+        "without it.",
+    )
+    parser.add_argument(
+        "--validation-meters-interval",
+        type=float,
+        default=DEFAULT_VALIDATION_METERS_INTERVAL,
+        metavar="SECONDS",
+        help="the same, for the 12-poll LP 0x50 validation-meter sweep "
+        "(default %(default)s = every cycle). Subject to the same "
+        "interlock.",
+    )
+    parser.add_argument(
+        "--c7-probation-minutes",
+        type=float,
+        default=DEFAULT_C7_PROBATION_MINUTES,
+        metavar="MINUTES",
+        help="how long to spend deciding whether this cabinet answers "
+        "Table C-7 at all (default %(default)s; 0 disables the check and "
+        "leaves the sweep on). A cabinet that does not implement LP 0x6F "
+        "does not refuse it -- §4.4 lets it say nothing -- so each of the "
+        "13 chunks costs a full timeout, and §2.2.1's exception queue does "
+        "not survive that every cycle. The decision comes early, after "
+        f"{C7_EMPTY_SWEEPS_BEFORE_GIVING_UP} consecutive sweeps answering "
+        "zero codes, rather than waiting out the window. A sweep that "
+        "answers SOME codes is healthy: the lab cabinet answers 125 of 162 "
+        "and §7.21b makes the other 37 a legitimate absence.",
+    )
+    parser.add_argument(
         "--pool-depth-alert",
         type=int,
         default=DEFAULT_POOL_DEPTH_ALERT,
         metavar="N",
-        help="print an active, repeated alert (and log one PoolLow row per "
-        "episode) while fewer than N validation numbers remain available, "
-        "with the 24-hour consumption rate and a projection of how long is "
-        "left (default: %(default)s). DIFFERENT QUESTION FROM "
+        help="FLOOR under the low-water mark for validation_pool. The live "
+        "mark is max(N, 20%% of the pool size at the last recorded fill), so "
+        "it scales with the pool instead of alerting at 25-of-200 and "
+        "25-of-30 alike; N only binds for pools under 50. While available "
+        "numbers are below it, print an active, repeated alert (and log one "
+        "PoolLow row per episode) with the 24-hour consumption rate and a "
+        "projection of how long is left (default: %(default)s). With no fill "
+        "recorded on the database the mark falls back to N, and the alert "
+        "says so rather than quoting a percentage of a size nobody knows. "
+        "DIFFERENT QUESTION FROM "
         "--pool-age-alert-hours: that one asks whether a top-up is reaching "
         "this gateway, this one asks whether there will be a number for the "
         "next cashout. A pool can be old and full, or young and nearly "
@@ -6477,9 +7895,6 @@ def main() -> int:
     # THE GATE on the two features that let this poller act on money by
     # itself. The lab ticket file is the authorisation, exactly as it is for
     # ticket-in: it binds to one cabinet, it expires, and the run exits
-    # rather than act against any other machine. A flag alone is too easy to
-    # leave in a unit file.
-    lab_auto = None
     if args.drain_fast_poll and not args.drain_priority:
         print("--drain-fast-poll does nothing without --drain-priority: it "
               "only changes the rate WHILE draining, and without it nothing "
@@ -6491,12 +7906,16 @@ def main() -> int:
               f"polled below the floor once and recorded it as a bug; it is "
               f"not a knob.", file=sys.stderr)
         return 2
-    if args.server_ticket_authority and args.lab_ticket_authority:
-        print("--server-ticket-authority and --lab-ticket-authority cannot be "
-              "combined.\n  One asks the server what a ticket is worth; the "
-              "other answers from a file on the gateway. A run with both has "
-              "two authorities, and which one paid a given ticket would be a "
-              "question nobody could answer afterwards.", file=sys.stderr)
+    if args.allow_server_aft and not args.serve_host_requests:
+        print("--allow-server-aft without --serve-host-requests does nothing.\n"
+              "  host_requests is the channel an AFT_TRANSFER arrives on, and "
+              "nothing is listening to it, so a push from the server would sit "
+              "unanswered rather than be refused. This is an ERROR and not a "
+              "warning because the flag reads as 'the server may move money "
+              "onto this cabinet' and would be silently false for the whole "
+              "run -- the kind of no-op that costs a lab session before anyone "
+              "notices. Add --serve-host-requests, or drop --allow-server-aft.",
+              file=sys.stderr)
         return 2
     if args.server_ticket_authority and not (
             0.1 <= args.ticket_query_timeout <= 4.0):
@@ -6505,35 +7924,6 @@ def main() -> int:
               "polled, and §2.3.3 lets a machine go at most 5 s between "
               "polls.", file=sys.stderr)
         return 2
-    if args.lab_auto_handpay_reset or args.lab_auto_aft_credit:
-        if not args.lab_ticket_authority:
-            print("--lab-auto-handpay-reset and --lab-auto-aft-credit both "
-                  "require --lab-ticket-authority.\n"
-                  "  Not bureaucracy: that file is what binds this run to one "
-                  "cabinet by serial (or asset, §4.4) and carries the expiry "
-                  "date.\n"
-                  "  Clearing handpays and pushing credits without a human are "
-                  "cash-dispensing defects on a floor, and an unbound flag is "
-                  "how one gets there.", file=sys.stderr)
-            return 2
-        if (args.lab_auto_handpay_reset
-                and args.lab_auto_handpay_reset < LAB_AUTO_HANDPAY_MIN_SECONDS):
-            print(f"--lab-auto-handpay-reset {args.lab_auto_handpay_reset:.0f} is "
-                  f"below the {LAB_AUTO_HANDPAY_MIN_SECONDS:.0f}s minimum. Below a "
-                  "minute you are not clearing an unattended lockup, you are "
-                  "racing the attendant walking towards the machine.",
-                  file=sys.stderr)
-            return 2
-        if args.lab_auto_aft_credit and args.lab_auto_aft_credit <= 0:
-            print("--lab-auto-aft-credit must be positive.", file=sys.stderr)
-            return 2
-        lab_auto = LabAutoConfig(
-            handpay_reset_after_s=args.lab_auto_handpay_reset,
-            aft_credit_cents=round(args.lab_auto_aft_credit * 100),
-            aft_floor_cents=round(args.lab_aft_credit_floor * 100),
-        )
-
-
     try:
         client = connect_from_config(args.config, min_poll_interval=args.min_poll_interval)
     except SASPortCapabilityError as e:
@@ -6566,11 +7956,39 @@ def main() -> int:
         print("  meters_history: unbounded, written every cycle (lab/stress-testing mode).")
     print(
         f"  meters: {len(ALL_METER_FIELDS)} columns per row "
-        f"(single-meter sweep {'enabled' if not args.skip_full_meter_sweep else 'skipped'}, "
+        # EACH SWEEP REPORTS ITS CADENCE, not just whether it is on. Only
+        # C-7 did, because only C-7 had one; the other two gained
+        # intervals on 2026-11-12 and the banner still said "enabled",
+        # so an operator who had just typed --full-meter-interval 1800
+        # could not tell from the output whether it had taken effect.
+        f"(single-meter sweep {'skipped' if args.skip_full_meter_sweep else ('every cycle' if args.full_meter_interval <= 0 else f'every {args.full_meter_interval:.0f}s')}, "
         f"Table C-7 sweep {'skipped' if args.skip_table_c7_sweep else ('every cycle' if args.table_c7_interval <= 0 else f'every {args.table_c7_interval:.0f}s')}, "
-        f"validation meters sweep {'enabled' if not args.skip_validation_meters_sweep else 'skipped'}, "
+        f"validation meters sweep {'skipped' if args.skip_validation_meters_sweep else ('every cycle' if args.validation_meters_interval <= 0 else f'every {args.validation_meters_interval:.0f}s')}, "
         f"last-accepted-bill poll {'enabled' if not args.skip_last_accepted_bill_poll else 'skipped'})."
     )
+    if args.c7_probation_minutes > 0 and not args.skip_table_c7_sweep:
+        print(f"  Table C-7 is on probation: if this cabinet answers zero "
+              f"extended meters for {C7_EMPTY_SWEEPS_BEFORE_GIVING_UP} sweeps "
+              f"in a row, or for {args.c7_probation_minutes:.0f} minutes, the "
+              "sweep is turned off and BOTH intervals above revert to every "
+              "cycle -- C-7 is the cheap source, not the only one, and "
+              "those 39 single polls are what is left without it.")
+    # A FLAG THAT LETS A SERVER MOVE MONEY ONTO THE MACHINE announces
+    # itself, loudly, every start. The standing posture is read-only to
+    # the EGM; anything that reverses it should be impossible to run for
+    # a week without noticing.
+    if args.allow_server_aft:
+        if not args.serve_host_requests:
+            print("  --allow-server-aft WITHOUT --serve-host-requests does "
+                  "nothing: host_requests is the channel an AFT push "
+                  "arrives on, and nothing is reading it.")
+        else:
+            print("  ** --allow-server-aft: the SERVER MAY MOVE MONEY ONTO "
+                  f"THIS MACHINE (§8.3), up to {AFT_PUSH_MAX_PER_RUN} "
+                  f"pushes and {AFT_PUSH_MAX_TOTAL_CENTS / 100:,.2f} "
+                  f"total this run, no more than one every "
+                  f"{AFT_PUSH_MIN_INTERVAL_S:.0f}s. Without this flag "
+                  "the gateway is read-only to the EGM and refuses pushes.")
     # A default that changes what goes on the wire has to announce itself.
     # Nobody reads a unit file to find out why a sweep got shorter.
     if args.drain_priority:
@@ -6597,56 +8015,6 @@ def main() -> int:
               f"`python3 -m gateway.client` must be running against this "
               f"database, or every ticket is handed back.")
 
-    if args.lab_ticket_authority:
-        import datetime as _dt
-        from pathlib import Path as _Path
-        try:
-            from ticket_lab_authority import LAB_AUTHORITY_EXPIRES, load_tickets
-        except ImportError:
-            print("--lab-ticket-authority needs examples/ticket_lab_authority.py, "
-                  "which is not in this checkout. It is meant to be deleted before "
-                  "a gateway goes near a floor, so this is very likely correct.",
-                  file=sys.stderr)
-            return 2
-        today = _dt.date.today()
-        if today > LAB_AUTHORITY_EXPIRES:
-            print(f"The lab ticket authority expired on {LAB_AUTHORITY_EXPIRES}. "
-                  "That date is deliberate. Refusing to answer tickets.",
-                  file=sys.stderr)
-            return 2
-        try:
-            tickets, binding = load_tickets(_Path(args.lab_ticket_authority))
-        except (OSError, ValueError, json.JSONDecodeError) as e:
-            print(f"could not read {args.lab_ticket_authority}: {e}", file=sys.stderr)
-            return 2
-        state.ticket_authority = tickets
-        state.ticket_authority_binding = binding
-        state.ticket_authority_path = args.lab_ticket_authority
-        print("=" * 70)
-        print("  LAB TICKET AUTHORITY ACTIVE. This run will REDEEM tickets.")
-        print(f"  {len(tickets)} number(s) from {args.lab_ticket_authority}, "
-              f"bound to {binding.describe()}")
-        print(f"  Expires {LAB_AUTHORITY_EXPIRES}. Delete the file and "
-              "examples/ticket_lab_authority.py when the bench work is done.")
-        if lab_auto is not None and lab_auto.any_enabled():
-            print("-" * 70)
-            print("  THIS RUN ALSO ACTS ON MONEY BY ITSELF:")
-            if lab_auto.handpay_reset_after_s:
-                print(f"    LP 0x94 remote handpay reset after "
-                      f"{lab_auto.handpay_reset_after_s:.0f}s unattended.")
-                print("    §7.9: with W2-G Reset To Credit Meter off, this "
-                      "records the")
-                print("    jackpot as PAID TO A PLAYER who was never there.")
-            if lab_auto.aft_credit_cents:
-                print(f"    AFT push {lab_auto.aft_credit_cents / 100:,.2f} "
-                      f"cashable whenever the balance is at or below "
-                      f"{lab_auto.aft_floor_cents / 100:,.2f},")
-                print(f"    capped at {LAB_AUTO_AFT_MAX_PUSHES} pushes and "
-                      f"{LAB_AUTO_AFT_MAX_TOTAL_CENTS / 100:,.0f} total "
-                      f"for this run.")
-            print("    Every action lands in the lab_auto_actions table.")
-        print("=" * 70)
-
     # BEFORE ANYTHING READS THE WIRE. A cabinet left in real time event mode
     # by an unclean stop answers every general poll with its own address byte,
     # and each mis-read poll eats one byte of a Table 12.5 frame and misframes
@@ -6660,6 +8028,14 @@ def main() -> int:
         _dispatch_exception(client, conn, utc_now(), probed_code,
                             source="startup-backlog", state=state)
         _safe_commit(conn, utc_now())
+
+    # READY only once the port is open and the config has been accepted,
+    # so Type=notify means "started" rather than "the process exists". A
+    # unit that reports ready before it can poll hides its own worst
+    # failure.
+    if _watchdog_setup():
+        _watchdog_notify(b"READY=1")
+        _watchdog_notify(b"STATUS=polling")
 
     if args.interrogate_on_connect:
         print("Interrogating the machine (identity, features, every game, "
@@ -6703,78 +8079,24 @@ def main() -> int:
             drain_now = utc_now()
             print(f"  {len(startup_codes)} event(s) drained by the interrogation's "
                   "heartbeats; stored as source 'startup-backlog'.")
-            for code, hb_fields, _hb_source in startup_codes:
+            # FOUR, not three. The heartbeat's `seen` entries gained the
+            # time each event was drained on 2026-11-12; this consumer was
+            # missed and the poller crashed on its first start with
+            # "too many values to unpack (expected 3)" -- after a 58.9 s
+            # interrogation, so it looked like the interrogation had
+            # failed rather than the line below.
+            for code, hb_fields, _hb_source, hb_at in startup_codes:
                 print(f"  exception 0x{code:02X} during interrogation: "
                       f"{describe_exception(code)}")
                 _clarify = clarify_exception(code)
                 if _clarify:
                     print(f"      ^ {_clarify}")
-                _dispatch_exception(client, conn, drain_now, code,
+                # The event's OWN time, not drain_now. An interrogation is
+                # ~150 long polls; stamping its backlog with one instant
+                # is the same bug this change set out to fix.
+                _dispatch_exception(client, conn, hb_at or drain_now, code,
                                     source="startup-backlog", state=state,
                                     fields=hb_fields)
-
-    # Checked OUTSIDE the interrogation branch, because it used to live
-    # inside it: --no-interrogate-on-connect then silently disabled the one
-    # check that stops this file being used against the wrong cabinet. The
-    # binding is the authorisation; a flag about startup chatter must not be
-    # able to switch it off.
-    #
-    # THE UNREADABLE CASE IS A SEPARATE DECISION FROM THE MISMATCHED ONE, and
-    # conflating them cost a soak. The original check read
-    # ``if seen and seen.strip() != bound``, which fails OPEN: a cabinet whose
-    # LP 0x54 does not answer -- section 4.4 lets it refuse -- had no serial to
-    # compare, so the binding was not enforced and nothing said so. Replacing
-    # that with a bare refusal fixed the silence and broke every such cabinet,
-    # including this project's own lab EGM, which exits 2 at startup on a
-    # command line that worked ten minutes earlier.
-    #
-    # So: a MISMATCH is always fatal, because the machine has identified
-    # itself and it is the wrong one. An UNREADABLE serial is fatal by
-    # default, because an unenforceable binding is not a binding -- but the
-    # operator standing at the cabinet can overrule that with
-    # --ticket-authority-unverified-serial, which puts the decision in the
-    # command line and in the log instead of nowhere.
-    if state.ticket_authority is not None:
-        # Only worth a long poll if nothing has asked yet. An interrogation
-        # that ran and got None was already refused by the machine; asking
-        # again spends an exchange to be told the same thing.
-        if state.identity is None:
-            try:
-                state.identity = read_identity(client)
-            except SASError as e:
-                print(f"  could not read this cabinet's identity "
-                      f"({type(e).__name__}: {e})", file=sys.stderr)
-        verdict = ticket_authority_binding_verdict(
-            state.ticket_authority_binding, state.identity,
-            allow_unverified=args.ticket_authority_unverified_serial)
-        if verdict is not None:
-            reason, detail = verdict
-            if reason == "mismatch":
-                print(f"\n  WRONG CABINET: {detail}.", file=sys.stderr)
-                print("  Refusing to redeem tickets against it. No flag "
-                      "overrides this.", file=sys.stderr)
-                return 2
-            if reason == "unverifiable":
-                print(f"\n  CANNOT VERIFY WHICH CABINET THIS IS: {detail}.",
-                      file=sys.stderr)
-                print(f"  That binding is the only thing stopping "
-                      f"{args.lab_ticket_authority} redeeming tickets against "
-                      "a cabinet it was not issued for.", file=sys.stderr)
-                print("  Add machine_asset to the file if this cabinet reports "
-                      "an asset number — that is enforceable where a serial is "
-                      "not. Or, if you are at the cabinet and know it is the "
-                      "right one, say so deliberately:", file=sys.stderr)
-                print("    --ticket-authority-unverified-serial", file=sys.stderr)
-                return 2
-            if reason == "unbound":
-                print("\n  WARNING: the ticket file names no cabinet, so it "
-                      "will redeem against ANY machine this run talks to.",
-                      file=sys.stderr)
-            else:
-                print(f"\n  WARNING: {detail}; the binding is NOT being "
-                      "enforced. --ticket-authority-unverified-serial was "
-                      "given, so the run continues on the operator's word.",
-                      file=sys.stderr)
 
     if not args.interrogate_on_connect and not args.skip_ticket_out_backfill:
         print("Reading the existing ticket-out buffer (indices 1-31, non-destructive)...")
@@ -6918,9 +8240,13 @@ def main() -> int:
                 table_c7_sweep=not args.skip_table_c7_sweep,
             table_c7_interval=args.table_c7_interval,
                 validation_meters_sweep=not args.skip_validation_meters_sweep,
+                full_meter_interval=args.full_meter_interval,
+                validation_meters_interval=args.validation_meters_interval,
+                c7_probation_minutes=args.c7_probation_minutes,
                 heartbeat_every=args.heartbeat_every,
                 credit_poll_every=args.credit_poll_every,
                 serve_host_requests=args.serve_host_requests,
+                allow_server_aft=args.allow_server_aft,
                 last_accepted_bill_poll=not args.skip_last_accepted_bill_poll,
                 interval=args.interval,
                 general_poll_retries=args.general_poll_retries,
@@ -6928,10 +8254,10 @@ def main() -> int:
                 pool_depth_alert=args.pool_depth_alert,
                 rte=rte_on,
                 comms_gap_seconds=args.comms_gap_seconds,
-                lab_auto=lab_auto,
                 drain_priority=args.drain_priority,
                 drain_fast_poll=args.drain_fast_poll,
                 drain_fast_poll_interval=args.drain_fast_poll_interval,
+                burst_preemptions=args.drain_burst_preemptions,
                 drain_fast_poll_fallback=args.drain_fast_poll_fallback,
             )
             # Under drain priority this is general polls, not sleep: the
@@ -6962,13 +8288,80 @@ def main() -> int:
         # finally-block close below still runs.
         stop_reason = f"{type(e).__name__}: {e}"
         print(f"\nPolling stopped: {type(e).__name__}: {e}", file=sys.stderr)
-        print(
-            "\nThe serial port failed mid-run. The usual cause is the adapter "
-            "disconnecting or re-enumerating. Data already written to the database "
-            "is intact. Run this under a supervisor (systemd 'Restart=always') so a "
-            "gateway recovers on its own — see MANUAL.md §4.6.",
-            file=sys.stderr,
-        )
+        # DO NOT BLAME THE CABLE FOR A BUG IN THIS PROGRAM.
+        #
+        # 2026-11-14T18:49:11, one second after a §8.7 AFT decline went
+        # out, the operator's run died with "IndexError: index out of
+        # range" -- a short Table 8.3c response walking off the end of an
+        # unbounded parser -- and this handler answered "The serial port
+        # failed mid-run. The usual cause is the adapter disconnecting or
+        # re-enumerating." He went and looked at the cable. The adapter
+        # was fine.
+        #
+        # That story is right for an OSError out of pyserial, which is
+        # what a re-enumeration raises. It is wrong, and expensively
+        # wrong, for a logic error, which needs a traceback instead --
+        # and needs the reader told that restarting will hit the same
+        # path again, because "run it under a supervisor" is the one
+        # piece of advice that makes a crash loop.
+        if isinstance(e, OSError):
+            print(
+                "\nThe serial port failed mid-run. The usual cause is the adapter "
+                "disconnecting or re-enumerating. Data already written to the database "
+                "is intact. Run this under a supervisor (systemd 'Restart=always') so a "
+                "gateway recovers on its own — see MANUAL.md §4.6.",
+                file=sys.stderr,
+            )
+        else:
+            import traceback
+            # A SUPERVISOR IS STILL WANTED. IT JUST CANNOT FIX THIS.
+            #
+            # This text used to read "a supervisor will NOT help".
+            # Correct about the bug, wrong as operational advice, and
+            # the operator said why on 2026-11-15: after commissioning
+            # the server re-provisions the HMAC key, so the one a
+            # technician saw stops working and they have no SSH. "we
+            # don't want them to restart the gateway through its power
+            # button" either. A headless gateway that will not restart
+            # itself is a site visit.
+            #
+            # So: restart, and make the restart RATE the signal. Every
+            # start writes an interrogations row with
+            # reason='first_connect' AND a poller_lifecycle row carrying
+            # the reason the last run ended, and both of those tables are
+            # drained to the server. A burst of them is a crash loop and
+            # is visible without anyone logging in.
+            #
+            # THAT SENTENCE WAS FALSE UNTIL 2026-11-16, and it is worth
+            # saying why rather than just correcting it. The gate is not
+            # NEVER_DRAINED -- that holds one table, meters_current.
+            # drain_tables() ships a table if it has BOTH `id` and
+            # `synced_at`, discovered from the database rather than from
+            # a list, and neither of these two had synced_at. So the
+            # signal this paragraph promises never left the gateway, and
+            # a real crash loop ran for an hour with the server seeing
+            # nothing. Found by running the query that was meant to
+            # confirm the claim: `no such column: synced_at`.
+            #
+            # tests/test_handpay_queue_drain.py now asserts that what this
+            # comment promises is what drain_tables() delivers, in both
+            # directions, so the two cannot drift apart again.
+            print(
+                "\nTHIS IS A BUG IN THE POLLER, NOT A CABLE OR AN ADAPTER. The "
+                "serial port did not fail; this program raised an error it does "
+                "not handle, and data already written to the database is "
+                "intact.\n"
+                "A supervisor SHOULD restart this -- a headless gateway has no "
+                "one to do it by hand -- but it cannot fix the bug, so expect "
+                "the same crash again. What makes that visible is the restart "
+                "rate: each start writes an interrogations row that drains to "
+                "the server, so a crash loop shows up there as a burst of "
+                "first_connect. Use a start limit so it backs off instead of "
+                "thrashing the card.\n"
+                "The traceback below is the thing to report.",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
         return 3
     finally:
         # state.rte_enabled, NOT the startup-time rte_on: a run that enabled

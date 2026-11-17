@@ -288,8 +288,17 @@ def main() -> int:
             print("         nonrestricted, so promotional money paid by hand is")
             print("         unattributable here by design. What matters is that this")
             print("         figure STAYS STILL. If it grew since the last reading,")
-            print("         something new happened -- examples/capture_diff.py compares")
-            print("         two snapshots and reports exactly that.")
+            print("         something new happened.")
+            # capture_diff.py is a lab-only tool and the public mirror does
+            # not carry it, so naming it unconditionally sent a reader of
+            # the published tree after a file that is not there. Offered
+            # only where it exists.
+            if (Path(__file__).resolve().parent / "capture_diff.py").exists():
+                print("         examples/capture_diff.py compares two "
+                      "snapshots and reports exactly that.")
+            else:
+                print("         Compare this figure against your previous "
+                      "reading of the same meter.")
 
     print("\nOn the machine now")
     for label, code in CURRENT:

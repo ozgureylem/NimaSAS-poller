@@ -5,7 +5,7 @@
 #   sudo systemctl enable --now nimasas-poller
 #   journalctl -fu nimasas-poller
 #
-# PATHS HERE MATCH THE LAB GATEWAY AS IT IS: the repository in the nima-sas
+# PATHS HERE MATCH THE LAB GATEWAY AS IT IS: the repository in the nimasas
 # home directory, the config beside it, the system python3 (there is no venv
 # on that box -- pytest is not even installed). A floor install belongs in
 # /opt/nimasas with its database in /var/lib/nimasas; the three paths below
@@ -16,14 +16,16 @@
 # on 2026-11-01 a gateway reboot ended a soak exactly that way. A floor
 # gateway has nobody logged in to restart it.
 #
-# WHAT THIS UNIT IS NOT: it carries no --lab-ticket-authority. That file makes
-# a gateway an authority on what tickets are worth, which has no place on a
-# floor -- delete it and examples/ticket_lab_authority.py before a gateway
-# goes near one. See HANDOVER.md §9 item 8.
+# WHAT THIS UNIT IS NOT: it carries no ticket authority of its own, and
+# there is no longer a flag that would give it one -- --lab-ticket-authority
+# was removed on 2026-11-15 (MIGRATION-SPEC-AMENDMENTS A27). Historical note,
+# because the warning used to live here: that file made a gateway an
+# authority on what tickets are worth, which has no place on a floor. The
+# deletion it kept telling you to perform has been performed.
 
 [Unit]
 Description=NimaSAS gateway poller (SAS 6.02 host, meters + real time events)
-Documentation=file:/home/nima-sas/NimaSAS/MANUAL.md
+Documentation=file:/home/nimasas/NimaSAS/MANUAL.md
 # The serial port must exist before we open it. For a USB adapter use
 # dev-ttyUSB0.device, and prefer a udev SYMLINK so a re-enumeration cannot
 # silently point the gateway at a different cabinet (MANUAL.md §4.6).
@@ -34,17 +36,42 @@ Requires=local-fs.target
 
 [Service]
 Type=simple
-User=nima-sas
+User=nimasas
 # dialout owns the serial device on Debian. Without it the open fails with
 # EACCES, which reads like a missing port rather than a missing group.
 Group=dialout
 SupplementaryGroups=dialout
-WorkingDirectory=/home/nima-sas/NimaSAS
+WorkingDirectory=/home/nimasas/NimaSAS
 
-# --mode ring, NOT append. Append is the audit/stress setting and grows
-# meters_history without bound; ring caps it at a decoupled write cadence,
-# which is what the flash on a gateway micro-PC needs to survive years of
-# 7-second cycles (MANUAL.md §5.9). Use append for a soak, never for a floor.
+# --mode ring, NOT append. CONFIRMED by the operator 2026-11-16 after the
+# alternative was put to him, so this is a decision rather than a default.
+#
+# Ring caps meters_history at a decoupled write cadence -- one row every
+# --history-interval, not one per poll cycle -- which is what the flash on a
+# gateway micro-PC needs to survive years of 7-second cycles (MANUAL.md
+# §5.9). Append writes one row per CYCLE: 43,200 a day at --interval 2.0
+# against ring's 1,440.
+#
+# RING USED TO BE THE LOSSY CHOICE AND IS NOT ANY MORE. Its eviction deleted
+# the oldest rows by count whatever their synced_at, so a link down longer
+# than the ring holds -- 200 rows at 60s is about 3.3 hours -- silently
+# deleted meter history the server never received. Found by the server side
+# 2026-11-16 and fixed the same day: the eviction now skips rows with a NULL
+# synced_at. That is what made this a free choice rather than a trade of
+# disk against data loss.
+#
+# What it costs during an outage, since nothing is acknowledged and so
+# nothing is evicted:
+#
+#     offline      ring        append
+#      1 day       0.2 MB      7 MB
+#      7 days      1.6 MB     49 MB
+#     30 days      7.0 MB    210 MB
+#
+# Steady state with the link up and the drain running: about 33 KB.
+#
+# Use append for a soak, where every cycle's meters are the point. Never for
+# a floor.
 #
 # --min-poll-interval 0.2 is §2.3.3's own floor and the default. Do not lower
 # it: §12.2's 40ms relaxation buys nothing, because §12.3 delivers at most one
@@ -64,9 +91,9 @@ WorkingDirectory=/home/nima-sas/NimaSAS
 #
 # --no-drain-priority turns it off, and exists for measuring what the
 # deferral is worth. It does not belong on a floor gateway.
-ExecStart=/usr/bin/python3 /home/nima-sas/NimaSAS/examples/sql_poll_logger.py \
-    /home/nima-sas/gateway.ini \
-    --db /home/nima-sas/NimaSAS/gateway.sqlite3 \
+ExecStart=/usr/bin/python3 /home/nimasas/NimaSAS/examples/sql_poll_logger.py \
+    /home/nimasas/gateway.ini \
+    --db /home/nimasas/NimaSAS/gateway.sqlite3 \
     --rte \
     --mode ring \
     --min-poll-interval 0.2 \
@@ -84,13 +111,32 @@ ExecStart=/usr/bin/python3 /home/nima-sas/NimaSAS/examples/sql_poll_logger.py \
 # which the teardown catches (confirmed twice on 2026-11-01), so this only
 # matters after a hard kill. The leading '-' makes it advisory: if the port is
 # busy or the disable is itself pre-empted, the service still starts.
-ExecStartPre=-/usr/bin/python3 /home/nima-sas/NimaSAS/examples/exception_monitor.py /dev/ttyS0 --address 1 --disable-rte
+ExecStartPre=-/usr/bin/python3 /home/nimasas/NimaSAS/examples/exception_monitor.py /dev/ttyS0 --address 1 --disable-rte
 
 # SIGTERM is what the teardown listens for: it disables RTE, flushes the last
 # interleaved event, and closes the database. SIGKILL cannot be caught by
 # anything, so give the teardown room rather than letting systemd escalate.
 KillSignal=SIGTERM
 TimeoutStopSec=45
+
+# Type=notify, so "started" means the port is open and the config was
+# accepted -- not merely that the process exists. The poller sends READY=1
+# at that point and WATCHDOG=1 from its inner poll loop thereafter.
+#
+# WATCHDOGSEC CLOSES THE ONE FAILURE Restart= CANNOT SEE: a poller that is
+# alive, holding the serial port, and no longer polling. Restart= acts on a
+# process that EXITED. Operator, 2026-11-15: after commissioning the server
+# re-provisions the HMAC key, technicians lose SSH, "and we don't want them
+# to restart the gateway through its power button" -- so a wedged poller
+# that nothing restarts is a site visit.
+#
+# 60s is safe because the ping comes from every EXCHANGE, not every cycle.
+# A cycle legitimately runs tens of seconds (185s measured, and a
+# drain-priority sweep is routinely 10-20s), but a sweep IS exchanges, so a
+# healthy sweep keeps feeding the watchdog while a wedged poller does not.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 
 # Restart=always, and deliberately WITHOUT a start limit.
 #
@@ -105,8 +151,40 @@ TimeoutStopSec=45
 # loops every 10 seconds; the symptom is unmistakable in `journalctl -u
 # nimasas-poller`, and it prints its own reason each time.
 Restart=always
-RestartSec=10
+RestartSec=30
 StartLimitIntervalSec=0
+
+# RestartSec IS 30, NOT 10, and the difference is the SD card.
+#
+# The no-start-limit reasoning above is right and stands: a gateway that
+# gives up permanently at 3am is worse than one that retries. But the cost
+# line -- "the symptom is unmistakable in journalctl" -- assumes somebody
+# reads journalctl, and on a headless floor nobody does. A deterministic
+# crash at 10s is 360 starts an hour, each one a full interrogation
+# (identity, features, every game, ticket history) plus the rows it writes,
+# on a card whose binding constraint is flash write endurance.
+#
+# 30s keeps recovery inside a minute and cuts that by two thirds. True
+# exponential backoff would be better still -- RestartSteps and
+# RestartMaxDelaySec -- but those need systemd 254 and bookworm ships 252.
+#
+# The crash loop is not invisible either way: every start writes an
+# interrogations row with reason='first_connect' AND a poller_lifecycle row
+# carrying the reason the last run ended, and both tables are drained to the
+# server, so a burst of them is the signal the server watches for.
+#
+# THAT WAS NOT TRUE UNTIL 2026-11-16. Neither table had a synced_at column,
+# and drain_tables() ships a table only if it has both id and synced_at, so
+# the signal this paragraph relies on never left the gateway. A real crash
+# loop ran for about an hour that day with the server seeing nothing, which
+# is precisely the scenario RestartSec=30 above was traded against. Both
+# tables now carry the column. See docs/private/AGENT-BOARD.md and
+# HANDOVER.md §14p.
+#
+# poller_lifecycle is the better of the two and is why the line above names
+# it: a first_connect burst says only that something restarted; the
+# lifecycle row says what killed it ('signal 15', an exception repr) and the
+# argv it was running with.
 
 # The journal rotates; a redirected file does not, and an unattended gateway
 # that fills its partition with its own log loses the data the log was about.
@@ -119,13 +197,13 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 # ProtectHome=yes was here and is WRONG for this layout: it hides
-# /home/nima-sas, which is where the repository, the config and the database
+# /home/nimasas, which is where the repository, the config and the database
 # all live, so the service would fail to start with a file-not-found on its
 # own code. On a floor install under /opt and /var/lib, turn it back on --
 # that is the better arrangement and this line is the cost of not having it
 # yet.
 ProtectHome=no
-ReadWritePaths=/home/nima-sas/NimaSAS
+ReadWritePaths=/home/nimasas/NimaSAS
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes

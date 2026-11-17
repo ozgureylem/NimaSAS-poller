@@ -105,6 +105,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import datetime
 import json
 import sqlite3
 import sys
@@ -723,10 +724,41 @@ def check_meters(conn, events, since, until,
     # which is the only thing that actually settles it.
     edge_slack = {"games played": 1}
 
-    def compare(label, delta, from_events, note="", per_game=None):
+    def compare(label, delta, from_events, note="", per_game=None,
+                have_events=True):
+        """have_events=False means the EVENT side is empty, not zero.
+
+        A meter delta compared against "no events carried this field" is
+        not evidence of loss -- it is the absence of evidence, and
+        reporting it as FAIL is vacuous.
+
+        Measured 2026-11-13 over an 18h40m window the operator asked for.
+        The poller had run WITHOUT --rte throughout, so all 27,913 of its
+        game starts arrived as bare exceptions with no §12.5.3 payload.
+        Detectors 2, 5 and 6 each correctly reported NO DATA. This one
+        compared a 23,745-game meter delta against zero wager-bearing
+        starts, announced "949760 credits SHORT ... that is a game start
+        that did not arrive", and was the SOLE FAIL behind a headline of
+        "events were lost. At this polling rate this cabinet does NOT
+        retain every event". Detector 8, which counts bare exceptions too,
+        put the same window at 99.4% retained.
+
+        Note the asymmetry, because it is the whole fix: a BARE game start
+        still counts toward games_played, so that comparison survives
+        without RTE. Only the money and the anchored identity need the
+        payload.
+        """
         nonlocal verdict, checks
         if delta is None:
             lines.append(f"    {label}: meter not in this database")
+            return
+        if not have_events:
+            lines.append(f"    -- {label}: meters moved {delta}, but NO event "
+                         f"in this window carries the field to compare it "
+                         f"against. Not a loss finding -- this needs --rte "
+                         f"(§12.5 is what puts numbers in an exception; "
+                         f"ordinary polling gives the bare code). Detector 8 "
+                         f"counts game starts from every source.")
             return
         checks += 1
         diff = abs(delta - from_events)
@@ -761,13 +793,14 @@ def check_meters(conn, events, since, until,
     biggest_wager = max(wagers) if wagers else None
     biggest_win = max(wins) if wins else None
 
-    compare("games played", delta("games_played"), len(starts))
+    compare("games played", delta("games_played"), len(starts),
+            have_events=bool(starts))
     compare("coin in", delta("total_coin_in"), sum(wagers),
             f" (from {len(wagers)} wager-bearing starts)",
-            per_game=biggest_wager)
+            per_game=biggest_wager, have_events=bool(wagers))
     compare("total won", delta("c7_total_won_credits"), sum(wins),
             f" (from {len(wins)} win-bearing ends)",
-            per_game=biggest_win)
+            per_game=biggest_win, have_events=bool(wins))
 
     # ---------------------------------------------------------------- #
     # THE METER-ANCHORED WINDOW: the same question with no boundary left
@@ -806,6 +839,7 @@ def check_meters(conn, events, since, until,
     # is a boundary artefact and can be dismissed by arithmetic instead of
     # by argument, which is what this project has been doing by hand.
     anchored_exact = False
+    anchored_ran = False
     c_first = first.get("total_coin_in") if cols else None
     c_last = last.get("total_coin_in") if cols else None
     if c_first is None or c_last is None or c_last < c_first:
@@ -828,7 +862,15 @@ def check_meters(conn, events, since, until,
                          f"wagers for that reason alone")
         short = (c_last - c_first) - sum(anchored_wagers)
         anchored_exact = short == 0
-        if short == 0:
+        anchored_ran = bool(anchored)
+        if not anchored:
+            lines.append(f"      no game start in this coin-in range carries "
+                         f"a §12.5.3 payload, so the anchored identity has "
+                         f"nothing to telescope. NOT 'short by "
+                         f"{c_last - c_first}' -- there is simply nothing in "
+                         f"range to sum. Needs --rte.")
+            anchored_exact = False
+        elif short == 0:
             lines.append(f"      EXACT: {len(anchored)} game(s) in the meter "
                          f"range, wagers sum to {sum(anchored_wagers)} = the "
                          f"coin-in delta. Nothing is missing from the wager "
@@ -853,12 +895,32 @@ def check_meters(conn, events, since, until,
                 # to the credit -- the precise noise this was built to end.
                 anchored_exact = False
             if off:
+                # ANSWERED 2026-11-16, on the lab cabinet: games_played
+                # increments at game END, while total_coin_in increments at
+                # game START. Measured over 188 meter-read intervals where
+                # the start count and the end count differed -- 144 of them
+                # followed ENDS against 28 following STARTS. The query is in
+                # COMMANDS.md §10n and it validated 175/0 the other way on
+                # synthetic data built to the opposite rule, so it
+                # discriminates.
+                #
+                # This is CABINET BEHAVIOUR and not a SAS guarantee, so the
+                # wording below still names it as a check rather than a law.
+                # A new cabinet gets the query re-run before its edge counts
+                # are trusted.
+                direction = ("the window closed mid-game: its wager is in "
+                             "coin in and its completion is not"
+                             if off < 0 else
+                             "a game completed inside the window whose start "
+                             "fell before it")
                 lines.append(f"      games played: meter moved {gp}, "
                              f"{len(anchored)} game(s) in the meter range "
-                             f"({off:+}). Worth one bench check: whether this "
-                             f"cabinet increments games_played at game START "
-                             f"or at game END. If at END, the last game of "
-                             f"the window counts on one side only.")
+                             f"({off:+}). ONE is an edge, not a loss. On the "
+                             f"lab cabinet (measured 2026-11-16) coin in "
+                             f"increments at game START and games_played at "
+                             f"game END, so {direction}. Re-run COMMANDS.md "
+                             f"§10n on a cabinet whose edge counts you have "
+                             f"not checked.")
             else:
                 lines.append(f"      games played: meter moved {gp}, and "
                              f"{len(anchored)} game(s) fall in the meter "
@@ -954,10 +1016,14 @@ def check_meters(conn, events, since, until,
                 lines.extend(trend)
             compare("game ends (won + lost)", won_d + lost_d, len(ends),
                     f" (games won {won_d} + lost {lost_d})",
-                    per_game=per_cycle)
+                    per_game=per_cycle, have_events=bool(ends))
 
-    if anchored_exact and failed_labels and all(
-            lbl in ("games played", "coin in") for lbl in failed_labels):
+    # The anchored window is the authority whenever it closed, whether the
+    # timestamp path DISAGREED or was skipped for want of a payload. Both
+    # are the same situation from the reader's side: the smeared view says
+    # nothing useful and the meter range says nothing is missing.
+    if anchored_exact and (not checks or (failed_labels and all(
+            lbl in ("games played", "coin in") for lbl in failed_labels))):
         verdict = "PASS"
         lines.append("")
         lines.append(f"    VERDICT FROM THE ANCHORED WINDOW, not the smeared "
@@ -966,7 +1032,12 @@ def check_meters(conn, events, since, until,
                      f"range has no edge, and it closes exactly, so nothing "
                      f"is missing from the wager side.")
 
-    if not checks:
+    # The anchored identity is a result in its own right. When the
+    # timestamp window excludes every event -- the smeared case, where
+    # games arrive after the last meter reading -- `checks` is zero while
+    # the meter range still telescopes exactly. Returning NO DATA there
+    # throws away the only check that worked.
+    if not checks and not anchored_ran:
         return "NO DATA", lines
     if verdict == "PASS":
         lines.append("    the meters and the event stream agree")
@@ -1051,7 +1122,31 @@ def _meter_span(conn, since, until, columns):
             f"{' AND' if clause else ' WHERE'} {c} IS NOT NULL", params).fetchone()[0]
         out[c] = {"first": row[0], "first_at": row[1],
                   "last": last[0], "last_at": last[1], "rows": n,
-                  "delta": last[0] - row[0]}
+                  "delta": last[0] - row[0],
+                  # A CUMULATIVE METER THAT WENT BACKWARDS IS NOT A DELTA.
+                  #
+                  # SAS meters are fixed-width BCD: the core six are
+                  # payload[5:9] and friends, four bytes, so they roll at
+                  # 99,999,999. On 2026-11-15 the lab cabinet's
+                  # total_coin_in stood at 46,880,661 and the previous
+                  # 24 hours moved 1,126,260 -- about 47 days of headroom.
+                  # This is not hypothetical and it is not far off.
+                  #
+                  # Detector 8 subtracted first from last and compared the
+                  # results. Across a rollover that yields a large negative
+                  # number, which _containment_check would then dress up as
+                  # a DISAGREEMENT between paths -- a wrong answer wearing
+                  # a confident one's clothes.
+                  #
+                  # Flagged, not corrected. §8.2's rollover correction
+                  # prepends a generation digit on a confirmed drop, and
+                  # sql_poll_logger.py already warns that it must exclude
+                  # the meters which legitimately reset (a 13 -> 0 reset
+                  # becomes 100,000,000 permanently, since the corrected
+                  # value is monotonic forever). Choosing that policy is
+                  # not something to do inside a reconciler; saying the
+                  # number is unusable is.
+                  "went_backwards": last[0] < row[0]}
     return out, cols
 
 
@@ -1865,6 +1960,539 @@ def check_payout_identity(conn, events, since, until,
     return verdict, lines
 
 
+# The operator's identity, 2026-11-13: "games_won+games_lost is the proper
+# way to compare with total games played delta within given period of time."
+#
+# It is the strongest check available on a games count, and the reason is
+# the one thing every other comparison here lacks: all three meters of a
+# triplet are read IN THE SAME SWEEP, from the same row. There is no
+# cadence difference to allow for, no endpoints to align, nothing to
+# explain away. A path is checked against itself.
+#
+# Each entry must stay PURE -- one prefix, one long poll. _wonlost_trend
+# coalesces sm_/c7_/lp1c_ won against sm_/c7_ lost and compares the sum to
+# the CORE games_played, so it can mix three polls read seconds apart, and
+# the wobble it then reports as "sampling skew" may be an artifact of its
+# own construction rather than anything the cabinet did.
+GAMES_TRIPLETS = (
+    ("c7_games_played", "c7_games_won", "c7_games_lost", "Table C-7 sweep"),
+    ("sm_games_played", "sm_games_won", "sm_games_lost", "single-meter sweep"),
+)
+
+# Paths with no won/lost sibling. These can only be compared ACROSS paths,
+# which means allowing for cadence -- see _containment_check.
+GAMES_PLAYED_METERS = (
+    ("games_played", "core cycle meter, read EVERY cycle"),
+    ("c7_games_played", "Table C-7 extended sweep"),
+    ("sm_games_played", "single-meter sweep"),
+    ("lp19_games_played", "LP 0x19"),
+    ("lp1c_games_played", "LP 0x1C"),
+)
+
+COIN_IN_METERS = (
+    ("total_coin_in", "core cycle meter, read EVERY cycle"),
+    ("c7_total_coin_in_credits", "Table C-7 extended sweep"),
+    ("lp19_total_coin_in", "LP 0x19"),
+    ("lp1c_total_coin_in", "LP 0x1C"),
+    ("sm_total_coin_in", "single-meter sweep"),
+)
+
+# The paid side. Operator, 2026-11-13, leaving the cabinet on autoplay
+# overnight: "tomorrow i want to consolidate games played, total credits
+# bet, total won, meter values, everything."
+#
+# Kept SEPARATE from the win side on purpose, and not summed with it.
+# total_cancelled_credits and lp2d_total_hand_paid_cancelled_credits are
+# CASH-OUT meters: a jackpot that is awarded and then handpaid moves an
+# award meter AND one of these, so adding them double-counts it. Detector
+# 5 makes the same distinction and says why at length; this one only
+# compares each meter against its OWN twins across polls, which is a
+# different question and immune to that trap.
+COIN_OUT_METERS = (
+    ("total_coin_out", "core cycle meter, read EVERY cycle"),
+    ("c7_total_coin_out_credits", "Table C-7 extended sweep"),
+    ("lp19_total_coin_out", "LP 0x19"),
+    ("lp1c_total_coin_out", "LP 0x1C"),
+    ("sm_total_coin_out", "single-meter sweep"),
+)
+
+JACKPOT_METERS = (
+    ("total_jackpot", "core cycle meter, read EVERY cycle"),
+    ("c7_total_jackpot_credits", "Table C-7 extended sweep"),
+    ("lp19_total_jackpot", "LP 0x19"),
+    ("lp1c_total_jackpot", "LP 0x1C"),
+    ("sm_total_jackpot", "single-meter sweep"),
+)
+
+# Three reads of ONE quantity: credits cancelled off the meter, however
+# they left -- ticket or handpay.
+CANCELLED_METERS = (
+    ("total_cancelled_credits", "core cycle meter [CASH-OUT, not a win]"),
+    ("c7_total_cancelled_credits", "Table C-7 [CASH-OUT, not a win]"),
+    ("sm_total_cancelled_credits", "single-meter sweep [CASH-OUT]"),
+)
+
+# A DIFFERENT QUANTITY, AND MY BUG FOR GROUPING IT WITH THEM.
+#
+# LP 0x2D counts only the HAND PAID portion of cancelled credits. It is a
+# SUBSET of total_cancelled_credits, not another reading of it, and this
+# file already said so in LEDGER_MONEY_METERS: "total_cancelled_credits is
+# deliberately the ONLY cash-out term. It already covers a ticket-out and
+# a handpay both, so adding ticket_out_*_cents or lp2d_* beside it would
+# subtract the same money twice." I put them in one comparison group
+# anyway.
+#
+# The operator's overnight run then reported three DISAGREEMENTs that
+# were nothing of the kind:
+#
+#   total_cancelled_credits                 1,843,517
+#   c7_total_cancelled_credits              1,843,517
+#   sm_total_cancelled_credits              1,843,517
+#   lp2d_total_hand_paid_cancelled_credits    858,767
+#
+# The three agree exactly. The fourth is 858,767 -- the handpay from the
+# 2026-11-13 button-burst test, to the cent. It was right, and so were
+# they.
+#
+# Compared against its own kind, and checked against the superset as the
+# containment relationship it actually is.
+HAND_PAID_METERS = (
+    ("lp2d_total_hand_paid_cancelled_credits",
+     "LP 0x2D — the HANDPAID SUBSET of cancelled credits"),
+)
+
+
+def _stamp(ts: str) -> str:
+    """MM-DDTHH:MM:SS. Time alone is ambiguous on a window that spans
+    midnight -- a 24-hour day would print as "06:00:00-06:00:00"."""
+    return ts[5:19] if len(ts) >= 19 else ts
+
+
+def _triplet_identity(conn, since, until, played, won, lost, have):
+    """won + lost - played, per row and across the window, on ONE path.
+
+    Returns None when the path is not in this database or has too few
+    complete rows.
+
+    Two different things are measured and they must not be confused. The
+    PER-ROW gap can be a nonzero constant without anything being wrong: a
+    cabinet that counts a tie as neither won nor lost, or as both, carries
+    a fixed offset from whenever its meters were cleared. A constant
+    cancels in a subtraction, so it does not disturb the day's figures.
+
+    What must close is the DELTA identity over the window -- the operator's
+    own wording. If the per-row gap is constant the delta closes exactly;
+    if the gap drifts, the delta is the amount it drifted by, and that is a
+    real third category accumulating, not skew.
+    """
+    if not all(c in have for c in (played, won, lost)):
+        return None
+    where = [f"{played} IS NOT NULL", f"{won} IS NOT NULL", f"{lost} IS NOT NULL"]
+    params = []
+    if since:
+        where.append("polled_at >= ?")
+        params.append(since)
+    if until:
+        where.append("polled_at <= ?")
+        params.append(until)
+    try:
+        rows = conn.execute(
+            f"SELECT {played}, {won}, {lost}, polled_at FROM meters_history "
+            f"WHERE {' AND '.join(where)} ORDER BY id", params).fetchall()
+    except sqlite3.Error:
+        return None
+    if len(rows) < 2:
+        return None
+    gaps = [r[1] + r[2] - r[0] for r in rows]
+    first, last = rows[0], rows[-1]
+    # The gap's ENDPOINTS are what the delta identity sees. An excursion
+    # between them cancels. Measured on the lab cabinet 2026-11-13: the sm_
+    # triplet's gap touched +1 mid-window and came back to 0, with the
+    # identity still closing exactly -- because even inside ONE sweep the
+    # three meters are separate long polls read seconds apart, so a game
+    # ending between the won read and the played read shows a transient +1.
+    # Calling that "a real third category" sends the reader after nothing.
+    d_played = last[0] - first[0]
+    d_won = last[1] - first[1]
+    d_lost = last[2] - first[2]
+    return {
+        "rows": len(rows), "gaps": gaps,
+        "gap_min": min(gaps), "gap_max": max(gaps),
+        "gap_first": gaps[0], "gap_last": gaps[-1],
+        "excursion": max(gaps) - min(gaps),
+        "constant": min(gaps) == max(gaps),
+        "d_played": d_played, "d_won": d_won, "d_lost": d_lost,
+        "residual": (d_won + d_lost) - d_played,
+        "first_at": first[3], "last_at": last[3],
+    }
+
+
+def _containment_check(span, paths, label, lines):
+    """Compare deltas only where one path's window CONTAINS another's.
+
+    This is the difficulty of consolidating ACROSS paths, and the reason
+    the triplet identity above is the better instrument where it exists.
+    The paths run at different cadences, so their first and last readings
+    land at different moments: with the 2026-11-13 defaults c7_* reads
+    every cycle while sm_* reads every 1800 s, so sm_*'s window can start
+    half an hour late and end half an hour early. Its delta is then
+    SMALLER, and nothing is wrong.
+
+    A bare delta comparison therefore manufactures failures. What must hold
+    is an ordering: if path B's window sits inside path A's, B counted a
+    sub-interval of what A counted, so B's delta cannot exceed A's.
+    """
+    backwards = [(c, span[c]) for c, _ in paths
+                 if span.get(c) and span[c].get("went_backwards")]
+    for col, s in backwards:
+        lines.append(
+            f"  METER WENT BACKWARDS: {col} read {s['first']:,} at "
+            f"{_stamp(s['first_at'])} and {s['last']:,} at "
+            f"{_stamp(s['last_at'])}. A cumulative meter cannot fall, so "
+            f"this window spans a ROLLOVER (fixed-width BCD; the core "
+            f"meters are 4 bytes and roll at 99,999,999) or a RAM CLEAR. "
+            f"No delta is computed and no comparison below includes it -- "
+            f"narrow the window to one side of the event, and read "
+            f"machine_epochs for which it was.")
+    present = [(c, d) for c, d in paths
+               if span.get(c) and span[c].get("rows", 0) >= 2
+               and not span[c].get("went_backwards")]
+    if backwards and len(present) < 2:
+        return "FAIL", len(backwards)
+    if len(present) < 2:
+        return "INCONCLUSIVE", 0
+    bad = len(backwards)
+
+    # ONE CYCLE'S MOVEMENT IS NOT A CONTRADICTION.
+    #
+    # `polled_at` is ONE timestamp per meters_history row, but the meters
+    # in that row are read at different instants across the sweep. So two
+    # paths can share an endpoint to the microsecond while their actual
+    # reads are a whole cycle apart -- and on 2026-11-17 a cable-pull
+    # window had `max cycle interval 66.03s`.
+    #
+    # The old test demanded exact equality and said "Two reads of one
+    # quantity cannot both be right." They can: the quantity moved
+    # between them. That run flagged three disagreements, every one of
+    # them exactly ONE GAME (c7 251 vs lp19 250, lp19 250 vs lp1c 251,
+    # coin in 25,000 vs 25,100 = one game at 100), and failed detector 8
+    # on them. Every earlier window agreed exactly -- because their median
+    # cycle was 2.7s, not 66s.
+    #
+    # The same report contradicted itself twice in the process: the
+    # won+lost check next to it says "Three meters, three instants, same
+    # sweep" and "it oscillates around a constant, which is sampling
+    # skew". That check models the skew; this one called it impossible.
+    #
+    # TOLERANCE FROM THE DATA, NOT A CONSTANT. The densest path is read
+    # every cycle, so its movement per reading IS one cycle's movement --
+    # in the quantity's own units, so it scales from games to credits
+    # without a second rule. A sparse path's own rate would be far too
+    # generous (a path with two readings an hour would excuse an hour of
+    # play), which is why the densest one sets it.
+    #
+    # Operator, 2026-11-17: "fix detector 8's cross-path check with
+    # one-game tolerance".
+    densest = max(present, key=lambda cd: span[cd[0]].get("rows", 0))[0]
+    d_rows = max(1, span[densest].get("rows", 1) - 1)
+    per_cycle = max(1, abs(span[densest].get("delta") or 0) // d_rows)
+
+    for i, (ca, _) in enumerate(present):
+        for cb, _ in present[i + 1:]:
+            a, b = span[ca], span[cb]
+            a_in_b = b["first_at"] <= a["first_at"] and a["last_at"] <= b["last_at"]
+            b_in_a = a["first_at"] <= b["first_at"] and b["last_at"] <= a["last_at"]
+            if a_in_b and b_in_a and abs(a["delta"] - b["delta"]) > per_cycle:
+                bad += 1
+                lines.append(
+                    f"  DISAGREEMENT: {ca} and {cb} were read at the SAME "
+                    f"endpoints and disagree: {a['delta']} vs {b['delta']} "
+                    f"{label} — {abs(a['delta'] - b['delta'])} apart, more "
+                    f"than the {per_cycle} one cycle's sampling skew "
+                    f"explains. Two reads of one quantity cannot both be "
+                    f"right.")
+            elif a_in_b and b_in_a and a["delta"] != b["delta"]:
+                lines.append(
+                    f"  note: {ca} and {cb} differ by "
+                    f"{abs(a['delta'] - b['delta'])} {label}, within the "
+                    f"{per_cycle} one cycle's sampling skew explains. One "
+                    f"`polled_at` covers a whole sweep, so two meters in "
+                    f"one row are read at different instants; this is that "
+                    f"gap, not a contradiction.")
+            elif b_in_a and a["delta"] < b["delta"]:
+                bad += 1
+                lines.append(
+                    f"  DISAGREEMENT: {cb} counted {b['delta']} {label} over "
+                    f"{_stamp(b['first_at'])}-{_stamp(b['last_at'])}, but {ca} "
+                    f"counted only {a['delta']} over the WIDER window "
+                    f"{_stamp(a['first_at'])}-{_stamp(a['last_at'])}. A "
+                    f"sub-interval cannot hold more than the interval.")
+            elif a_in_b and b["delta"] < a["delta"]:
+                bad += 1
+                lines.append(
+                    f"  DISAGREEMENT: {ca} counted {a['delta']} {label} over "
+                    f"{_stamp(a['first_at'])}-{_stamp(a['last_at'])}, but {cb} "
+                    f"counted only {b['delta']} over the WIDER window "
+                    f"{_stamp(b['first_at'])}-{_stamp(b['last_at'])}. A "
+                    f"sub-interval cannot hold more than the interval.")
+    return ("FAIL" if bad else "PASS"), bad
+
+
+def check_games_consolidated(conn, events, since, until, boundaries=None):
+    """Detector 8: consolidate the window's games across every path.
+
+    Answers "how many games were played, and do the sources agree" -- not
+    detector 4's "does the event stream match the meters". The order is
+    deliberate: the within-path identity first, because it is the only one
+    with no cadence to allow for, then the cross-path deltas, then the RTE
+    count as a floor beneath both.
+    """
+    lines = []
+    have = {r[1] for r in conn.execute("PRAGMA table_info(meters_history)")}
+    # A bare exception from ordinary polling IS a game start. Only RTE adds
+    # §12.5.3's payload, so detectors 2, 4 and 5 can use RTE events alone --
+    # they need the numbers inside. But COUNTING games must use every
+    # source, or a window where RTE was off for part of the time reads as
+    # catastrophic loss. Measured 2026-11-13: a window whose meters counted
+    # 6,992 games carried 1,198 RTE starts and ~11,681 cycle/heartbeat
+    # events, which is 5,794 starts and their ends to within 0.8%. Nothing
+    # was lost; RTE was simply not enabled across 13 gateway restarts.
+    live = [e for e in events if e["source"] != "startup-backlog"]
+    starts = [e for e in live if e["code"] == GAME_START]
+    ends = [e for e in live if e["code"] == GAME_END]
+    rte_starts = [e for e in starts if e["source"] in RTE_SOURCES]
+    bare_starts = len(starts) - len(rte_starts)
+
+    verdict = "INCONCLUSIVE"
+    bad = 0
+
+    lines.append("WON + LOST = PLAYED, within each path (same sweep, same row):")
+    checked = 0
+    for played, won, lost, prov in GAMES_TRIPLETS:
+        r = _triplet_identity(conn, since, until, played, won, lost, have)
+        prefix = played.split("_games")[0]
+        if r is None:
+            lines.append(f"  {prefix:<5} not available in this database "
+                         f"(needs all three of {played}, {won}, {lost})")
+            continue
+        checked += 1
+        lines.append(
+            f"  {prefix:<5} {prov}: won {r['d_won']:,} + lost {r['d_lost']:,} "
+            f"= {r['d_won'] + r['d_lost']:,} against played {r['d_played']:,}")
+        if r["residual"] == 0:
+            lines.append(f"        IDENTITY CLOSES EXACTLY over "
+                         f"{_stamp(r['first_at'])}-{_stamp(r['last_at'])} "
+                         f"({r['rows']} complete readings)")
+            if verdict != "FAIL":
+                verdict = "PASS"
+        else:
+            bad += 1
+            verdict = "FAIL"
+            lines.append(f"        ** RESIDUAL {r['residual']:+,} games over "
+                         f"{_stamp(r['first_at'])}-{_stamp(r['last_at'])}. The "
+                         f"delta identity does NOT close.")
+        if r["constant"]:
+            if r["gap_min"]:
+                lines.append(f"        per-row gap is the CONSTANT "
+                             f"{r['gap_min']:+,} on all {r['rows']} readings, "
+                             f"which cancels in the delta -- a tie convention "
+                             f"or a cleared-meter offset, not today's problem")
+        elif r["residual"] == 0:
+            lines.append(f"        per-row gap wandered within "
+                         f"{r['gap_min']:+,}..{r['gap_max']:+,} across "
+                         f"{r['rows']} readings but STARTED AND ENDED at "
+                         f"{r['gap_first']:+,}, so it cancels. Even inside one "
+                         f"sweep the three meters are separate long polls read "
+                         f"seconds apart, so a game ending between two of them "
+                         f"shows a transient gap. Not a third category.")
+        else:
+            lines.append(f"        per-row gap went from {r['gap_first']:+,} to "
+                         f"{r['gap_last']:+,} (range {r['gap_min']:+,}.."
+                         f"{r['gap_max']:+,}) across {r['rows']} readings. The "
+                         f"ENDPOINTS differ, so it does not cancel: a real "
+                         f"third category accumulating, and it is exactly the "
+                         f"residual above.")
+    if not checked:
+        lines.append("  No path in this database carries all three meters, so "
+                     "the identity cannot be tested. Cross-path deltas below "
+                     "are the weaker fallback.")
+
+    cols = ([c for c, _ in GAMES_PLAYED_METERS]
+            + [c for c, _ in COIN_IN_METERS]
+            + [c for c, _ in COIN_OUT_METERS]
+            + [c for c, _ in JACKPOT_METERS]
+            + [c for c, _ in CANCELLED_METERS]
+            + [c for c, _ in HAND_PAID_METERS])
+    span, _present = _meter_span(conn, since, until, cols)
+
+    def table(paths):
+        rows = []
+        for col, prov in paths:
+            s = span.get(col)
+            if s is None:
+                rows.append(f"  {col:<28} not in this database")
+            elif s.get("rows", 0) < 2:
+                rows.append(f"  {col:<28} only {s.get('rows', 0)} reading(s) "
+                            f"in window -- no delta available")
+            elif s.get("went_backwards"):
+                rows.append(
+                    f"  {col:<28} {'BACKWARDS':>12}   "
+                    f"{_stamp(s['first_at'])}-{_stamp(s['last_at'])}  "
+                    f"({s['first']:,} -> {s['last']:,}; rollover or RAM "
+                    f"clear, see below)")
+            else:
+                rows.append(
+                    f"  {col:<28} {s['delta']:>12,}   "
+                    f"{_stamp(s['first_at'])}-{_stamp(s['last_at'])}  "
+                    f"({s['rows']} reads, {prov})")
+        return rows
+
+    lines.append("")
+    lines.append("GAMES PLAYED, across paths (cadence differs -- see note):")
+    lines.extend(table(GAMES_PLAYED_METERS))
+    # The operator read "of those, from RTE 0 -- the only ones carrying
+    # §12.5.3 numbers" and could not tell what it was claiming. Fair: the
+    # label described the category rather than what the number means for
+    # him. Say it as a split of one total, and say what each half is for.
+    lines.append(f"  {'0x7E game starts seen':<30} {len(starts):>12,}   "
+                 f"every source; a FLOOR, not a total")
+    lines.append(f"  {'  of those WITH numbers (RTE)':<30} "
+                 f"{len(rte_starts):>12,}   wager, coin-in, denom per game")
+    if bare_starts:
+        lines.append(f"  {'  of those BARE (no numbers)':<30} "
+                     f"{bare_starts:>12,}   real games, but only the code "
+                     f"0x7E")
+        lines.append(f"  {'':<30} {'':>12}   so detectors 2/4/5 have nothing "
+                     f"to add up")
+    lines.append(f"  {'0x7F game ends seen':<30} {len(ends):>12,}   "
+                 f"every source; a FLOOR, not a total")
+    gverdict, gbad = _containment_check(span, GAMES_PLAYED_METERS, "games", lines)
+
+    lines.append("")
+    lines.append("COIN IN (total credits bet), across meter paths:")
+    lines.extend(table(COIN_IN_METERS))
+    cverdict, cbad = _containment_check(span, COIN_IN_METERS, "coin in", lines)
+
+    extra_bad = 0
+    for paths, label, heading in (
+            (COIN_OUT_METERS, "coin out",
+             "COIN OUT (paid to the credit meter), across meter paths:"),
+            (JACKPOT_METERS, "jackpot",
+             "JACKPOT (attendant-paid, NOT in coin out), across meter paths:"),
+            (CANCELLED_METERS, "cancelled credits",
+             "CANCELLED CREDITS — a CASH-OUT meter, never added to the win "
+             "side:"),
+            (HAND_PAID_METERS, "hand paid",
+             "HAND PAID — a SUBSET of cancelled credits above, not another "
+             "reading of it:")):
+        lines.append("")
+        lines.append(heading)
+        lines.extend(table(paths))
+        v, b = _containment_check(span, paths, label, lines)
+        extra_bad += b
+        if v == "FAIL":
+            cverdict = "FAIL"
+    cbad += extra_bad
+
+    # THE RELATIONSHIP THAT DOES HOLD between those two groups: handpaid
+    # cancelled credits are part of cancelled credits, so the subset can
+    # never exceed the superset. That is a genuine invariant, unlike the
+    # equality the old grouping asserted.
+    sup = span.get("total_cancelled_credits")
+    sub = span.get("lp2d_total_hand_paid_cancelled_credits")
+    if sup and sub and sup.get("rows", 0) >= 2 and sub.get("rows", 0) >= 2:
+        lines.append("")
+        if sub["delta"] > sup["delta"]:
+            lines.append(
+                f"  DISAGREEMENT: hand paid {sub['delta']:,} exceeds total "
+                f"cancelled {sup['delta']:,}. The handpaid portion cannot be "
+                f"larger than everything cancelled.")
+            verdict = "FAIL"
+        else:
+            share = (100.0 * sub["delta"] / sup["delta"]) if sup["delta"] else 0.0
+            lines.append(
+                f"  of {sup['delta']:,} cancelled credits, {sub['delta']:,} "
+                f"({share:.1f}%) left as a HANDPAY and the rest as tickets. "
+                f"Subset within superset, as it must be.")
+
+    # The RTE stream can only ever UNDER-count: §2.2.1's queue is 20
+    # elements and a played machine fills it in about eight seconds of
+    # silence. So a start count ABOVE every meter delta is not "the meters
+    # are wrong", it is duplicate delivery -- detector 6's subject.
+    widest = max((span[c]["delta"] for c, _ in GAMES_PLAYED_METERS
+                  if span.get(c) and span[c].get("rows", 0) >= 2), default=None)
+    # A meter delta is last-minus-first, so it does NOT cover the play that
+    # produced the FIRST reading -- but events inside the window do. The
+    # floor can therefore exceed the delta by up to one cycle's play without
+    # anything being duplicated, which is the same edge detectors 4 and 5
+    # already allow for. Found by test 2026-11-13: a fixture at 10 games per
+    # cycle reported the floor 10 above the delta and the tool cried
+    # duplicates.
+    per_cycle = 1
+    for c, _ in GAMES_PLAYED_METERS:
+        s = span.get(c)
+        if s and s.get("rows", 0) >= 2 and s["delta"] == widest:
+            per_cycle = max(1, -(-s["delta"] // max(1, s["rows"] - 1)))
+            break
+    lines.append("")
+    if widest is None:
+        lines.append("  No meter path had two readings in this window, so the "
+                     "RTE count stands alone and nothing checks it.")
+    elif len(starts) > widest + per_cycle:
+        lines.append(f"  {len(starts)} game starts counted where the widest "
+                     f"meter window counted {widest} games, which is "
+                     f"{len(starts) - widest} more than the meters moved and "
+                     f"beyond the {per_cycle} one cycle's play can explain. "
+                     f"Events cannot be invented: suspect DUPLICATE delivery "
+                     f"and read detector 6, not the meters.")
+        verdict = "FAIL"
+    elif len(starts) > widest:
+        lines.append(f"  {len(starts)} game starts against a meter delta of "
+                     f"{widest}: {len(starts) - widest} more, within the "
+                     f"{per_cycle} one cycle's play explains. A meter delta is "
+                     f"last-minus-first and so omits the play behind its FIRST "
+                     f"reading, which the events inside the window still "
+                     f"carry. Not a duplicate.")
+    else:
+        missing = widest - len(starts)
+        pct = (100.0 * len(starts) / widest) if widest else 0.0
+        lines.append(f"  RTE saw {len(starts)} of {widest} games ({pct:.1f}%); "
+                     f"{missing} game start(s) not in the event stream.")
+        if missing:
+            lines.append("  That gap is the queue, the cadence, or a window "
+                         "edge -- a sweep lands mid-game, so a game or two at "
+                         "each boundary is ordinary. Detectors 1 and 2 are "
+                         "what say whether events were LOST.")
+        if bare_starts:
+            lines.append(f"  BEFORE READING ANY 'EVENTS WERE LOST' VERDICT: "
+                         f"{bare_starts:,} of those starts arrived WITHOUT an "
+                         f"RTE payload, so detectors 2, 4 and 5 could not see "
+                         f"them and will report them as missing. That is RTE "
+                         f"having been off, not the cabinet dropping events. "
+                         f"Re-run over a window where --rte ran throughout "
+                         f"before concluding anything about the queue.")
+    if ends and starts:
+        d = len(starts) - len(ends)
+        if d > 0:
+            why = "games started inside the window whose end fell outside it"
+        elif d < 0:
+            why = ("games whose START fell before the window opened -- the "
+                   "mirror case, equally ordinary at an edge")
+        else:
+            why = "every game that started also ended inside the window"
+        lines.append(f"  starts-minus-ends = {d:+d}: {why}.")
+
+    if (gbad or cbad) and verdict != "FAIL":
+        verdict = "FAIL"
+    elif verdict == "INCONCLUSIVE" and (gverdict == "PASS" or cverdict == "PASS"):
+        verdict = "PASS"
+    if verdict == "PASS" and not (bad or gbad or cbad):
+        lines.append("")
+        lines.append("  Every path that could be compared agrees, allowing for "
+                     "the cadence difference between them.")
+    return verdict, lines
+
+
 def poll_cadence(conn, since, until) -> list[str]:
     """What rate was actually achieved -- the claim's other half."""
     where, params = [], []
@@ -1930,18 +2558,75 @@ def legacy_cutoff(root=None) -> str | None:
     return None
 
 
+def _day_window(day: str | None, yesterday: bool, utc_offset: str,
+                day_start: str) -> tuple[str, str, str]:
+    """A LOCAL gaming day, as UTC bounds matching how the poller writes time.
+
+    The poller stores UTC (`datetime.now(timezone.utc).isoformat()`), so a
+    naive "yesterday" would cut the day at UTC midnight -- 18:00 the
+    previous evening in Belize, in the middle of trade. A casino day also
+    rarely starts at midnight; --day-start moves the cutoff.
+
+    Returned bounds are ISO strings with an explicit +00:00 offset, which
+    compares correctly against the stored timestamps: the stored form may
+    carry fractional seconds, and '.' sorts after '+', so a row exactly on
+    the upper cutoff falls outside it. That is what should happen -- it
+    belongs to the next day.
+    """
+    sign = 1 if utc_offset[0] != "-" else -1
+    oh, om = (int(x) for x in utc_offset.lstrip("+-").split(":"))
+    tz = datetime.timezone(sign * datetime.timedelta(hours=oh, minutes=om))
+    sh, sm = (int(x) for x in day_start.split(":"))
+    if yesterday:
+        d = (datetime.datetime.now(tz) - datetime.timedelta(days=1)).date()
+    else:
+        d = datetime.date.fromisoformat(day)
+    begin = datetime.datetime(d.year, d.month, d.day, sh, sm, tzinfo=tz)
+    finish = begin + datetime.timedelta(days=1)
+    utc = datetime.timezone.utc
+    label = (f"gaming day {d.isoformat()} {day_start} to "
+             f"{(d + datetime.timedelta(days=1)).isoformat()} {day_start} "
+             f"at UTC{utc_offset}")
+    return (begin.astimezone(utc).isoformat(),
+            finish.astimezone(utc).isoformat(), label)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("db")
     ap.add_argument("--since", help="ISO timestamp lower bound")
     ap.add_argument("--until", help="ISO timestamp upper bound")
+    ap.add_argument("--day", metavar="YYYY-MM-DD",
+                    help="consolidate ONE local gaming day. Sets --since and "
+                         "--until from --utc-offset and --day-start.")
+    ap.add_argument("--yesterday", action="store_true",
+                    help="--day for yesterday, in --utc-offset's zone")
+    ap.add_argument("--utc-offset", default="+00:00", metavar="+HH:MM",
+                    help="the floor's offset from UTC, e.g. -06:00 for "
+                         "Belize, -04:00 for Trinidad (default +00:00, i.e. "
+                         "a UTC day, which is NOT a trading day anywhere)")
+    ap.add_argument("--day-start", default="00:00", metavar="HH:MM",
+                    help="when the gaming day starts, local (default 00:00)")
     ap.add_argument("--all-history", action="store_true",
                     help="ignore LEGACY-CUTOFF and read the whole database. "
                          "Useful for archaeology; misleading as a headline, "
                          "because the totals then span every build this "
                          "database remembers.")
     args = ap.parse_args()
+
+    day_label = None
+    if args.day or args.yesterday:
+        if args.since or args.until:
+            print("--day/--yesterday set the window; do not also pass "
+                  "--since/--until.", file=sys.stderr)
+            return 2
+        try:
+            args.since, args.until, day_label = _day_window(
+                args.day, args.yesterday, args.utc_offset, args.day_start)
+        except (ValueError, IndexError) as exc:
+            print(f"Could not read that day: {exc}", file=sys.stderr)
+            return 2
 
     # The cutoff applies only when no explicit --since was given: a caller
     # who named a window meant that window.
@@ -1970,6 +2655,9 @@ def main() -> int:
 
     print("=" * 72)
     print(f"RTE reconciliation: {path}")
+    if day_label:
+        print(f"{day_label}")
+        print(f"  window {args.since} .. {args.until}")
     if cutoff_note:
         print(f"scoped to the LEGACY CUTOFF {cutoff_note} -- nothing before "
               f"it is deleted; --all-history reads the whole database")
@@ -2026,6 +2714,28 @@ def main() -> int:
     overflowed = any(e["code"] == BUFFER_OVERFLOW for e in rte
                      if e["source"] != "startup-backlog")
 
+    # Why loss happened, when the database can say. The operator,
+    # 2026-11-13: "Events were lost because last night the poller wasn't
+    # running a few times while we were pulling updates and starting the
+    # poller. The machine was on autoplay and of course buffer overflow was
+    # expected during the time poller wasn't running."
+    #
+    # He is right, and the headline was indicting the wrong thing. Events
+    # lost while NOTHING WAS LISTENING say nothing about the polling rate:
+    # §2.2.1 guarantees 20 queue elements, which an autoplaying machine
+    # fills in about eight seconds, so a poller that is down for a minute
+    # loses events at any rate whatsoever. Only loss recorded while polling
+    # was under way is evidence about the rate.
+    restarts_inside = [b for b in boundaries
+                       if (args.since is None or b >= args.since)
+                       and (args.until is None or b <= args.until)]
+    startup_overflow = any(e["code"] == BUFFER_OVERFLOW for e in rte
+                           if e["source"] == "startup-backlog")
+    bare_game_starts = sum(
+        1 for e in events
+        if e["code"] == GAME_START and e["source"] not in RTE_SOURCES)
+    downtime_explains = bool(restarts_inside) and not overflowed
+
     results = []
     failed_titles: list[str] = []
     for title, (verdict, lines) in (
@@ -2044,6 +2754,9 @@ def main() -> int:
                                overflowed=overflowed)),
         ("7. CREDIT LEDGER (credits - wagers + wins = credits, per interval)",
          check_credit_ledger(conn, rte, args.since, args.until, boundaries)),
+        ("8. GAMES CONSOLIDATED (won+lost=played per path, then across paths)",
+         check_games_consolidated(conn, events, args.since, args.until,
+                                  boundaries)),
     ):
         results.append(verdict)
         if verdict == "FAIL":
@@ -2075,6 +2788,29 @@ def main() -> int:
                   "detectors 2 and 6 separately -- they are different faults "
                   "with different causes, and one can mask the other in any "
                   "total.")
+        elif downtime_explains:
+            print("VERDICT: events were lost, and this window CANNOT say "
+                  "whether the polling rate was at fault.")
+            print(f"  The gateway restarted {len(restarts_inside)} time(s) "
+                  f"inside this window, and no buffer overflow was recorded "
+                  f"once polling was under way. Events lost while nothing was "
+                  f"listening are not evidence about the rate: \u00a72.2.1 "
+                  f"guarantees {SPEC_MIN_QUEUE} queue elements, which a played "
+                  f"machine fills in about eight seconds, so a poller that is "
+                  f"down for a minute loses events at ANY rate.")
+            if startup_overflow:
+                print("  The overflows in this database were drained at "
+                      "startup, i.e. the machine was played with no host "
+                      "collecting -- exactly what a restart looks like.")
+            if bare_game_starts:
+                print(f"  {bare_game_starts:,} game start(s) also arrived "
+                      f"WITHOUT an RTE payload, so detectors 2, 4 and 5 could "
+                      f"not use them and counted them as missing. Those games "
+                      f"are in the database; their numbers are not.")
+            print("  To test the RATE, re-run with --since/--until inside ONE "
+                  "uninterrupted run with --rte on throughout:")
+            print("    sqlite3 <db> \"SELECT started_at, reason FROM "
+                  "interrogations ORDER BY id\"")
         else:
             print("VERDICT: events were lost. At this polling rate this cabinet "
                   "does NOT retain every event.")

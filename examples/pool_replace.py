@@ -52,7 +52,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from examples.sql_poll_logger import open_gateway_db  # noqa: E402
+from examples.sql_poll_logger import (  # noqa: E402
+    DEFAULT_POOL_DEPTH_ALERT, POOL_FILLS_DDL, backfill_issue_seq,
+    next_issue_seq, open_gateway_db, pool_low_water, record_pool_fill)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -73,14 +75,28 @@ def migrate_pool_columns(conn: sqlite3.Connection) -> list[str]:
     if not cols:
         raise SystemExit("validation_pool does not exist in this database -- "
                          "run sql_poll_logger against it at least once first.")
+    # pool_fills may predate nothing at all: a database from before the
+    # depth alert scaled with the pool has no such table, and replace_pool
+    # writes to it. CREATE TABLE IF NOT EXISTS, from the one definition
+    # sql_poll_logger owns, so the three writers cannot disagree on shape.
+    conn.executescript(POOL_FILLS_DDL)
     added = []
+    # KEEP IN STEP WITH gateway/db.py's POOL_BATCH_COLUMNS; a test asserts
+    # the two lists match. They are separate because examples/ does not
+    # import gateway/.
     for name, decl in (("pool_epoch", "INTEGER"),
                        ("batch_uuid", "TEXT"),
-                       ("revoked_at", "TEXT")):
+                       ("revoked_at", "TEXT"),
+                       ("issue_seq", "INTEGER")):
         if name not in cols:
             conn.execute(f"ALTER TABLE validation_pool ADD COLUMN {name} {decl}")
             added.append(name)
-    if added:
+    # UNCONDITIONAL, not `if added`. The poller's own migration may have
+    # added issue_seq already, and a hand-inserted row can carry NULL at any
+    # time; a NULL issue_seq sorts LAST and would strand that number behind
+    # every number minted after it. The backfill is a no-op when nothing is
+    # NULL, so paying for one SELECT per run is the cheaper mistake.
+    if backfill_issue_seq(conn) or added:
         conn.commit()
     return added
 
@@ -147,6 +163,10 @@ def replace_pool(conn: sqlite3.Connection, count: int, *,
             "WHERE status = 'available'", (now,)).rowcount
         added = 0
         attempts = 0
+        # Minting order IS issue order. The numbers are random, so without
+        # issue_seq the assignment would fall back to validation_number and
+        # hand them out in numeric order -- the one order §11.2 forbids.
+        base_seq = next_issue_seq(conn) - 1
         while added < count:
             attempts += 1
             if attempts > count * 50:
@@ -157,18 +177,30 @@ def replace_pool(conn: sqlite3.Connection, count: int, *,
             try:
                 conn.execute(
                     "INSERT INTO validation_pool (validation_number, "
-                    "validation_system_id, status, issued_at, pool_epoch, batch_uuid) "
-                    "VALUES (?, ?, 'available', ?, ?, ?)",
-                    (number, validation_system_id, now, epoch, batch))
+                    "validation_system_id, status, issued_at, pool_epoch, "
+                    "batch_uuid, issue_seq) "
+                    "VALUES (?, ?, 'available', ?, ?, ?, ?)",
+                    (number, validation_system_id, now, epoch, batch,
+                     base_seq + added + 1))
             except sqlite3.IntegrityError:
                 continue  # collided with a number this gateway already holds
             added += 1
+        # Inside the transaction, before the COMMIT: the fills row and the
+        # numbers it describes are one event. This row is what the poller's
+        # depth alert takes its 20% of -- without it the alert silently
+        # falls back to the --pool-depth-alert floor, which on a 200-number
+        # pool is four hours of warning turned into twenty minutes.
+        size = record_pool_fill(conn, now, source="pool_replace",
+                                issued=added, revoked=revoked,
+                                pool_epoch=epoch, batch_uuid=batch)
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
         raise
     return {"revoked": revoked, "issued": added, "pool_epoch": epoch,
-            "batch_uuid": batch, "at": now}
+            "batch_uuid": batch, "at": now, "available_after": size,
+            "low_water": pool_low_water(conn, DEFAULT_POOL_DEPTH_ALERT)[0],
+            "issue_seq_from": base_seq + 1, "issue_seq_to": base_seq + added}
 
 
 def main() -> int:
@@ -246,7 +278,14 @@ def main() -> int:
     print(f"  issued  : {result['issued']} as epoch {result['pool_epoch']}")
     print(f"  batch   : {result['batch_uuid']}")
     print(f"  assigned rows left untouched: {after.get('assigned', 0)}")
+    print(f"  issue_seq : {result['issue_seq_from']}-{result['issue_seq_to']} "
+          "(the order the poller will hand them out in)")
     print(f"\n  pool now: " + ", ".join(f"{v} {k}" for k, v in sorted(after.items())))
+    # The fill is recorded, so say what it bought: the poller's depth alert
+    # now fires at 20% of this size, and an operator who sized the pool
+    # himself should be told where that lands before he walks away from it.
+    print(f"\n  pool size recorded: {result['available_after']} available\n"
+          f"  depth alert will fire below: {result['low_water']}")
     print("\nRevoked numbers stay in the table on purpose: they are the record "
           "that this gateway\never held them. Any number already dispensed stays "
           "redeemable regardless (§9.4).")

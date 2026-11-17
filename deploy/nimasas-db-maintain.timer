@@ -1,0 +1,22 @@
+# Runs nimasas-db-maintain.service every 12 hours (operator, 2026-11-15).
+#
+# 09:20 and 21:20 UTC are 03:20 and 15:20 in Belize. The times are a
+# convenience, not a requirement -- the job is built to run beside a busy
+# poller -- so change OnCalendar freely, but keep two runs a day: the
+# sizing of append mode assumes it. systemd reads the times in the
+# gateway's own zone unless the zone is written, which is why it is.
+#
+# Persistent=true: a gateway that was powered off at a run time does the
+# job when it next boots instead of skipping it.
+
+[Unit]
+Description=NimaSAS gateway database maintenance, every 12 hours
+
+[Timer]
+OnCalendar=*-*-* 09:20:00 UTC
+OnCalendar=*-*-* 21:20:00 UTC
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
