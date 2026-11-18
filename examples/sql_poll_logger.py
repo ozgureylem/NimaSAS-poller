@@ -291,7 +291,7 @@ from pathlib import Path
 # tries at a machine, and "pip install -e ." is an easy step to skip.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from saspy.config import connect_from_config
+from saspy.config import connect_from_config, load_config
 from saspy.constants import (
     AFT_TRANSFER_CODE_FULL_ONLY,
     HANDPAY_RESET_CODES,
@@ -705,6 +705,38 @@ CREATE TABLE IF NOT EXISTS machine_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_machine_events_at ON machine_events (occurred_at);
+
+-- THE SAS LINK, AS A GAUGE OF NOW. One row, replaced in place.
+--
+-- The heartbeat already reported egm_status.online, derived from how stale
+-- meters_current is. That conflates two situations the server must tell
+-- apart:
+--
+--   the poller is ALIVE and fighting to reopen the port (cable out)
+--   the poller is GONE and systemd is restarting it
+--
+-- Both leave meters_current stale, and they need different responses: the
+-- first is a cable somebody should look at, the second is a gateway that
+-- may not come back. Only the poller knows which, and until now it had
+-- nowhere to say so.
+--
+-- NO synced_at AND NO id, deliberately: drain_tables() ships a table only
+-- if it has both, so this cannot be drained as history. It is a gauge, and
+-- a gauge shipped as events would tell the server the link went down
+-- repeatedly when it went down once.
+--
+-- Written only on a STATE CHANGE, not every cycle. A floor gateway's
+-- binding constraint is flash write endurance, and in steady state this
+-- table is written once -- when the link first comes up.
+CREATE TABLE IF NOT EXISTS sas_link_status (
+    one INTEGER PRIMARY KEY CHECK (one = 1),
+    state TEXT NOT NULL,          -- 'up' | 'reconnecting' | 'down'
+    since TEXT NOT NULL,          -- when this state began
+    updated_at TEXT NOT NULL,
+    attempt INTEGER,              -- reconnect attempt, when reconnecting
+    max_attempts INTEGER,
+    detail TEXT
+);
 
 -- What a full interrogation found, on first connect and after a comms gap
 -- long enough for someone to have moved the cable.
@@ -7909,6 +7941,103 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# How many times a poller will reopen its own serial port before giving up
+# and letting the supervisor restart it. Not unlimited: a loop that never
+# ends is a gateway that never tells anyone, which is the one objection to
+# reconnecting that survives (MANUAL.md section 4.6).
+RECONNECT_MAX_ATTEMPTS = 10
+RECONNECT_BACKOFF_S = (1.0, 2.0, 5.0, 10.0, 30.0)
+
+
+
+def record_sas_link(conn, state: str, now: str, *, attempt=None,
+                    max_attempts=None, detail=None) -> None:
+    """Record the serial link's state, but ONLY WHEN IT CHANGES.
+
+    The server learns the link is healthy from the heartbeat, which reads
+    this row. Writing it every cycle would double the gateway's steady-state
+    write rate for a value that changes perhaps twice a week, on a device
+    whose binding constraint is flash endurance -- so a repeat of the same
+    state only refreshes updated_at, which is what proves the poller is
+    still alive and still of that opinion.
+
+    `since` is kept from the earlier row on a repeat, so the server can say
+    "the link has been down for four minutes" rather than "the link was
+    down as of a second ago".
+    """
+    try:
+        row = conn.execute(
+            "SELECT state, since FROM sas_link_status WHERE one = 1").fetchone()
+        since = row[1] if row and row[0] == state else now
+        conn.execute(
+            "INSERT INTO sas_link_status "
+            "(one, state, since, updated_at, attempt, max_attempts, detail) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(one) DO UPDATE SET state=excluded.state, "
+            "since=excluded.since, updated_at=excluded.updated_at, "
+            "attempt=excluded.attempt, max_attempts=excluded.max_attempts, "
+            "detail=excluded.detail",
+            (state, since, now, attempt, max_attempts, detail))
+        _safe_commit(conn, now)
+    except sqlite3.Error:
+        # Never let bookkeeping about the link stop the poller using it.
+        pass
+
+
+def reconnect_serial(config_path, args, conn, state, now_fn, attempt: int):
+    """Reopen the serial port by RE-READING THE CONFIG FILE. Returns a client.
+
+    WHY RE-READ RATHER THAN REOPEN THE HANDLE. This is the whole reason the
+    project refused a reconnect loop for months: a re-enumeration can change
+    the device name, and blindly reopening the old name could attach to a
+    DIFFERENT cabinet's adapter. Re-reading the config resolves the port by
+    name exactly as a supervisor restart would, so the loop is equivalent to
+    the restart it replaces rather than a shortcut around it.
+
+    Two further protections, neither of which existed when that decision was
+    taken:
+
+      * the caller sets force_identity_check, so the first cycle after a
+        reconnect re-reads the cabinet's identity and opens a
+        machine_changed epoch if it is not the same machine (operator's
+        2026-11-15 rule);
+      * the outage is RECORDED, so a cable that keeps falling out shows up
+        as a row somebody can count rather than as silence.
+
+    The operator, 2026-11-18, on the remaining objection: these floors do
+    not use USB adapters and do not reissue asset numbers, so the
+    device-renaming case this guarded against is not their failure mode --
+    while a headless gateway with no SSH that will not restart itself is a
+    site visit.
+    """
+    delay = RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)]
+    now = now_fn()
+    record_sas_link(conn, "reconnecting", now, attempt=attempt + 1,
+                    max_attempts=RECONNECT_MAX_ATTEMPTS,
+                    detail=f"serial port lost; retrying in {delay:.0f}s")
+    print(f"[{now}] serial port lost. Reconnect attempt "
+          f"{attempt + 1}/{RECONNECT_MAX_ATTEMPTS} in {delay:.0f}s "
+          f"(re-reading {config_path}, so the port is resolved by name).")
+    try:
+        conn.execute(
+            "INSERT INTO poll_errors (occurred_at, poll_name, error_type, message) "
+            "VALUES (?, ?, ?, ?)",
+            (now, "serial_port", "PortLost",
+             f"reconnect attempt {attempt + 1}/{RECONNECT_MAX_ATTEMPTS} after {delay:.0f}s"))
+        _safe_commit(conn, now)
+    except sqlite3.Error:
+        pass  # the database is not the reason to stop trying to come back
+    time.sleep(delay)
+    client = connect_from_config(config_path, min_poll_interval=args.min_poll_interval)
+    record_sas_link(conn, "up", now_fn(), detail="reopened after a port loss")
+    state.force_identity_check = True
+    state.force_identity_attempts = 0
+    print(f"[{now_fn()}] serial port reopened. Identity will be re-read before "
+          "anything is attributed to this cabinet.")
+    return client
+
+
+
 def main() -> int:
     # Line-buffer stdout. Python block-buffers it when it is not a terminal,
     # so under `nohup ... > soak.log` nothing appears until ~8KB has built up
@@ -7993,6 +8122,11 @@ def main() -> int:
     conn.executescript(SCHEMA)
     migrate_epoch_columns(conn)
     conn.commit()
+    # The port opened, so the link is up. Recorded once here rather than
+    # every cycle: the heartbeat pairs this with how stale meters_current is,
+    # and the PAIR is what separates "cable out, poller fighting" from
+    # "poller gone" -- two states that look identical from meter age alone.
+    record_sas_link(conn, "up", utc_now(), detail="port opened at startup")
 
     print(f"Polling {args.config} every {args.interval}s, writing to {args.db} (mode={args.mode}).")
     if args.mode == "ring":
@@ -8275,44 +8409,83 @@ def main() -> int:
         1.0 / state.normal_poll_interval if state.normal_poll_interval else 0.0)
 
     cycle = 0
+    reconnect_attempt = 0
+    # Read for the reconnect flag only; the client itself was built
+    # from this same file by connect_from_config() above.
+    cfg = load_config(args.config)
     try:
-        while args.cycles == 0 or cycle < args.cycles:
-            cycle += 1
-            poll_and_log(
-                client,
-                conn,
-                state,
-                history,
-                db_size_warning_mb=args.db_size_warning_mb,
-                full_meter_sweep=not args.skip_full_meter_sweep,
-                table_c7_sweep=not args.skip_table_c7_sweep,
-            table_c7_interval=args.table_c7_interval,
-                validation_meters_sweep=not args.skip_validation_meters_sweep,
-                full_meter_interval=args.full_meter_interval,
-                validation_meters_interval=args.validation_meters_interval,
-                c7_probation_minutes=args.c7_probation_minutes,
-                heartbeat_every=args.heartbeat_every,
-                credit_poll_every=args.credit_poll_every,
-                serve_host_requests=args.serve_host_requests,
-                allow_server_aft=args.allow_server_aft,
-                last_accepted_bill_poll=not args.skip_last_accepted_bill_poll,
-                interval=args.interval,
-                general_poll_retries=args.general_poll_retries,
-                pool_age_alert_hours=args.pool_age_alert_hours,
-                pool_depth_alert=args.pool_depth_alert,
-                rte=rte_on,
-                comms_gap_seconds=args.comms_gap_seconds,
-                drain_priority=args.drain_priority,
-                drain_fast_poll=args.drain_fast_poll,
-                drain_fast_poll_interval=args.drain_fast_poll_interval,
-                burst_preemptions=args.drain_burst_preemptions,
-                drain_fast_poll_fallback=args.drain_fast_poll_fallback,
-            )
-            # Under drain priority this is general polls, not sleep: the
-            # inter-cycle gap is the largest uninterrupted block of time in
-            # the loop, and during a burst it is the worst possible moment
-            # to stop collecting.
-            _drain_sleep(client, conn, state, args.interval, rte=rte_on)
+        # THE RECONNECT LOOP, nested INSIDE the existing try so the finally
+        # below still runs exactly once. Wrapping the whole block instead
+        # would close the port and the database on every reconnect, which
+        # is the opposite of the point.
+        while True:
+            try:
+                while args.cycles == 0 or cycle < args.cycles:
+                    cycle += 1
+                    poll_and_log(
+                        client,
+                        conn,
+                        state,
+                        history,
+                        db_size_warning_mb=args.db_size_warning_mb,
+                        full_meter_sweep=not args.skip_full_meter_sweep,
+                        table_c7_sweep=not args.skip_table_c7_sweep,
+                    table_c7_interval=args.table_c7_interval,
+                        validation_meters_sweep=not args.skip_validation_meters_sweep,
+                        full_meter_interval=args.full_meter_interval,
+                        validation_meters_interval=args.validation_meters_interval,
+                        c7_probation_minutes=args.c7_probation_minutes,
+                        heartbeat_every=args.heartbeat_every,
+                        credit_poll_every=args.credit_poll_every,
+                        serve_host_requests=args.serve_host_requests,
+                        allow_server_aft=args.allow_server_aft,
+                        last_accepted_bill_poll=not args.skip_last_accepted_bill_poll,
+                        interval=args.interval,
+                        general_poll_retries=args.general_poll_retries,
+                        pool_age_alert_hours=args.pool_age_alert_hours,
+                        pool_depth_alert=args.pool_depth_alert,
+                        rte=rte_on,
+                        comms_gap_seconds=args.comms_gap_seconds,
+                        drain_priority=args.drain_priority,
+                        drain_fast_poll=args.drain_fast_poll,
+                        drain_fast_poll_interval=args.drain_fast_poll_interval,
+                        burst_preemptions=args.drain_burst_preemptions,
+                        drain_fast_poll_fallback=args.drain_fast_poll_fallback,
+                    )
+                    # Under drain priority this is general polls, not sleep: the
+                    # inter-cycle gap is the largest uninterrupted block of time in
+                    # the loop, and during a burst it is the worst possible moment
+                    # to stop collecting.
+                    _drain_sleep(client, conn, state, args.interval, rte=rte_on)
+            except OSError as e:
+                # pyserial raises OSError when the adapter goes. A SASError
+                # is a poll that failed; this is the PORT failing, and it is
+                # the only exception worth reopening for.
+                if not (cfg.reconnect
+                        and reconnect_attempt < RECONNECT_MAX_ATTEMPTS):
+                    raise
+                try:
+                    client = reconnect_serial(args.config, args, conn, state,
+                                              utc_now, reconnect_attempt)
+                    reconnect_attempt = 0
+                except Exception:  # noqa: BLE001 - still gone; count and retry
+                    reconnect_attempt += 1
+                    if reconnect_attempt >= RECONNECT_MAX_ATTEMPTS:
+                        # SAY SO BEFORE EXITING. The client process keeps
+                        # running and keeps heartbeating, so this row is how
+                        # the server learns the cable is still out rather
+                        # than merely that this poller stopped writing.
+                        record_sas_link(
+                            conn, "down", utc_now(),
+                            attempt=RECONNECT_MAX_ATTEMPTS,
+                            max_attempts=RECONNECT_MAX_ATTEMPTS,
+                            detail="gave up reopening the port; supervisor restarting")
+                        print(f"[{utc_now()}] giving up after "
+                              f"{RECONNECT_MAX_ATTEMPTS} reconnect attempts; "
+                              "letting the supervisor restart from the config.")
+                        raise e from None
+                continue
+            break
     except KeyboardInterrupt as e:
         reason = f" ({e})" if str(e) else ""
         # "signal 15" when logind, a supervisor or soak_cycle.sh asked;

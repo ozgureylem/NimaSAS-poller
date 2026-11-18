@@ -497,6 +497,38 @@ def _optional(conn, sql: str):
     return row[0] if row else None
 
 
+
+def sas_link_status(conn: sqlite3.Connection) -> dict | None:
+    """What the poller last said about the serial link, with its own age.
+
+    None when the poller has never written the row -- an older gateway, or
+    one that has not started since the table was added. null says "this
+    gateway cannot tell you", which is honest; a default of "up" would be a
+    guess about the one thing being asked.
+    """
+    try:
+        row = conn.execute(
+            "SELECT state, since, updated_at, attempt, max_attempts, detail "
+            "FROM sas_link_status WHERE one = 1").fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    state, since, updated_at, attempt, max_attempts, detail = row
+    return {
+        "state": state,
+        "since": since,
+        # How long the poller has held this opinion, and how long since it
+        # last confirmed it. A large said_s_ago on state 'up' is the
+        # poller-is-gone case.
+        "for_s": _seconds_since(since),
+        "said_s_ago": _seconds_since(updated_at),
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "detail": detail,
+    }
+
+
 def build_heartbeat(conn: sqlite3.Connection, tables: list[str], db_path: str) -> dict:
     """§10.4 and Appendix B.3. Fields this gateway cannot yet measure are
     sent as null, never as a plausible-looking default: `last_poll_ms` and
@@ -530,6 +562,23 @@ def build_heartbeat(conn: sqlite3.Connection, tables: list[str], db_path: str) -
                 conn, "SELECT sas_version FROM machine_epochs "
                       "ORDER BY id DESC LIMIT 1"),
             "last_poll_ms": None, "headroom_pct": None},
+        # THE SERIAL LINK, AS THE POLLER SEES IT -- which is not the same
+        # question as egm_status.online above.
+        #
+        # online is derived from how stale meters_current is, and a stale
+        # meter table has two causes that need opposite responses: the
+        # cable is out and the poller is reopening it, or the poller itself
+        # is gone and systemd is restarting it. Pairing what the poller
+        # SAID about the link with how recently it WROTE separates them:
+        #
+        #   state 'up',           meters fresh  -> healthy
+        #   state 'reconnecting', meters stale  -> cable out, poller fighting
+        #   state 'up',           meters stale  -> poller gone or wedged
+        #   state 'down',         meters stale  -> poller gave up; supervisor
+        #
+        # This client process keeps heartbeating either way, so the server
+        # hears about a dead poller from a live client.
+        "sas_link": sas_link_status(conn),
         "disk_critical": disk_critical,
         "credit_meter": credits,
         # The cabinet this gateway is on NOW: the open machine epoch, with
@@ -677,10 +726,19 @@ class Link:
         # batch alone -- not from a heartbeat that may have described a
         # different cabinet by the time this backlog drains.
         named = {e.get("epoch_id") for e in events}
+        # The link state in the SAME frame as the data, for the same reason
+        # the epochs are. A PULL_INVITE is the moment the server is about to
+        # ACT on these rows, so it must be able to say "this batch came from
+        # a gateway whose cable was down" from the batch alone, without
+        # correlating against a heartbeat that arrived at some other second.
+        # It does NOT replace the heartbeat's copy: an invite only tells the
+        # server what it thought to ask, and a gateway that has gone quiet
+        # at 3am is exactly the case no pull ever reaches.
         self.send(MessageType.EVENT_BATCH,
                   {"invite_id": payload.get("invite_id"),
                    "db_instance_id": self.instance, "events": events,
-                   "epochs": [e for e in epochs if e["id"] in named]})
+                   "epochs": [e for e in epochs if e["id"] in named],
+                   "sas_link": sas_link_status(self.conn)})
 
     def on_validation_response(self, payload: dict) -> None:
         """Write the server's answer into the poller's question -- and only

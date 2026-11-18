@@ -377,6 +377,31 @@ Two further top-level fields †, not shown above:
 - `acked` — `{table: highest row id the server has acknowledged}`. This is
   how a server learns, with nobody telling it, that it has **lost** rows it
   once acknowledged (§2.4 below).
+- `sas_link` † — what the poller last said about the **serial link**, with
+  its own age. `null` when this gateway cannot tell you:
+
+  ```json
+  "sas_link": {"state": "reconnecting", "since": "2026-11-18T03:14:02+00:00",
+               "for_s": 94.2, "said_s_ago": 1.1,
+               "attempt": 4, "max_attempts": 10,
+               "detail": "serial port lost; retrying in 30s"}
+  ```
+
+  `state` is `up`, `reconnecting` or `down` (`down` = the reconnect loop
+  gave up). **Read it together with `said_s_ago`, never alone.**
+  `egm_status.online` cannot answer this question: it is derived from how
+  stale `meters_current` is, and a stale meter table has two causes needing
+  opposite responses —
+
+  | `state` | `said_s_ago` | reading |
+  |---|---|---|
+  | `up` | small | healthy |
+  | `reconnecting` / `down` | small | **the cable** — send someone to the cabinet |
+  | `up` | large | **the gateway** — the poller is gone; the state is its last word, not current |
+
+  `since` survives a repeated state, so an outage can be aged from it.
+  A gateway that has never written the gauge sends `null` rather than a
+  default of `up`, which would be a guess about the one thing being asked.
 
 The last four `pool_status` fields † are not in Appendix B.3 (amendment
 A25, accepted 2026-11-12). `used_24h` is what a refill is sized from;
@@ -417,6 +442,20 @@ object, minus `synced_at`. Each event also carries `epoch_id` †, and the
 batch carries `epochs` †: the full machine-epoch objects those events
 name, in the same shape as the heartbeat's `machine`. A server can
 therefore place every row on a cabinet from the batch alone.
+
+The batch also carries `sas_link` †, in the **same shape and from the same
+source** as the heartbeat's field above (so a server that parses one parses
+the other). A `PULL_INVITE` is the moment the server is about to act on
+these rows, so the link state travels with the data it describes rather
+than having to be correlated against a heartbeat from some other second.
+**This matters most when `events` is empty**: a cable that is out means
+there is nothing to drain, and an empty batch is otherwise
+indistinguishable from a quiet floor.
+
+It does **not** replace the heartbeat's copy. A pull only ever tells the
+server what it thought to ask; a gateway that has stopped answering is the
+case no pull reaches. Treat the heartbeat as the liveness signal and the
+batch field as provenance for that batch.
 
 **`0x04` ACK** (S→G) † — `{"acks": [{"db_instance_id", "table", "id"}]}`,
 sent only after the rows are committed.

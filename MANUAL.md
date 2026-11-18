@@ -214,6 +214,7 @@ port = /dev/ttyUSB0
 baudrate = 19200
 address = 1
 timeout = 1.0
+reconnect = 1
 
 [protocol]
 sas_version = 602
@@ -221,6 +222,10 @@ sas_version = 602
 [machine]
 serial_number = TROP-0042
 game_id = 01
+
+[server]
+ip = 10.20.0.5
+port = 7101
 ```
 
 `[connection]` is the only required section — `port` and `address` are
@@ -229,6 +234,23 @@ the only required keys within it; `baudrate` and `timeout` default to
 commissioning tool fills in as a record of what it found; nothing in
 `saspy` reads `[machine]` back programmatically — it's there for
 humans and for audit trail.
+
+`reconnect` **defaults to on**; set it to `0` only to restore the old
+behaviour of exiting for a supervisor to restart. See §4.6 for the loop
+itself and for what the server is told about the link. It is read from
+`[connection]`, and a copy in the wrong section is a silent misconfiguration
+of exactly the kind that costs a site visit — so if it is found in
+`[machine]` or `[protocol]` instead, it is **honoured anyway** and the
+loader prints a line telling you to move it. Values are `1/0`,
+`true/false` or `yes/no`; anything else is an error, not a false.
+
+`[server]` is where the gateway client finds the server, and it is
+**optional** — a poller with no server link does not need it, and a gateway
+that was given the address on the command line does not either. If you do
+fill it in, **fill in both keys**: `ip` without `port` and `port` without
+`ip` are both refused at load, in either direction, because half an address
+is not a usable default and a gateway that silently fell back to one would
+be worse than a gateway that would not start. `port` must be 1–65535.
 
 You can write this file by hand with any text editor if you'd rather
 not run the scanner — that's a fully supported path, not a fallback.
@@ -856,16 +878,79 @@ flexed, or the host power-saving the port. pyserial raises out of the
 read, which is not a `SASError`, so the poller treats it as fatal rather
 than as a failed poll and stops.
 
-**Why there is no built-in reconnect loop**, given that one would be a
-few lines: reopening the port automatically would paper over a physical
-fault that somebody should be told about, and — the part that actually
-decides it — a re-enumeration can change the device name. If
-`/dev/ttyUSB0` disappears and comes back as `/dev/ttyUSB1`, a blind
-reopen of `ttyUSB0` may attach to a *different machine's* adapter, and
-this program would then write one EGM's meters under another's identity.
-That is a data-integrity failure, and a quiet one. Exiting and letting a
-supervisor restart from the config file re-resolves the port by name
-every time, which is the behaviour you want.
+**The reconnect loop, and why it is on by default.** When the serial port
+fails mid-run — the adapter unplugged, power-saved, or a flaky cable — the
+poller reopens it itself. `[connection] reconnect = 0` turns that off and
+restores the old behaviour of exiting for a supervisor to restart.
+
+This project refused a reconnect loop for months, and the reasoning is
+worth keeping because it shaped how the loop works:
+
+- *Reopening the port papers over a physical fault somebody should be told
+  about.* Still true, and answered by making the loop **loud** rather than
+  by refusing to have one: every attempt prints, and every outage writes a
+  `poll_errors` row, so a cable that keeps falling out is a number somebody
+  can count instead of silence.
+- *A re-enumeration can change the device name, so reopening `ttyUSB0`
+  blindly might attach to a different machine's adapter.* Answered
+  directly: the loop **re-reads the config file** on every attempt, so the
+  port resolves by name exactly as a supervisor restart would. It is
+  equivalent to the restart it replaces, not a shortcut around it.
+- *A swapped cabinet would be logged under the wrong identity.* Answered
+  since 2026-11-15, before the loop existed: a reconnect forces an identity
+  read, and a cabinet that is not the one we were talking to opens a
+  `machine_changed` epoch (§5.12). The server is never told the same EGM
+  continued.
+
+Attempts are bounded (ten, with backoff to thirty seconds). After that the
+poller exits and lets the supervisor restart it, because a loop that never
+ends is a gateway that never tells anyone.
+
+Operator, 2026-11-18, on why the default flipped: these floors do not use
+USB adapters, and no asset number is used more than once on a floor — so
+the device-renaming case is not their failure mode, while a headless
+gateway with no SSH that will not restart itself is a site visit.
+
+**What the server is told about the link.** The poller keeps a one-row
+`sas_link_status` gauge, written **only when the state changes** so that
+`since` survives and an outage can be aged from it. The gateway client
+reports it to the server as `sas_link`, on **two** messages: every
+heartbeat, and every `EVENT_BATCH` answering a `PULL_INVITE`. The shape is
+in `SERVER-LINK.md`; `state` is `up`, `reconnecting` or `down`, where
+`down` means the loop used all ten attempts and gave up.
+
+Read it **with `said_s_ago`, never alone.** The field exists because
+`egm_status.online` cannot answer this question — that is derived from how
+stale `meters_current` is, and a stale meter table has two causes needing
+opposite responses:
+
+| `state` | `said_s_ago` | what it means |
+|---|---|---|
+| `up` | small | healthy |
+| `reconnecting` / `down` | small | **the cable** — send someone to the cabinet |
+| `up` | large | **the gateway** — the poller is gone; that state is its last word, not current news |
+
+A gateway that has never written the gauge sends `null`, not a default of
+`up`: a guess about the one thing being asked is worse than an admission.
+
+It is on the batch as well as the heartbeat because a `PULL_INVITE` is the
+moment the server is about to **act** on those rows, and it should not have
+to correlate them against a heartbeat from some other second. That matters
+most when `events` is empty — a cable that is out means there is nothing to
+drain, and an empty batch is otherwise indistinguishable from a quiet
+floor. It is **not** on the batch instead of the heartbeat: a pull only
+tells the server what it thought to ask, and a gateway that has stopped
+answering is the case no pull reaches. Treat the heartbeat as the liveness
+signal and the batch field as provenance for that batch.
+
+**What this does NOT do, stated plainly: it raises no alert.** `sas_link`
+is a field on two messages. When the loop exhausts its attempts and sets
+`state: "down"`, nothing is pushed to the alert channel — a server must
+read the field to notice. As far as any human is concerned the gateway
+gives up quietly, which is the opposite of the "loud" property the bullets
+above claim for the loop itself, and it is the one place that claim stops
+being true. A server implementation should treat `down`, and `up` with a
+large `said_s_ago`, as conditions to raise itself.
 
 Anything already committed to SQLite is safe across all of this; the
 database is closed cleanly on every exit path above.
