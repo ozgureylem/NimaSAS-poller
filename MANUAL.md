@@ -1141,8 +1141,16 @@ per call, each a transaction of a few milliseconds — and prunes in batches
 of 500 rows, stopping at 120 seconds with any remainder left for the next
 run. It reclaims **only what pruning has already released**, and retention
 keeps most of the database: 72 hours of `machine_events`, 30 days of
-everything else. So there is normally little to reclaim and the window is
-short.
+everything else.
+
+**At a 12-hour cadence that is a small amount of work.** Each run only
+reclaims the rows that crossed their window since the last one — twelve
+hours' worth, from 3 days ago for the events and from 30 days ago for the
+rest — so the freed page count is small and the run should finish in
+seconds. **This has not been timed on gateway hardware**, so treat "seconds"
+as the expectation to confirm on the first unit rather than a figure to
+design a window around; `db_maintain.py status` reports the freelist the
+next run would return, which is the number to watch.
 
 **`enable-auto-vacuum` is the exception, and it is not a scheduled job.** One
 full `VACUUM`, once per database, rewriting the whole file: on a 32-bit
@@ -1183,9 +1191,32 @@ one scheduled run did not prune it** — the extra hour covers the timer's
 Anything less would fire on a run that has simply not come round yet.
 
 **Each table is measured against its own window**, because they do not grow
-alike: `machine_events` is the fast one and keeps 72 hours, everything else
-keeps 30 days for disaster recovery. A single threshold would either
-complain constantly about the ticket tables or never fire on the events.
+alike. A single threshold would either complain constantly about the ticket
+tables or never fire on the events, so there is one age per type:
+
+| table | retention | warns after |
+|---|---|---|
+| `machine_events` | 72 h — the fast one | **85 h** |
+| `ticket_out_history`, `ticket_in_completions`, `aft_completions`, `handpays` | 720 h (30 days, for disaster recovery) | **733 h** |
+
+**Meters are not on this schedule at all, and the assumption that they are
+is worth correcting.** `meters_history` has no `synced_at` — meter rows do
+not drain to the server yet — so the acknowledge-then-delete rule §6.4
+prunes on cannot apply to it. It is in `NEVER_PRUNED`, so **no retention
+figure applies and this warning can never fire for it.**
+
+What bounds it is the **ring, not time**:
+
+| mode | `meters_history` |
+|---|---|
+| `--mode ring` (the floor default) | capped at `--history-cap` rows, 200 by default, written at most every `--history-interval` seconds |
+| `--mode append` | **bounded by nothing.** It grows for as long as the poller runs |
+
+So a gateway left in `--mode append` fills up without any alert in this
+section saying so — the pruner is not failing, there is simply nothing it is
+allowed to delete. `--db-size-warning-mb` is the only thing that speaks up,
+and it speaks about the file, not about a table. Append mode is a lab choice
+for keeping a whole soak for analysis; a floor gateway wants `ring`.
 
 Two things it deliberately does not do. It is **silent when pruning is off**
 — with no `--prune-acked` nothing is deleted by design, so every old row
