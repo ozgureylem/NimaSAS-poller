@@ -1182,12 +1182,52 @@ two are easy to confuse:
 | overdue past retention + 13 h | is the **pruner** failing? | rows the server took, whose window has expired, still on disk |
 
 A gateway can be perfectly drained and still fill up, which is why both
-exist. **Only eligible data counts here**: a row is eligible once the server
-has acknowledged it and its window has passed. An undrained row is never
-eligible — §6.4 forbids deleting it, so the pruner leaving it alone is
-correct behaviour, not a fault, and it is already reported at 48 hours by
-the alert above. This warning means one thing only: *data the vacuum was
-allowed to remove is still here.* **Nothing else warrants a warning.**
+exist.
+
+**Eligibility here is about age, not about drain status.** Past 72 hours a
+`machine_events` row can be removed; the job runs every 12 hours; so the
+oldest surviving row should be about 84 hours at worst, allowing for a run
+delayed while it waits for zero credits. **Still there at 85 and something
+is wrong** — and from the disk's point of view it does not matter *why*.
+So the line names both causes separately, because they have different fixes:
+
+```
+ALERT: machine_events still holds ACKNOWLEDGED rows 14h past its 72h
+retention. ... at least one scheduled run did not prune them
+
+ALERT: machine_events still holds UNDRAINED rows 31h past its 72h
+retention. These cannot be pruned -- §6.4 keeps an unacknowledged row
+whatever its age -- so this is the DRAIN failing, not the pruner.
+```
+
+An undrained row is **not** the pruner's to delete and never will be, so
+the pruner leaving it is correct. It fills the disk all the same, and
+nothing will reclaim it until the server takes it. One merged line would
+send somebody to the timer when the drain is down, or the reverse.
+**Nothing other than these two warrants a warning.**
+
+**Two different clocks, and the asymmetry is deliberate.** An undrained row
+has no `synced_at` to measure from, so it is measured from **when it
+happened**. An acknowledged row is measured from **the acknowledgement**,
+because that is when its retention window starts: the gateway is the
+server's backup of last resort, so it holds a row for 30 days from the
+moment the server took responsibility for it, not from when the cabinet
+produced it.
+
+One consequence worth knowing, because it is the only place the age model
+and the code's rule part company: **a row drained very late is kept longer
+than its own age suggests.** A ticket that printed 40 days ago but was only
+acknowledged yesterday is kept another 30 days from the acknowledgement, and
+is not reported as overdue. That is the safe direction for a backup — the
+server has only just become responsible for it — but if the intent is that
+nothing survives 733 hours of *its own age* regardless of when it drained,
+that is a different rule and this is where it would change.
+
+**A gateway that has never drained anything says nothing about undrained
+rows.** Without a server link every row is undrained forever, by design, so
+the warning would fire on every run of every bench gateway — which is how a
+warning gets ignored. `--db-size-warning-mb` is what speaks about that
+machine's disk.
 
 #### Why this one is not in the same class as the pool-age alert
 

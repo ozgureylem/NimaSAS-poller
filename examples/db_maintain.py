@@ -234,35 +234,89 @@ def _when_column(conn: sqlite3.Connection, table: str) -> str | None:
 
 # --- pruning (§6.4) ----------------------------------------------------------
 
+def _has_ever_drained(conn: sqlite3.Connection, tables) -> bool:
+    """Has this gateway ever had a server link? Judged by evidence -- a row
+    that was once acknowledged -- not by a flag.
+
+    Without a link every row is undrained forever, BY DESIGN, so the
+    undrained half of `retention_overdue` would fire on every run of every
+    lab gateway. That is how a warning gets ignored. A gateway that has
+    never drained anything is a commissioning state or a bench tool;
+    --db-size-warning-mb is what speaks about its disk.
+    """
+    return any(conn.execute(
+        f'SELECT 1 FROM "{t}" WHERE synced_at IS NOT NULL LIMIT 1').fetchone()
+        for t in tables)
+
+
 def retention_overdue(conn: sqlite3.Connection,
                       grace_hours: float = RETENTION_OVERDUE_GRACE_HOURS,
-                      *, now: str | None = None) -> dict[str, float]:
-    """Acknowledged rows still present past their retention, per table.
+                      *, now: str | None = None) -> dict[str, dict[str, float]]:
+    """Rows past their retention window that are still on the disk, per
+    table, split by WHY they are still here.
 
-    Returns {table: hours the OLDEST such row is past its window}, so the
-    line this feeds can say how far behind the pruner is rather than only
-    that it is. Retention is per table -- `machine_events` gets 72 hours
-    because it grows fastest, everything else 30 days for disaster
-    recovery -- so each table is measured against its own window.
+        {"machine_events": {"unpruned": 14.2, "undrained": 31.0}}
 
-    MEASURED FROM synced_at, exactly as `prune_acked` deletes, so this
-    cannot report a row the pruner would not have taken. And `datetime()`
-    on both sides for the reason spelled out there: synced_at carries a 'T'
-    and an offset, SQLite's datetime() does not, and a raw string compare
-    is lexicographic -- 'T' beats a space, and this repository has already
-    found one "24-hour" window that was 48 hours wide because of it.
+    Both numbers are hours past the window. A table appears only if at
+    least one of them does. The split is not cosmetic: the two have
+    different causes and different fixes, and one line that merged them
+    would send somebody to the wrong one.
+
+      unpruned   acknowledged, window expired, NOT DELETED. The pruner
+                 should have taken it. Measured from synced_at, exactly as
+                 `prune_acked` deletes, so this can never report a row the
+                 pruner would have left alone.
+
+      undrained  never acknowledged and older than the window. The pruner
+                 is RIGHT to leave it -- §6.4 forbids deleting an
+                 unacknowledged row, whatever its age -- so this is a drain
+                 fault, not a pruner fault. But it fills the disk exactly
+                 the same, and from the disk's point of view the reason
+                 does not matter, which is why it is reported here as well
+                 as by the 48-hour alert.
+
+    TWO DIFFERENT CLOCKS, and the asymmetry is deliberate. An undrained row
+    has no synced_at to measure from, so its age is its own -- the column
+    `_when_column` finds. An acknowledged row is measured from the
+    acknowledgement, because that is when the retention window starts: the
+    gateway is the server's backup of last resort, so it holds a row for 30
+    days from the moment the server took responsibility for it, not from
+    when the cabinet produced it. A row drained late is therefore kept
+    longer than its nominal age, never shorter.
+
+    `datetime()` on both sides throughout, for the reason `prune_acked`
+    spells out: synced_at carries a 'T' and an offset, SQLite's datetime()
+    does not, and a raw string compare is lexicographic.
     """
     now = now or utc_now()
-    out: dict[str, float] = {}
-    for table in prunable_tables(conn):
-        keep = retention_hours(table) + float(grace_hours)
+    tables = prunable_tables(conn)
+    linked = _has_ever_drained(conn, tables)
+    out: dict[str, dict[str, float]] = {}
+    for table in tables:
+        keep = retention_hours(table)
+        cutoff = keep + float(grace_hours)
+        found: dict[str, float] = {}
+
         row = conn.execute(
             f'SELECT (julianday(?) - julianday(MIN(datetime(synced_at)))) * 24.0 '
             f'FROM "{table}" WHERE synced_at IS NOT NULL AND '
             f'datetime(synced_at) <= datetime(?, ?)',
-            (now, now, f"-{keep} hours")).fetchone()
+            (now, now, f"-{cutoff} hours")).fetchone()
         if row and row[0] is not None:
-            out[table] = float(row[0]) - retention_hours(table)
+            found["unpruned"] = float(row[0]) - keep
+
+        when = _when_column(conn, table)
+        if linked and when is not None:
+            row = conn.execute(
+                f'SELECT (julianday(?) - julianday(MIN(datetime("{when}")))) '
+                f'* 24.0 FROM "{table}" WHERE synced_at IS NULL AND '
+                f'"{when}" IS NOT NULL AND datetime("{when}") <= datetime(?, ?)',
+                (now, now, f"-{cutoff} hours")).fetchone()
+            if row and row[0] is not None:
+                found["undrained"] = float(row[0]) - keep
+
+        if found:
+            out[table] = found
     return out
 
 
@@ -527,12 +581,21 @@ def cmd_run(args) -> int:
         # either the timer not firing or a run that cannot finish.
         behind = retention_overdue(conn)
         for table, over in sorted(behind.items()):
-            log(f"ALERT: {table} still holds acknowledged rows "
-                f"{over:.0f}h past its {retention_hours(table):g}h retention. "
-                f"More than {RETENTION_OVERDUE_GRACE_HOURS:g}h over means at "
-                "least one scheduled run did not prune them: check the timer "
-                "fired, and that a run is not hitting its time limit with "
-                "work left.")
+            keep = retention_hours(table)
+            grace = RETENTION_OVERDUE_GRACE_HOURS
+            if "unpruned" in over:
+                log(f"ALERT: {table} still holds ACKNOWLEDGED rows "
+                    f"{over['unpruned']:.0f}h past its {keep:g}h retention. "
+                    f"More than {grace:g}h over means at least one scheduled "
+                    "run did not prune them: check the timer fired, and that "
+                    "a run is not hitting its time limit with work left.")
+            if "undrained" in over:
+                log(f"ALERT: {table} still holds UNDRAINED rows "
+                    f"{over['undrained']:.0f}h past its {keep:g}h retention. "
+                    "These cannot be pruned -- §6.4 keeps an unacknowledged "
+                    "row whatever its age -- so this is the DRAIN failing, "
+                    "not the pruner. They occupy the disk all the same, and "
+                    "nothing will reclaim them until the server takes them.")
     else:
         log("pruning is off (no --prune-acked); nothing is deleted")
 
