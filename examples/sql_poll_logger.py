@@ -7311,27 +7311,37 @@ def poll_and_log(
             # for weeks grows at the append rate. db_maintain reports the
             # row count; --db-size-warning-mb is the backstop.
             #
-            # A gateway with no server link at all has no synced_at on any
-            # row, so this would never evict anything and the ring would
-            # stop capping. That is not the floor configuration -- the floor
-            # has a link -- but it IS the bench, so the unlinked case keeps
-            # the old behaviour deliberately.
-            linked = conn.execute(
-                "SELECT COUNT(*) FROM meters_history "
-                "WHERE synced_at IS NOT NULL").fetchone()[0]
-            if linked:
-                conn.execute(
-                    "DELETE FROM meters_history WHERE synced_at IS NOT NULL "
-                    "AND id NOT IN (SELECT id FROM meters_history "
-                    "ORDER BY id DESC LIMIT ?)",
-                    (history.cap,),
-                )
-            else:
-                conn.execute(
-                    "DELETE FROM meters_history WHERE id NOT IN "
-                    "(SELECT id FROM meters_history ORDER BY id DESC LIMIT ?)",
-                    (history.cap,),
-                )
+            # THE SENTENCE ABOVE WAS A PROMISE THE CODE DID NOT KEEP, until
+            # 2026-11-18. There used to be an `else` here: when NO row was
+            # acknowledged it fell back to evicting by count, whatever the
+            # synced_at. The intent was the bench, where nothing is ever
+            # acknowledged -- but an outage DEGENERATES INTO THAT CASE. The
+            # statement below deletes the acknowledged rows outside the
+            # newest `cap`, and during an outage the newest `cap` rows are
+            # all unacknowledged, so every acknowledged row goes, the count
+            # of acknowledged rows reaches zero, and the fallback took over
+            # and deleted the unacknowledged ones. Simulated at cap=3:
+            #
+            #   outage cycle 1-3: protected, unacked 1 -> 2 -> 3
+            #   outage cycle 4+:  fallback, unacked rows deleted
+            #
+            # So the protection lasted `cap` cycles -- about three hours at
+            # the defaults -- and then did the one thing it existed to
+            # prevent. The test that should have caught it ran ONE cycle.
+            #
+            # The operator chose the promise over the fallback on 2026-11-18
+            # ("Grow through an outage"), so there is now one rule and no
+            # fallback: AN UNACKNOWLEDGED ROW IS NEVER DELETED HERE. The
+            # cost lands on the bench, where nothing is ever acknowledged
+            # and the ring therefore never caps at all. That is said out
+            # loud at startup rather than left to be discovered.
+            conn.execute(
+                "DELETE FROM meters_history WHERE synced_at IS NOT NULL "
+                "AND id NOT IN (SELECT id FROM meters_history "
+                "ORDER BY id DESC LIMIT ?)",
+                (history.cap,),
+            )
+
     _safe_commit(conn, now)
     state.last_meters = values
 
@@ -8167,6 +8177,12 @@ def main() -> int:
             f"  meters_history: capped at {args.history_cap} rows, written every {args.history_interval}s, "
             f"or every cycle for {args.burst_count} poll(s) after a meter decrease or failed poll."
         )
+        print("  the ring is a SOFT cap: it only evicts rows the server has "
+              "acknowledged, so it grows at the append rate through a server "
+              "outage, and on a gateway with no server at all it never caps. "
+              "That is deliberate -- disk is recoverable and a deleted "
+              "unacknowledged row is not -- and --db-size-warning-mb is the "
+              "backstop.")
     else:
         print("  meters_history: written every cycle. It DRAINS to the server "
               "and db_maintain prunes it 72 hours after the server "

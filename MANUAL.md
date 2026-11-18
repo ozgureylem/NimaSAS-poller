@@ -650,6 +650,30 @@ overwritten with the latest values from all of them, unconditionally,
 every cycle. Whether that cycle *also* writes a new row to
 `meters_history` depends on the mode:
 
+**The ring is a soft cap, and since 2026-11-18 it is soft in one more way.**
+It evicts **only rows the server has acknowledged** — never one the server
+has not seen, because *disk is recoverable and a deleted unacknowledged row
+is not.* Two consequences follow, and the second is new:
+
+- **Through a server outage the ring stops capping** and the table grows at
+  the append rate until the link returns.
+- **On a gateway whose rows are never acknowledged the ring never caps at
+  all.** That includes a poller run on its own, without
+  `python3 -m gateway.client` draining beside it — the ordinary lab and
+  commissioning state. There, `--mode ring` behaves like `--mode append`.
+
+There used to be a fallback for exactly that case: with no acknowledged row
+anywhere, it evicted by count instead. It was removed because **an outage
+degenerated into that case, and the fallback then deleted the very rows the
+rule exists to protect.** The eviction deletes acknowledged rows outside the
+newest `cap`; during an outage the newest `cap` rows are all unacknowledged,
+so every acknowledged row goes, none are left, and the fallback took over.
+The protection lasted `cap` cycles — about three hours at the defaults.
+
+The poller states this at startup in ring mode. `--db-size-warning-mb` is
+the backstop, and `db_maintain.py status` reports the row count.
+
+
 - In `append` mode, always.
 - In `ring` mode, only if: this is the first poll ever, or
   `--history-interval` seconds have passed since the last history
