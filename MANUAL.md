@@ -1040,10 +1040,12 @@ Two things to know before expecting the file to shrink:
   acknowledged is **never deleted**, whatever its age. It is off on the
   command line and on in the timer's unit.
 
-  `meters_history` is **not** pruned, because the server does not receive
-  meter rows yet and the gateway holds the only copy. In `--mode ring`
-  that table caps itself. In `--mode append` it grows without bound, and
-  this job cannot stop that until meters drain.
+  `meters_history` **is** pruned, since 2026-11-18: it drains, and its
+  window is 72 hours after acknowledgement, like `machine_events`. That is
+  what bounds `--mode append` — roughly 25 MB of meter history at the
+  lab's measured rate. A gateway with no server acknowledges nothing and
+  so prunes nothing; there `--mode ring` caps the table itself and
+  `--db-size-warning-mb` is the backstop.
 
 To schedule it (every 12 hours, at **03:45 and 15:45 local time** by
 default — edit `OnCalendar` to taste):
@@ -1321,75 +1323,48 @@ tables or never fire on the events, so there is one age per type:
 | `machine_events` | 72 h — the fast one | **85 h** |
 | `ticket_out_history`, `ticket_in_completions`, `aft_completions`, `handpays` | 720 h (30 days, for disaster recovery) | **733 h** |
 
-**Meters are not on this schedule at all, and the assumption that they are
-is worth correcting.** `meters_history` has no `synced_at` — meter rows do
-not drain to the server yet — so the acknowledge-then-delete rule §6.4
-prunes on cannot apply to it. It is in `NEVER_PRUNED`, so **no retention
-figure applies and this warning can never fire for it.**
+**`meters_history` is on this schedule too, since 2026-11-18.** It carries a
+`synced_at`, it drains to the server, and `db_maintain` prunes it **72 hours
+after the server acknowledges each row** — the same window and the same rule
+as `machine_events`. Its row therefore warns at **85 h** like any other
+fast table.
 
-What bounds it is the **ring, not time**:
-
-| mode | `meters_history` |
-|---|---|
-| `--mode ring` (the floor default) | capped at `--history-cap` rows, 200 by default, written at most every `--history-interval` seconds |
-| `--mode append` | **bounded by nothing**, unless `--history-max-age-days` is set |
-
-**`--history-max-age-days` is how append mode gets a ceiling without giving
-up what append is for.** It caps by **age**, not by row count, so every
-sample inside the window is kept at full per-poll resolution. Off unless
-given; given without a number it is **40 days**. It applies in both modes.
-
-The file then **levels off** rather than shrinking, and that is the intended
-behaviour rather than a shortfall:
-
-| day, at the measured idle rate (~8.5 MB/day) | no window | 40-day window |
-|---|---|---|
-| 30 | 255 MB | 255 MB |
-| 50 | 425 MB | **340 MB** |
-| 59 | 500 MB — the warning fires | **340 MB** |
-| 365 | ~3 GB, until the partition fills | **340 MB** |
-
-Once the oldest rows start aging off, each day deletes about as much as it
-adds, and **SQLite reuses the freed pages**, so the file stops growing. The
-plateau is roughly *window × daily growth rate*.
-
-**Do not convert such a gateway with `enable-auto-vacuum`.** Returning pages
-to the filesystem and then re-allocating them is extra writes, and on
-flash-based hardware write wear is the binding constraint, not space.
-Reuse-in-place is what you want, and it needs no vacuum at all.
-
-The measured 8.5 MB/day is an **idle** cabinet. Under play the rate is
-higher — a meter decrease, a failed poll or an anomaly makes the next few
-polls log at full resolution — so the plateau is proportionally higher.
-Measure the under-load rate before trusting a figure, and set the window to
-whatever ceiling you want: `--db-size-warning-mb` is the backstop either way.
-
-**What it deletes, stated without softening: the gateway holds the only copy
-of `meters_history`**, because meter rows do not drain to a server yet. A row
-this removes is gone for good. What that does and does not cost:
+That is what bounds the database in `--mode append`, and it bounds it hard:
 
 | | |
 |---|---|
-| cumulative meter totals | **unaffected.** SAS meters are lifetime counters, `meters_current` holds them, and it is in `NEVER_PRUNED` |
-| the drained tables — events, tickets, handpays, AFT | **untouched**, and the server has its own copy of them |
-| per-poll meter resolution older than the window | **gone.** This is the diagnostic time series, and it is the real cost |
+| meter history kept | 72 h after acknowledgement |
+| at the lab's measured idle rate (~8.5 MB/day) | **≈ 25 MB**, then level |
+| mechanism | ordinary `--prune-acked`; no second rule, no age cap |
 
-So a question like *"what did coin-in read at 14:32 six weeks ago"* stops
-being answerable; *"what is lifetime coin-in"* never does. For comparison, a
-floor gateway in `--mode ring` keeps about 200 rows — a few hours — so a
-40-day window is far more history than the floor retains.
+So append mode does **not** have to be given up to keep the file small.
+Every sample is kept at full per-poll resolution for three days, the server
+has them, and the gateway reclaims the space once it does. The file levels
+off because deletions match insertions and SQLite reuses the freed pages —
+it does not shrink, and does not need to.
 
-**And it narrows itself the moment meters drain.** While nothing is
-acknowledged the age alone decides. As soon as any `meters_history` row
-carries a `synced_at`, this deletes only acknowledged rows — the same rule
-the ring follows, for the same reason: *disk is recoverable and a deleted
-unacknowledged row is not.*
+**It is pruning that does this, not vacuum.** Vacuum only returns to the
+filesystem what pruning has already released, and on flash a gateway is
+better off reusing those pages in place than handing them back and
+re-allocating them.
 
-So a gateway left in `--mode append` fills up without any alert in this
-section saying so — the pruner is not failing, there is simply nothing it is
-allowed to delete. `--db-size-warning-mb` is the only thing that speaks up,
-and it speaks about the file, not about a table. Append mode is a lab choice
-for keeping a whole soak for analysis; a floor gateway wants `ring`.
+**The one case where nothing bounds it: no server taking the rows.** Pruning
+deletes only what has been acknowledged, so a gateway with no link — a bench
+unit, or a long outage — acknowledges nothing, prunes nothing, and grows at
+the full append rate. That is deliberate: *disk is recoverable and a deleted
+unacknowledged row is not.* `--db-size-warning-mb` is the backstop, and
+`--mode ring` is the alternative for a unit that will never have a server.
+
+**What this costs, and it is a real transfer of risk.** Before this change
+the gateway kept every meter sample for as long as it ran, so it was the
+only copy and it never lost one. Now a row is dropped 72 hours after the
+server took it, which means **after 72 hours the server's copy is the only
+copy.** For meters the gateway has stopped being the backup of last resort.
+If the server is restored from a backup older than that acknowledgement, the
+meter history in between is gone from both sides. The drained tables keep
+their 30-day window and are unaffected; this applies to `meters_history`
+alone.
+
 
 Two things it deliberately does not do. It is **silent when pruning is off**
 — with no `--prune-acked` nothing is deleted by design, so every old row

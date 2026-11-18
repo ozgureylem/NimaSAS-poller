@@ -1308,16 +1308,6 @@ DEFAULT_C7_PROBATION_MINUTES = 10.0
 C7_EMPTY_SWEEPS_BEFORE_GIVING_UP = 3
 
 DEFAULT_HISTORY_CAP = 200
-# The window --history-max-age-days uses when it is given without a number.
-# 40 days at the idle rate measured on the lab soak (about 8.5 MB a day)
-# plateaus the file near 340 MB, inside the 500 MB warning with margin.
-DEFAULT_HISTORY_MAX_AGE_DAYS = 40.0
-# The most history rows one cycle may delete. The first cycle after this is
-# switched on against an old database could otherwise delete weeks of rows
-# in a single statement, holding the write lock far past the ten seconds
-# §15.7 gives a cashout. Spread over cycles instead: at 500 a cycle a
-# 90,000-row backlog clears in about three minutes of polling.
-HISTORY_AGE_EVICT_BATCH = 500
 DEFAULT_HISTORY_INTERVAL = 60.0
 DEFAULT_BURST_COUNT = 10
 DEFAULT_GENERAL_POLL_RETRIES = 3
@@ -1410,15 +1400,11 @@ class HistoryConfig:
     mode: str = "ring"  # "ring" or "append"
     cap: int = DEFAULT_HISTORY_CAP  # ring mode only; ignored in append mode
     interval: float = DEFAULT_HISTORY_INTERVAL  # ring mode only; ignored in append mode
-    max_age_days: float = 0.0  # 0 = off. Applies in BOTH modes when set.
     burst_count: int = DEFAULT_BURST_COUNT
 
     def __post_init__(self) -> None:
         if self.mode not in ("ring", "append"):
             raise ValueError(f"mode must be 'ring' or 'append', got {self.mode!r}")
-        if self.max_age_days < 0:
-            raise ValueError("max_age_days cannot be negative; 0 means off, "
-                             f"got {self.max_age_days!r}")
 
 
 @dataclass
@@ -7312,40 +7298,6 @@ def poll_and_log(
                     "(SELECT id FROM meters_history ORDER BY id DESC LIMIT ?)",
                     (history.cap,),
                 )
-        if history.max_age_days:
-            # A TIME HORIZON, which is what lets append mode plateau. Append
-            # never deletes, so its file grows for as long as the poller
-            # runs; capping by AGE rather than by count keeps what append is
-            # for -- every sample, full resolution -- while putting a ceiling
-            # on the file. In equals out once the oldest rows start aging
-            # off, and SQLite reuses the freed pages, so the file levels off
-            # rather than needing a VACUUM to shrink. Deliberately NOT
-            # auto_vacuum INCREMENTAL: handing pages back and re-allocating
-            # them is extra writes, and flash wear is the binding
-            # constraint, not space.
-            #
-            # THE SAME RULE AS THE RING ABOVE: never delete a row the server
-            # has not acknowledged, once there is a server taking them. Meter
-            # rows do not drain yet, so today nothing is acknowledged and the
-            # age alone decides -- which is the operator's explicit choice,
-            # because the gateway holds the only copy and 40 days of
-            # per-poll history is what he is willing to keep. The moment
-            # meters DO drain, this narrows itself to acknowledged rows and
-            # can no longer destroy an un-backed-up one.
-            linked = conn.execute(
-                "SELECT COUNT(*) FROM meters_history "
-                "WHERE synced_at IS NOT NULL").fetchone()[0]
-            acked_only = "AND synced_at IS NOT NULL " if linked else ""
-            conn.execute(
-                f"DELETE FROM meters_history WHERE id IN ("
-                f"  SELECT id FROM meters_history "
-                f"  WHERE polled_at IS NOT NULL {acked_only}"
-                f"    AND datetime(polled_at) <= datetime(?, ?) "
-                f"  ORDER BY id LIMIT ?)",
-                (now, f"-{float(history.max_age_days)} days",
-                 HISTORY_AGE_EVICT_BATCH),
-            )
-
     _safe_commit(conn, now)
     state.last_meters = values
 
@@ -7564,23 +7516,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_HISTORY_CAP,
         help="max rows kept in meters_history in ring mode (default: %(default)s); ignored in append mode",
-    )
-    parser.add_argument(
-        "--history-max-age-days",
-        type=float,
-        nargs="?",
-        const=DEFAULT_HISTORY_MAX_AGE_DAYS,
-        default=0.0,
-        help="delete meters_history rows older than this many days, so the "
-        "database levels off instead of growing for as long as the poller "
-        "runs. OFF unless given; given without a number it is "
-        f"{DEFAULT_HISTORY_MAX_AGE_DAYS:g} days. Applies in BOTH modes. It "
-        "caps by AGE, not by row count, so append mode keeps every sample at "
-        "full resolution inside the window. The file levels off at roughly "
-        "(window x daily growth) and SQLite reuses the freed pages, so it "
-        "does not shrink and does not need to. ONCE METER ROWS DRAIN TO A "
-        "SERVER this only deletes acknowledged rows; until then the gateway "
-        "holds the only copy and the age alone decides",
     )
     parser.add_argument(
         "--history-interval",
@@ -8121,7 +8056,6 @@ def main() -> int:
         mode=args.mode,
         cap=args.history_cap,
         interval=args.history_interval,
-        max_age_days=args.history_max_age_days,
         burst_count=args.burst_count,
     )
     state = PollState()
@@ -8199,21 +8133,14 @@ def main() -> int:
             f"  meters_history: capped at {args.history_cap} rows, written every {args.history_interval}s, "
             f"or every cycle for {args.burst_count} poll(s) after a meter decrease or failed poll."
         )
-    elif args.history_max_age_days:
-        print(f"  meters_history: written every cycle, kept for "
-              f"{args.history_max_age_days:g} days. The file levels off at "
-              "about (that window x the daily growth rate) and then stays "
-              "there, reusing its own freed pages.")
     else:
-        print("  meters_history: unbounded, written every cycle (lab/stress-testing mode).")
-    if args.history_max_age_days:
-        print(f"  --history-max-age-days {args.history_max_age_days:g}: history "
-              "rows past that age are DELETED. Meter rows do not drain to a "
-              "server yet, so this gateway holds the ONLY copy and they are "
-              "gone for good. Cumulative meter totals are unaffected -- "
-              "meters_current keeps them and is never pruned -- and no "
-              "drained table is touched; what goes is per-poll meter "
-              "resolution older than the window.")
+        print("  meters_history: written every cycle. It DRAINS to the server "
+              "and db_maintain prunes it 72 hours after the server "
+              "acknowledges each row, so the file levels off instead of "
+              "growing -- about 25 MB of meter history at the lab's measured "
+              "rate. Without a server taking the rows, nothing is "
+              "acknowledged and nothing is pruned: then it is unbounded, and "
+              "--db-size-warning-mb is the backstop.")
     print(
         f"  meters: {len(ALL_METER_FIELDS)} columns per row "
         # EACH SWEEP REPORTS ITS CADENCE, not just whether it is on. Only

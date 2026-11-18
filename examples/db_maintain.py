@@ -102,26 +102,25 @@ NEVER_PRUNED = frozenset({
     # One row, replaced in place every cycle, in both modes. Nothing to
     # prune, and the baseline a restart uses to recognise a RAM clear.
     "meters_current",
-    # A GATE, NOT A DESCRIPTION -- and as of 2026-11-16 the condition it
-    # was waiting for IS MET. Read the next paragraph before acting on it.
+    # meters_history WAS HERE, as a gate rather than a description, waiting
+    # for the operator. REMOVED 2026-11-18 on his decision: "for meters, yes
+    # add synced_at. I will want to keep them for 72 hours as well (after
+    # sync)." The column was already there and the drain was already
+    # hardware-proven -- "meters_history drained? True, meters_current
+    # refused? True", nine tables draining -- so this entry was the only
+    # thing left, and removing a pruning guard is a decision about deleting
+    # data that AGENT-BOARD.md reserves for him.
     #
-    # It used to say: "Today the server never receives a meter row (the
-    # client's NEVER_DRAINED), the table has no synced_at ... Remove this
-    # entry in the same change that makes it drain, not before." Both
-    # facts are now false. meters_history carries synced_at, it is out of
-    # NEVER_DRAINED, and the drain is HARDWARE-PROVEN: "meters_history
-    # drained? True, meters_current refused? True", nine tables draining.
-    # The stale wording was caught by another session reading this file
-    # for the RamSys guide, not by anyone who changed the drain.
+    # The 72 hours it now gets is in RETENTION_HOURS below and was written
+    # at the same time as machine_events', so nothing else changed.
     #
-    # THE ENTRY STAYS ANYWAY, and deliberately. Removing a pruning guard
-    # is a decision about deleting data, and docs/private/AGENT-BOARD.md
-    # reserves it for the operator rather than for whoever notices the
-    # precondition has cleared. The retention spec gives this table 72
-    # hours once pruning is enabled; enabling it is one line here, plus a
-    # soak long enough to show the server really has what the gateway is
-    # about to drop.
-    "meters_history",
+    # WHAT IS STILL OWED, named by the comment this replaces: "a soak long
+    # enough to show the server really has what the gateway is about to
+    # drop." The server in the lab is a laptop. A row dropped here 72 hours
+    # after that laptop acknowledged it exists ONLY on the laptop, so a
+    # wiped or un-backed-up laptop loses meter history permanently. The
+    # gateway is the backup of last resort, and this is the change that
+    # makes it stop being one for meters.
     "validation_pool", "pool_fills", "counters",
     "validation_queries", "host_requests",
     # Which machine every other row belongs to. A gateway carried between
@@ -161,7 +160,7 @@ NEVER_PRUNED = frozenset({
 # may be and still be made whole from the floor. Shortening it to save
 # disk shortens that.
 RETENTION_HOURS = {"machine_events": 72.0,
-                   "meters_history": 72.0}      # inert while in NEVER_PRUNED
+                   "meters_history": 72.0}      # live since 2026-11-18
                                                 # (still listed there by
                                                 # choice, not by blocker --
                                                 # see the note above it)
@@ -585,12 +584,10 @@ def cmd_status(args) -> int:
         shown = f"{keep:g} h" if keep < 24 * 7 else f"{keep / 24:g} days"
         print(f"    {table:28s} {total:9d} / {acked:9d} / {total - acked:9d}"
               f"   {shown}")
-    try:
-        meters = conn.execute("SELECT COUNT(*) FROM meters_history").fetchone()[0]
-        print(f"    {'meters_history':28s} {meters:9d} rows, NOT pruned: it "
-              "does not drain yet, so the server holds no copy")
-    except sqlite3.OperationalError:
-        pass
+    # meters_history had a special line here saying "NOT pruned: it does not
+    # drain yet". Both halves were false by 2026-11-16 and the pruning gate
+    # came off on 2026-11-18, so it now appears in the drained-table listing
+    # above like any other table, with its own 72-hour window.
     return 0
 
 
