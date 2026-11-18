@@ -1028,8 +1028,8 @@ Two things to know before expecting the file to shrink:
   that table caps itself. In `--mode append` it grows without bound, and
   this job cannot stop that until meters drain.
 
-To schedule it (every 12 hours, at 09:20 and 21:20 UTC by default — edit
-`OnCalendar` to taste):
+To schedule it (every 12 hours, at **03:45 and 15:45 local time** by
+default — edit `OnCalendar` to taste):
 
 ```
 sudo cp deploy/nimasas-db-maintain.service deploy/nimasas-db-maintain.timer /etc/systemd/system/
@@ -1037,6 +1037,38 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now nimasas-db-maintain.timer
 journalctl -u nimasas-db-maintain.service -n 20
 ```
+
+**Local, not UTC, and that is a deliberate trade.** The `OnCalendar` lines
+carry no `UTC` suffix, so systemd reads them in the gateway's own zone. The
+properties are in different zones — Belize is UTC−6, Trinidad UTC−4 — so no
+single UTC time is the quiet hour at both: 09:20 UTC, the old default, is
+03:20 in Belize but 05:20 in Trinidad. Written locally, one unit file gives
+every property its own small hours with no per-site edit.
+
+**What it costs: the gateway's zone has to be right, and nothing will tell
+you if it is not.** A headless unit imaged from one property's master and
+shipped to another keeps the master's zone and then vacuums at the wrong
+local hour — silently, because this job is built to survive running beside
+a busy poller, so nothing fails and no alert fires. **Check it at
+commissioning:**
+
+```
+timedatectl                                  # confirm the zone and the clock
+sudo timedatectl set-timezone America/Belize  # or America/Port_of_Spain
+systemctl list-timers nimasas-db-maintain.timer   # shows the NEXT real fire time
+```
+
+That last command is the one worth running: it prints the next fire time as
+the gateway itself computes it, which settles the zone question without
+arithmetic.
+
+Two details before anyone treats 03:45 as exact. `RandomizedDelaySec=600`
+spreads the run over the following ten minutes, so it fires between 03:45
+and 03:55 — deliberate, so a floor of gateways does not hit the hour
+together. And neither property observes DST, so the local-time trap that
+bites `Persistent=true` elsewhere — a run skipped or doubled at the
+changeover — does not arise here. A property that did observe it would want
+these times moved off the changeover hour.
 
 The timer maintains **one** database: the one in the unit's `ExecStart`,
 which is the one `nimasas-poller.service` writes. A poller started by hand

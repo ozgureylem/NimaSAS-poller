@@ -1,10 +1,29 @@
 # Runs nimasas-db-maintain.service every 12 hours (operator, 2026-11-15).
 #
-# 09:20 and 21:20 UTC are 03:20 and 15:20 in Belize. The times are a
-# convenience, not a requirement -- the job is built to run beside a busy
-# poller -- so change OnCalendar freely, but keep two runs a day: the
-# sizing of append mode assumes it. systemd reads the times in the
-# gateway's own zone unless the zone is written, which is why it is.
+# 03:45 and 15:45 in the GATEWAY'S OWN ZONE (operator, 2026-11-18). No
+# `UTC` suffix, which is what makes systemd read them locally.
+#
+# Local rather than UTC on purpose: the properties are in different zones
+# (Belize UTC-6, Trinidad UTC-4), so no single UTC time is the quiet hour
+# at both -- 09:20 UTC is 03:20 in Belize but 05:20 in Trinidad. Written
+# locally, one unit file gives every property its own small hours without
+# a per-site edit.
+#
+# WHAT THIS COSTS, and it is a commissioning check, not a code problem:
+# the gateway's zone has to actually be right. A headless unit imaged from
+# one master and shipped to another property keeps the master's zone and
+# will vacuum at the wrong local hour -- silently, because the job is
+# designed to be survivable beside a busy poller, so nothing fails.
+# Verify with `timedatectl` at commissioning (MANUAL.md section 4.6).
+#
+# Neither property observes DST, so the local-time trap that bites
+# Persistent=true elsewhere -- a run skipped or doubled at the changeover
+# -- does not apply here. A property that did observe it would want these
+# times moved off the changeover hour.
+#
+# The times are a convenience, not a requirement -- the job is built to run
+# beside a busy poller -- so change OnCalendar freely, but keep two runs a
+# day: the sizing of append mode assumes it.
 #
 # Persistent=true: a gateway that was powered off at a run time does the
 # job when it next boots instead of skipping it.
@@ -13,8 +32,8 @@
 Description=NimaSAS gateway database maintenance, every 12 hours
 
 [Timer]
-OnCalendar=*-*-* 09:20:00 UTC
-OnCalendar=*-*-* 21:20:00 UTC
+OnCalendar=*-*-* 03:45:00
+OnCalendar=*-*-* 15:45:00
 RandomizedDelaySec=600
 Persistent=true
 
