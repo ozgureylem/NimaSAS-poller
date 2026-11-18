@@ -619,13 +619,63 @@ class Link:
                             payload=payload, key=self.cfg["hmac_key"])
         self.sock.sendall(data)
 
-    def alert(self, kind: str, detail: str) -> None:
+    def alert(self, kind: str, detail: str) -> bool:
+        """True if the frame went out, False if the link refused it.
+
+        Every caller but one ignores the answer, because for them the log
+        line above is the record and a dropped alert is subsumed by the link
+        going down. `_alert_link_down_once` needs it: a once-only alert that
+        counted a FAILED send as done would make the 3am give-up silent
+        again, which is the whole thing it exists to prevent.
+        """
         log(f"ALERT {kind}: {detail}")
         try:
             self.send(MessageType.ALERT, {"timestamp": utc_now(),
                                           "kind": kind, "detail": detail})
+            return True
         except OSError:
-            pass   # logged above; the link is going down anyway
+            return False   # logged above; the link is going down anyway
+
+    def _alert_link_down_once(self, link: dict | None) -> None:
+        """Operator, 2026-11-18: `state: "down"` raises a ONE-TIME alert.
+
+        `down` means the poller used all ten reconnect attempts and exited.
+        Until now that reached the server only as a FIELD somebody had to
+        read, so a gateway gave up quietly -- the opposite of the "loud"
+        property the reconnect loop claims for itself.
+
+        Three decisions in here, none of them arbitrary:
+
+        * `reconnecting` does NOT alert. A cable seated badly could flap for
+          an hour; ten attempts take 3.3 minutes, and alerting on each
+          transition would train somebody to ignore the channel.
+        * ONCE is keyed on the gauge's `since`, not on a boolean. `since`
+          changes only when the state changes, so the same give-up cannot
+          alert twice even if this process restarts and re-reads the row --
+          while a link that recovers and gives up AGAIN has a new `since`
+          and is a new alert, which it should be.
+        * The marker is written only if the send SUCCEEDED, so an alert lost
+          to a dead socket is retried on the next heartbeat rather than
+          counted as delivered.
+        """
+        if not link or link.get("state") != "down":
+            return
+        # A gauge with no `since` is malformed, but it still gets one alert:
+        # the default below is "", so "unknown" differs from it exactly once.
+        since = str(link.get("since") or "unknown")
+        if get_counter(self.conn, "sas_link_down_alerted", "") == since:
+            return
+        attempt, cap = link.get("attempt"), link.get("max_attempts")
+        tried = f" after {attempt} of {cap} attempts" if attempt and cap else ""
+        held = link.get("for_s")
+        age = f", down for {held:.0f}s" if isinstance(held, (int, float)) else ""
+        said = link.get("detail") or "no detail recorded"
+        if self.alert("sas_link_down",
+                      f"the poller gave up reopening the serial port{tried}"
+                      f"{age}; nothing is polling this cabinet until the "
+                      f"link is restored (since {since}: {said})"):
+            set_counter(self.conn, "sas_link_down_alerted", since)
+            self.conn.commit()
 
     # -- receiving --
 
@@ -807,6 +857,10 @@ class Link:
         # server that holds less than this has lost rows, and can say so.
         beat["acked"] = acked_high_water(self.conn, self.tables)
         self.send(MessageType.HEARTBEAT, beat)
+        # AFTER the beat, not before: the heartbeat is the obligation and the
+        # alert is the addition, so a refused alert must not cost the
+        # liveness signal. The beat already carries the state this explains.
+        self._alert_link_down_once(beat.get("sas_link"))
 
     def pump_queries(self) -> None:
         """Ticket-in: send what the poller asked, report how it ended."""

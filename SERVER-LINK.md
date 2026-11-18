@@ -516,6 +516,22 @@ rejected. Sent only for a completed cycle.
 
 **`0x07` ALERT** (G→S) † — `{"timestamp", "kind", "detail"}`.
 
+One `kind` is worth naming here because a server should act on it rather
+than merely file it: **`sas_link_down`**, raised when the poller has used
+all ten reconnect attempts and exited, i.e. when `sas_link.state` becomes
+`down`. It is raised **once per outage**, keyed on the gauge's `since`, so
+it does not repeat while the link stays down — and a link that recovers and
+then gives up again carries a new `since` and is a new alert. `reconnecting`
+never alerts: ten attempts take about 3.3 minutes, and a badly seated cable
+could otherwise flap all night.
+
+**A server must not treat the absence of this alert as a healthy link.** It
+is raised only for the give-up, and only while this gateway can reach the
+server. The two conditions a server has to derive from `sas_link` itself
+are unchanged: `state` `down` or `reconnecting`, and — the case nothing can
+alert on, because the process that would raise it is the one that died —
+`state: up` with a large `said_s_ago`.
+
 **`0x15` AFT_TRANSFER** (S→G) † — not in §10.2; added for the lab.
 
 ```json

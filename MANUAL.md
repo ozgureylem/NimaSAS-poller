@@ -943,14 +943,31 @@ tells the server what it thought to ask, and a gateway that has stopped
 answering is the case no pull reaches. Treat the heartbeat as the liveness
 signal and the batch field as provenance for that batch.
 
-**What this does NOT do, stated plainly: it raises no alert.** `sas_link`
-is a field on two messages. When the loop exhausts its attempts and sets
-`state: "down"`, nothing is pushed to the alert channel — a server must
-read the field to notice. As far as any human is concerned the gateway
-gives up quietly, which is the opposite of the "loud" property the bullets
-above claim for the loop itself, and it is the one place that claim stops
-being true. A server implementation should treat `down`, and `up` with a
-large `said_s_ago`, as conditions to raise itself.
+**Giving up raises an alert, once.** When the loop exhausts its attempts
+and sets `state: "down"`, the gateway sends an `ALERT` of kind
+`sas_link_down` — because a field somebody has to read is not the same as
+being told, and a gateway that gives up quietly at 03:00 is the failure
+this whole section exists to prevent (operator, 2026-11-18).
+
+Once, and the mechanics matter:
+
+- **`reconnecting` never alerts.** Ten attempts take about 3.3 minutes, and
+  a badly seated cable could flap all night; alerting on each transition
+  would train somebody to ignore the channel.
+- **"Once" is keyed on the gauge's `since`, not on a flag in memory**, so
+  the same give-up cannot alert twice even if the gateway client process
+  restarts and re-reads the row — while a link that recovers and gives up
+  *again* has a new `since` and is a new alert, which it should be.
+- **An alert the socket refuses is not counted as delivered.** It is
+  retried on the next heartbeat. Marking it done on a failed send would
+  restore exactly the silence it exists to prevent.
+
+**What still cannot be alerted on, and a server has to derive itself:**
+`state: up` with a large `said_s_ago` — the poller died without writing
+anything, so the process that would have raised the alert is the one that
+is gone. Nothing inside this gateway can report its own absence; only the
+server noticing a stale heartbeat can. Treat that pairing, and not just
+this alert, as the condition to act on.
 
 Anything already committed to SQLite is safe across all of this; the
 database is closed cleanly on every exit path above.
