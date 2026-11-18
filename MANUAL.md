@@ -1016,10 +1016,14 @@ is what the timer runs.
 
 Two things to know before expecting the file to shrink:
 
-- **It needs a one-time conversion.** Incremental vacuum only works on a
-  database in `auto_vacuum = INCREMENTAL` mode, and no database created so
-  far is. Converting takes one full `VACUUM`, so do it once, with the poller
-  **and** the gateway client stopped:
+- **A database created before 2026-11-15 needs a one-time conversion.**
+  Incremental vacuum only works in `auto_vacuum = INCREMENTAL` mode. Since
+  that date `open_gateway_db` sets it at creation (spec §6.1 asks for it
+  "from the first creation of the database"), so **a fresh floor gateway is
+  already INCREMENTAL and needs nothing**. Check which you have with
+  `db_maintain.py status`, which prints the mode. Converting an older file
+  takes one full `VACUUM`, so do it once, with the poller **and** the
+  gateway client stopped:
 
   ```
   sudo systemctl stop nimasas-poller
@@ -1185,6 +1189,18 @@ seconds. **This has not been timed on gateway hardware**, so treat "seconds"
 as the expectation to confirm on the first unit rather than a figure to
 design a window around; `db_maintain.py status` reports the freelist the
 next run would return, which is the number to watch.
+
+**Why convert at all, when freed pages are reused anyway.** In a steady
+state — pruning deleting about as much each day as the poller inserts — the
+file levels off at the same size either way, and `INCREMENTAL` costs a
+little extra I/O to hand pages back and re-allocate them. The conversion
+earns its keep on the **transition**: a database that has been running
+unpruned holds a backlog that pruning releases all at once, and without
+`INCREMENTAL` that space stays inside the file for good. A 94 MB database
+holding eleven days of meters drops to roughly 25 MB once the 72-hour
+window applies — but only if it can return the pages. Convert, let it
+reclaim, and expect it to take several runs: `incremental_vacuum` stops at
+the run's time limit and continues on the next one.
 
 **`enable-auto-vacuum` is the exception, and it is not a scheduled job.** One
 full `VACUUM`, once per database, rewriting the whole file: on a 32-bit
