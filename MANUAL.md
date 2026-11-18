@@ -1037,9 +1037,8 @@ Two things to know before expecting the file to shrink:
   acknowledged**, once they are older than their table's retention:
   72 hours for `machine_events`, 30 days for every other drained table
   (tickets, AFT completions, handpays). A row the server has not
-  acknowledged is never deleted; past 48 hours it is reported as an
-  `ALERT` instead. It is off on the command line and on in the timer's
-  unit.
+  acknowledged is **never deleted**, whatever its age. It is off on the
+  command line and on in the timer's unit.
 
   `meters_history` is **not** pruned, because the server does not receive
   meter rows yet and the gateway holds the only copy. In `--mode ring`
@@ -1173,16 +1172,27 @@ retention. More than 13h over means at least one scheduled run did not
 prune them: ...
 ```
 
-**This is a different question from the unacknowledged-row alert** and the
-two are easy to confuse:
+**This is the only age warning the tool raises.** It answers one question —
+*why is this row still on my disk?* — and names which of the two possible
+answers applies:
 
-| alert | asks | about |
+| the line says | asks | about |
 |---|---|---|
-| unacknowledged past 48 h | is the **drain** failing? | rows the server never took |
-| overdue past retention + 13 h | is the **pruner** failing? | rows the server took, whose window has expired, still on disk |
+| ACKNOWLEDGED rows *N*h past retention | is the **pruner** failing? | rows the server took, whose window has expired, still on disk |
+| rows up to *N*h old, still not acknowledged | is the **drain** failing? | rows the server never took |
 
-A gateway can be perfectly drained and still fill up, which is why both
-exist.
+A gateway can be perfectly drained and still fill up, which is why the first
+exists; it can also be perfectly pruned and still fill up, which is why the
+second does.
+
+**There was a second, earlier alert here until 2026-11-18** — spec §6.4 and
+§15 ask for an "Unacknowledged-event alert 48 h", and this tool raised one.
+It was removed because two thresholds for one question are harder to act on
+than one. **What that costs is recorded in MIGRATION-SPEC-AMENDMENTS A48 and
+is not nothing**: an undrained row in a 30-day table is now reported at 733
+hours rather than at 48, so a drain that fails on the ticket tables alone is
+not announced here for about a month. The heartbeat's `sas_link` and the
+server's own view of what it has acknowledged are what cover that interval.
 
 **Where the 85 comes from.** Past 72 hours an acknowledged
 `machine_events` row can be removed; the job runs every 12 hours; so the

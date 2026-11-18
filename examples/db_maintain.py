@@ -67,20 +67,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from examples.sql_poll_logger import open_gateway_db, utc_now  # noqa: E402
 
-# Spec §6.4 / §15: "Acknowledged-event purge 48 h", "Unacknowledged-event
-# alert 48 h".
-UNACKED_ALERT_HOURS = 48.0
-# How far past its retention an ACKNOWLEDGED row may sit before the run says
-# so. 13 hours, and the number is derived, not chosen: the timer fires every
-# 12 hours, so a row still here 13 hours past its window means AT LEAST ONE
-# SCHEDULED RUN DID NOT PRUNE IT. The extra hour covers the timer's
-# RandomizedDelaySec (10 min) and a run that stops at its 120 s ceiling.
+# How far past its retention a row may sit before the run says so. 13 hours,
+# and the number is derived, not chosen: the timer fires every 12 hours, so a
+# row still here 13 hours past its window means AT LEAST ONE SCHEDULED RUN
+# DID NOT TAKE IT. The extra hour covers the timer's RandomizedDelaySec
+# (10 min) and a run that stops at its 120 s ceiling.
 #
-# This is a different question from UNACKED_ALERT_HOURS above, and the two
-# are easy to confuse. That one asks "is the drain failing?" -- rows the
-# server never took. This one asks "is the PRUNER failing?" -- rows the
-# server has taken, whose retention has expired, that are still on the disk.
-# A gateway can be perfectly drained and still fill up.
+# THIS IS NOW THE ONLY AGE WARNING. Spec §6.4 / §15 also asks for an
+# "Unacknowledged-event alert 48 h", and this tool carried one until
+# 2026-11-18, when the operator removed it: both thresholds answer the single
+# question "why is this row still on my disk?", and one answer is easier to
+# act on than two. MIGRATION-SPEC-AMENDMENTS A48 records the divergence and
+# what it costs, which is not nothing -- an undrained row in a 30-day table
+# is now reported at 733 h rather than at 48.
+#
+# §6.4's other half is untouched: an unacknowledged row is still NEVER
+# deleted, whatever its age. Only the reporting changed.
 RETENTION_OVERDUE_GRACE_HOURS = 13.0
 # How much one transaction may do. Small on purpose: every one of these
 # holds the write lock the poller needs, and the poller is on a clock.
@@ -366,36 +368,6 @@ def prune_acked(conn: sqlite3.Connection, hours: float | None = None, *,
     return deleted
 
 
-def undelivered_past(conn: sqlite3.Connection, hours: float,
-                     *, now: str | None = None) -> dict[str, int]:
-    """Rows never acknowledged and older than `hours`, per table.
-
-    Only on a gateway that HAS a server link -- judged by evidence, a row
-    that was once acknowledged, not by a flag. Without a link every row is
-    unacknowledged forever, by design, and reporting that nightly would
-    teach whoever reads the journal to ignore this line.
-    """
-    now = now or utc_now()
-    tables = prunable_tables(conn)
-    linked = any(conn.execute(
-        f'SELECT 1 FROM "{t}" WHERE synced_at IS NOT NULL LIMIT 1').fetchone()
-        for t in tables)
-    if not linked:
-        return {}
-    out = {}
-    for table in tables:
-        when = _when_column(conn, table)
-        if when is None:
-            continue
-        count = conn.execute(
-            f'SELECT COUNT(*) FROM "{table}" WHERE synced_at IS NULL AND '
-            f'"{when}" IS NOT NULL AND datetime("{when}") <= datetime(?, ?)',
-            (now, f"-{float(hours)} hours")).fetchone()[0]
-        if count:
-            out[table] = count
-    return out
-
-
 # --- space -------------------------------------------------------------------
 
 def incremental_vacuum(conn: sqlite3.Connection, *, deadline: float | None = None,
@@ -601,14 +573,6 @@ def cmd_run(args) -> int:
                     "the pruner.")
     else:
         log("pruning is off (no --prune-acked); nothing is deleted")
-
-    late = undelivered_past(conn, UNACKED_ALERT_HOURS)
-    for table, count in late.items():
-        # §6.4: "Unacknowledged rows past 48 hours raise an alert and are
-        # never deleted."
-        log(f"ALERT: {count} row(s) in {table} are older than "
-            f"{UNACKED_ALERT_HOURS:g}h and the server has not acknowledged "
-            "them. They are KEPT. A drain is failing while the link stays up.")
 
     if facts["auto_vacuum"] == 2:
         freed = incremental_vacuum(conn, deadline=deadline)
