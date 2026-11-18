@@ -1101,55 +1101,98 @@ the flag from `ExecStart` to delete nothing.
 #### If a server schedules this instead of the timer
 
 A server can drive `db_maintain.py run` on its own schedule rather than
-leaving it to `systemd`. Two things to get right, and the first is a
-correction to the obvious worry.
+leaving it to `systemd`. Three rules, and the first overrides everything
+else in this section.
 
-**`run` does not need to wait for an idle machine.** It is not a `VACUUM`.
-It reclaims space with `PRAGMA incremental_vacuum(200)` — 200 pages per
-call, each a transaction of a few milliseconds, with a 50 ms pause between
-them and the poller writing in the gaps. Pruning is batched the same way,
-500 rows at a time, and the whole run stops at 120 seconds with work left
-for the next one. **Nothing in it holds the write lock for a length of time
-a cashout or a ticket would notice**, so gating it on "no credits, no
-games" is not needed — and it costs something real: a gate like that may
-never open on a busy cabinet, the run never happens, and `--mode append`'s
-sizing assumes two runs a day.
+**Vacuum only when `credit_meter` is zero.** The heartbeat carries
+`credit_meter`, so this is directly observable and needs nothing new on the
+wire. The reason is not tidiness:
 
-**What it would cost if something did block the write path**, which is the
-number to design against rather than the duration of the block: a ticket
-whose `VALIDATION_QUERY` cannot be written is refused after
-`--ticket-query-timeout` (2 s), and that refusal then sets
-`--ticket-query-backoff` — **30 seconds in which tickets are refused
-locally without asking the server at all** (§9.2). So a ten-second block
-is not ten seconds of refusals; it is closer to forty, and a customer who
-reinserts immediately is refused again. The backoff exists so that
-reinsertion cannot amplify a slow server, and it does not know the slowness
-was self-inflicted.
+| what a customer does mid-vacuum | cost |
+|---|---|
+| inserts a ticket or a bill | **none worth avoiding.** It is refused and returned. The gateway's state is untouched, because the poller is not running. |
+| **asks to cash out** | the host cannot answer inside the ten seconds §15.7 allows, so **the machine locks into a handpay** |
 
-**The operation that does need the machine out of service is
-`enable-auto-vacuum`**, and "idle" is not a strong enough condition for it.
-It is one full `VACUUM`, run **once per database**, and it rewrites the
-whole file: on a 32-bit gateway with a 150 MB database on flash that is
-longer than the ten seconds §15.7 gives the poller to answer a cashout
-before the machine locks into a handpay. The tool refuses to run unless the
-poller and the gateway client are stopped — and with the poller stopped the
-risk is not a refused ticket but an **unattended cabinet**: nothing is
-draining the exception queue, which §2.2.1 requires to hold only 20
-elements, and a machine being played generates around 2.4 exceptions a
-second, so the queue overruns in roughly eight seconds and the host gets
-exception `0x70` plus a hole in its accounting. Do it with the cabinet out
-of service, not merely with zero credits on it.
+**The second row is the whole reason this gateway exists.** A handpay
+created by our own maintenance window is the defect the project was started
+to remove, and it is strictly worse than any refused ticket. **Credits on
+the machine are the precondition for a cashout**, so a vacuum that waits for
+`credit_meter == 0` cannot cause one.
 
-**What a server can actually test for idle, today.** The heartbeat carries
-`credit_meter`, so "no credits" is directly observable. **Games played is
-not on the wire** — meter rows do not drain to the server yet — so a
-games-based condition cannot be evaluated from what a server receives; the
-nearest available signal is the absence of recent rows in `EVENT_BATCH`.
-Any idle gate written now should therefore be credits-plus-no-recent-events,
-and should have a timeout after which it runs anyway, so that a cabinet
-which is never idle still gets maintained.
+**Do not override the gate on a timer.** If a cabinet has not been at zero
+credits for days, that is a condition to report, not to vacuum through. The
+run is cheap to postpone: it reclaims only what retention has released, so
+there is little to do and skipping one is not a backlog. Postponing costs
+disk; overriding costs a handpay.
 
----
+**Two things the gate does not cover**, worth keeping the window short for
+rather than worth abandoning it:
+
+- `credit_meter` comes from the last heartbeat, so it is up to 15 s old.
+  Prefer a fresh beat, and treat a stale one as "do not vacuum".
+- Credits can *appear* during the window — a bill the EGM's own validator
+  accepts, or a game in progress paying out — and zero credits does not
+  prove no game is in play. The exposure is therefore the length of the
+  vacuum, which is the other reason to keep it short.
+
+**What the run actually does, so its duration can be judged.** It is not a
+full `VACUUM`. It reclaims with `PRAGMA incremental_vacuum(200)` — 200 pages
+per call, each a transaction of a few milliseconds — and prunes in batches
+of 500 rows, stopping at 120 seconds with any remainder left for the next
+run. It reclaims **only what pruning has already released**, and retention
+keeps most of the database: 72 hours of `machine_events`, 30 days of
+everything else. So there is normally little to reclaim and the window is
+short.
+
+**`enable-auto-vacuum` is the exception, and it is not a scheduled job.** One
+full `VACUUM`, once per database, rewriting the whole file: on a 32-bit
+gateway with a 150 MB database that is longer than §15.7's ten seconds. The
+tool refuses to run unless the poller and gateway client are stopped. Do it
+with the cabinet **out of service**, where the exposure above does not
+apply at all — and note that with the poller stopped nothing is draining the
+exception queue either, which §2.2.1 caps at 20 elements and a played
+machine fills in roughly eight seconds — after which the host gets
+exception `0x70`, buffer overflow, plus a hole in its accounting.
+
+#### When the warning about overdue data fires
+
+A `run` that prunes also reports **acknowledged rows still sitting past their
+retention**:
+
+```
+ALERT: machine_events still holds acknowledged rows 14h past its 72h
+retention. More than 13h over means at least one scheduled run did not
+prune them: ...
+```
+
+**This is a different question from the unacknowledged-row alert** and the
+two are easy to confuse:
+
+| alert | asks | about |
+|---|---|---|
+| unacknowledged past 48 h | is the **drain** failing? | rows the server never took |
+| overdue past retention + 13 h | is the **pruner** failing? | rows the server took, whose window has expired, still on disk |
+
+A gateway can be perfectly drained and still fill up, which is why both
+exist.
+
+**Why 13 hours, and it is derived rather than chosen.** The job runs every
+12 hours, so a row still present 13 hours past its window means **at least
+one scheduled run did not prune it** — the extra hour covers the timer's
+`RandomizedDelaySec` and a run that stopped at its own 120-second ceiling.
+Anything less would fire on a run that has simply not come round yet.
+
+**Each table is measured against its own window**, because they do not grow
+alike: `machine_events` is the fast one and keeps 72 hours, everything else
+keeps 30 days for disaster recovery. A single threshold would either
+complain constantly about the ticket tables or never fire on the events.
+
+Two things it deliberately does not do. It is **silent when pruning is off**
+— with no `--prune-acked` nothing is deleted by design, so every old row
+would be "overdue" and the line would fire on every run, which is how a
+warning gets ignored. And it **never counts an unacknowledged row**, however
+old: that row is not the pruner's to delete, and blaming the pruner for a
+drain failure would point at the wrong thing.
 
 ## 5. `saspy` — the library itself
 

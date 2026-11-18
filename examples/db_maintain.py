@@ -70,6 +70,18 @@ from examples.sql_poll_logger import open_gateway_db, utc_now  # noqa: E402
 # Spec §6.4 / §15: "Acknowledged-event purge 48 h", "Unacknowledged-event
 # alert 48 h".
 UNACKED_ALERT_HOURS = 48.0
+# How far past its retention an ACKNOWLEDGED row may sit before the run says
+# so. 13 hours, and the number is derived, not chosen: the timer fires every
+# 12 hours, so a row still here 13 hours past its window means AT LEAST ONE
+# SCHEDULED RUN DID NOT PRUNE IT. The extra hour covers the timer's
+# RandomizedDelaySec (10 min) and a run that stops at its 120 s ceiling.
+#
+# This is a different question from UNACKED_ALERT_HOURS above, and the two
+# are easy to confuse. That one asks "is the drain failing?" -- rows the
+# server never took. This one asks "is the PRUNER failing?" -- rows the
+# server has taken, whose retention has expired, that are still on the disk.
+# A gateway can be perfectly drained and still fill up.
+RETENTION_OVERDUE_GRACE_HOURS = 13.0
 # How much one transaction may do. Small on purpose: every one of these
 # holds the write lock the poller needs, and the poller is on a clock.
 PRUNE_BATCH_ROWS = 500
@@ -221,6 +233,38 @@ def _when_column(conn: sqlite3.Connection, table: str) -> str | None:
 
 
 # --- pruning (§6.4) ----------------------------------------------------------
+
+def retention_overdue(conn: sqlite3.Connection,
+                      grace_hours: float = RETENTION_OVERDUE_GRACE_HOURS,
+                      *, now: str | None = None) -> dict[str, float]:
+    """Acknowledged rows still present past their retention, per table.
+
+    Returns {table: hours the OLDEST such row is past its window}, so the
+    line this feeds can say how far behind the pruner is rather than only
+    that it is. Retention is per table -- `machine_events` gets 72 hours
+    because it grows fastest, everything else 30 days for disaster
+    recovery -- so each table is measured against its own window.
+
+    MEASURED FROM synced_at, exactly as `prune_acked` deletes, so this
+    cannot report a row the pruner would not have taken. And `datetime()`
+    on both sides for the reason spelled out there: synced_at carries a 'T'
+    and an offset, SQLite's datetime() does not, and a raw string compare
+    is lexicographic -- 'T' beats a space, and this repository has already
+    found one "24-hour" window that was 48 hours wide because of it.
+    """
+    now = now or utc_now()
+    out: dict[str, float] = {}
+    for table in prunable_tables(conn):
+        keep = retention_hours(table) + float(grace_hours)
+        row = conn.execute(
+            f'SELECT (julianday(?) - julianday(MIN(datetime(synced_at)))) * 24.0 '
+            f'FROM "{table}" WHERE synced_at IS NOT NULL AND '
+            f'datetime(synced_at) <= datetime(?, ?)',
+            (now, now, f"-{keep} hours")).fetchone()
+        if row and row[0] is not None:
+            out[table] = float(row[0]) - retention_hours(table)
+    return out
+
 
 def prune_acked(conn: sqlite3.Connection, hours: float | None = None, *,
                 now: str | None = None,
@@ -475,6 +519,20 @@ def cmd_run(args) -> int:
                 + ", ".join(f"{t} {n}" for t, n in deleted.items()))
         else:
             log(f"no acknowledged rows {rule}; nothing pruned")
+        # AFTER the prune, so it reports what is LEFT. Only when pruning is
+        # on: with it off nothing is deleted by design, so every old row
+        # would be "overdue" and this line would fire every run -- which is
+        # how a warning gets ignored. The 30-day window exists for disaster
+        # recovery, so being past it is not a tidiness question: it is
+        # either the timer not firing or a run that cannot finish.
+        behind = retention_overdue(conn)
+        for table, over in sorted(behind.items()):
+            log(f"ALERT: {table} still holds acknowledged rows "
+                f"{over:.0f}h past its {retention_hours(table):g}h retention. "
+                f"More than {RETENTION_OVERDUE_GRACE_HOURS:g}h over means at "
+                "least one scheduled run did not prune them: check the timer "
+                "fired, and that a run is not hitting its time limit with "
+                "work left.")
     else:
         log("pruning is off (no --prune-acked); nothing is deleted")
 
