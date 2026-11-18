@@ -650,6 +650,26 @@ overwritten with the latest values from all of them, unconditionally,
 every cycle. Whether that cycle *also* writes a new row to
 `meters_history` depends on the mode:
 
+- In `append` mode, always.
+- In `ring` mode, only if: this is the first poll ever, or
+  `--history-interval` seconds have passed since the last history
+  write, or a **burst** is active.
+
+A burst starts when any *cumulative* meter value goes down since the
+last successful poll (SAS meters are cumulative counters — a decrease
+usually means something worth a closer look, like a meter rollover or a
+reset), or when any poll in the group fails outright, or when a caller
+embedding `poll_and_log()` directly (rather than running this as a
+script) passes `anomaly=True` from its own logic. A handful of fields
+are gauges, not counters — current hopper level/status, current
+credits, selected game number — and are excluded from this check (see
+`GAUGE_METER_FIELDS`), since a decrease there is normal operation, not
+an anomaly. Once a burst starts, it writes the next `--burst-count`
+successful polls to history at full resolution — one per cycle, cadence
+ignored — before returning to the normal interval. This is deliberate:
+that's where the diagnostic value actually is, and it's cheap precisely
+because it's rare.
+
 **The ring is a soft cap, and since 2026-11-18 it is soft in one more way.**
 It evicts **only rows the server has acknowledged** — never one the server
 has not seen, because *disk is recoverable and a deleted unacknowledged row
@@ -673,31 +693,11 @@ The protection lasted `cap` cycles — about three hours at the defaults.
 The poller states this at startup in ring mode. `--db-size-warning-mb` is
 the backstop, and `db_maintain.py status` reports the row count.
 
-
-- In `append` mode, always.
-- In `ring` mode, only if: this is the first poll ever, or
-  `--history-interval` seconds have passed since the last history
-  write, or a **burst** is active.
-
-A burst starts when any *cumulative* meter value goes down since the
-last successful poll (SAS meters are cumulative counters — a decrease
-usually means something worth a closer look, like a meter rollover or a
-reset), or when any poll in the group fails outright, or when a caller
-embedding `poll_and_log()` directly (rather than running this as a
-script) passes `anomaly=True` from its own logic. A handful of fields
-are gauges, not counters — current hopper level/status, current
-credits, selected game number — and are excluded from this check (see
-`GAUGE_METER_FIELDS`), since a decrease there is normal operation, not
-an anomaly. Once a burst starts, it writes the next `--burst-count`
-successful polls to history at full resolution — one per cycle, cadence
-ignored — before returning to the normal interval. This is deliberate:
-that's where the diagnostic value actually is, and it's cheap precisely
-because it's rare.
-
 On a `SASError` from *any* poll in the group, the exception's type,
 message, and the specific poll that failed are inserted into
-`poll_errors` (this table's shape and behavior are unchanged from
-before — see §6.3), and **nothing** is written to `meters_current` or
+`poll_errors` (see §6.3; its shape changed on 2026-11-18, when it gained
+a `synced_at` so that it drains and can be pruned at 720 h — nothing
+about when or what it records changed), and **nothing** is written to `meters_current` or
 `meters_history` that cycle. The loop continues after `--interval`
 seconds either way; one bad exchange — a timeout, a checksum failure,
 anything — never stops the run. `--skip-full-meter-sweep`,
