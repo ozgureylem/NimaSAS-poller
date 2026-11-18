@@ -255,34 +255,34 @@ def retention_overdue(conn: sqlite3.Connection,
     """Rows past their retention window that are still on the disk, per
     table, split by WHY they are still here.
 
-        {"machine_events": {"unpruned": 14.2, "undrained": 31.0}}
+        {"machine_events": {"unpruned": 14.2, "undrained_age": 86.0}}
 
-    Both numbers are hours past the window. A table appears only if at
-    least one of them does. The split is not cosmetic: the two have
-    different causes and different fixes, and one line that merged them
-    would send somebody to the wrong one.
+    A table appears only if at least one applies. The split is not
+    cosmetic: the two have different causes and different fixes, and one
+    line that merged them would send somebody to the wrong one.
 
-      unpruned   acknowledged, window expired, NOT DELETED. The pruner
-                 should have taken it. Measured from synced_at, exactly as
-                 `prune_acked` deletes, so this can never report a row the
-                 pruner would have left alone.
+      unpruned        HOURS PAST ITS RETENTION. Acknowledged, window
+                      expired, not deleted -- the pruner should have taken
+                      it. Measured from synced_at, exactly as `prune_acked`
+                      deletes, so it can never report a row the pruner
+                      would rightly have left alone.
 
-      undrained  never acknowledged and older than the window. The pruner
-                 is RIGHT to leave it -- §6.4 forbids deleting an
-                 unacknowledged row, whatever its age -- so this is a drain
-                 fault, not a pruner fault. But it fills the disk exactly
-                 the same, and from the disk's point of view the reason
-                 does not matter, which is why it is reported here as well
-                 as by the 48-hour alert.
+      undrained_age   THE ROW'S OWN AGE IN HOURS, and deliberately NOT an
+                      overrun, because an unacknowledged row has no
+                      retention to be past.
 
-    TWO DIFFERENT CLOCKS, and the asymmetry is deliberate. An undrained row
-    has no synced_at to measure from, so its age is its own -- the column
-    `_when_column` finds. An acknowledged row is measured from the
-    acknowledgement, because that is when the retention window starts: the
-    gateway is the server's backup of last resort, so it holds a row for 30
-    days from the moment the server took responsibility for it, not from
-    when the cabinet produced it. A row drained late is therefore kept
-    longer than its nominal age, never shorter.
+    THE RETENTION CLOCK STARTS AT THE SERVER'S ACKNOWLEDGEMENT (operator,
+    2026-11-18), and that decides the shape of this function. The gateway
+    is the server's backup of last resort, so it holds a row for 30 days
+    from the moment the server took responsibility for it -- not from when
+    the cabinet produced it. A row drained late is therefore kept longer
+    than its own age, never shorter.
+
+    So an undrained row is NOT "past retention": its retention HAS NOT
+    STARTED. It is reported anyway, past the same age threshold, because it
+    occupies the disk exactly like any other row and nothing will reclaim
+    it until the server takes it -- but it is reported as an age and named
+    as a DRAIN fault, never as a pruner fault or a retention breach.
 
     `datetime()` on both sides throughout, for the reason `prune_acked`
     spells out: synced_at carries a 'T' and an offset, SQLite's datetime()
@@ -313,7 +313,7 @@ def retention_overdue(conn: sqlite3.Connection,
                 f'"{when}" IS NOT NULL AND datetime("{when}") <= datetime(?, ?)',
                 (now, now, f"-{cutoff} hours")).fetchone()
             if row and row[0] is not None:
-                found["undrained"] = float(row[0]) - keep
+                found["undrained_age"] = float(row[0])
 
         if found:
             out[table] = found
@@ -589,13 +589,16 @@ def cmd_run(args) -> int:
                     f"More than {grace:g}h over means at least one scheduled "
                     "run did not prune them: check the timer fired, and that "
                     "a run is not hitting its time limit with work left.")
-            if "undrained" in over:
-                log(f"ALERT: {table} still holds UNDRAINED rows "
-                    f"{over['undrained']:.0f}h past its {keep:g}h retention. "
-                    "These cannot be pruned -- §6.4 keeps an unacknowledged "
-                    "row whatever its age -- so this is the DRAIN failing, "
-                    "not the pruner. They occupy the disk all the same, and "
-                    "nothing will reclaim them until the server takes them.")
+            if "undrained_age" in over:
+                log(f"ALERT: {table} holds rows up to "
+                    f"{over['undrained_age']:.0f}h old that the server has "
+                    "still NOT acknowledged. Their retention has not even "
+                    f"started -- it begins at the acknowledgement, so the "
+                    f"{keep:g}h window has not yet applied to them -- and "
+                    "§6.4 forbids deleting them meanwhile. They occupy the "
+                    "disk all the same and nothing will reclaim them until "
+                    "the server takes them. This is the DRAIN failing, not "
+                    "the pruner.")
     else:
         log("pruning is off (no --prune-acked); nothing is deleted")
 

@@ -1184,7 +1184,7 @@ two are easy to confuse:
 A gateway can be perfectly drained and still fill up, which is why both
 exist.
 
-**Eligibility here is about age, not about drain status.** Past 72 hours a
+**Where the 85 comes from.** Past 72 hours an acknowledged
 `machine_events` row can be removed; the job runs every 12 hours; so the
 oldest surviving row should be about 84 hours at worst, allowing for a run
 delayed while it waits for zero credits. **Still there at 85 and something
@@ -1206,22 +1206,35 @@ nothing will reclaim it until the server takes it. One merged line would
 send somebody to the timer when the drain is down, or the reverse.
 **Nothing other than these two warrants a warning.**
 
-**Two different clocks, and the asymmetry is deliberate.** An undrained row
-has no `synced_at` to measure from, so it is measured from **when it
-happened**. An acknowledged row is measured from **the acknowledgement**,
-because that is when its retention window starts: the gateway is the
-server's backup of last resort, so it holds a row for 30 days from the
-moment the server took responsibility for it, not from when the cabinet
-produced it.
+**The retention clock starts when the server acknowledges a row, not when
+the row was created.** That is the rule, and it decides what each of the two
+lines above can claim.
 
-One consequence worth knowing, because it is the only place the age model
-and the code's rule part company: **a row drained very late is kept longer
-than its own age suggests.** A ticket that printed 40 days ago but was only
-acknowledged yesterday is kept another 30 days from the acknowledgement, and
-is not reported as overdue. That is the safe direction for a backup — the
-server has only just become responsible for it — but if the intent is that
-nothing survives 733 hours of *its own age* regardless of when it drained,
-that is a different rule and this is where it would change.
+The gateway is the server's backup of last resort, so a row is held for its
+window from the moment the server took responsibility for it. **A row
+drained late is therefore kept longer than its own age, never shorter**: a
+ticket that printed 40 days ago but was acknowledged yesterday is kept
+another 30 days, and is not overdue. That is the safe direction for a
+backup, and it is deliberate.
+
+Which means **an undrained row is not "past its retention" — its retention
+has not started.** So that line does not claim one. It reports the row's
+**own age**, says the window has not yet applied, and names the drain:
+
+```
+ALERT: machine_events holds rows up to 86h old that the server has still
+NOT acknowledged. Their retention has not even started -- it begins at the
+acknowledgement, so the 72h window has not yet applied to them -- and §6.4
+forbids deleting them meanwhile. ... This is the DRAIN failing, not the
+pruner.
+```
+
+It is reported at the same age threshold all the same, because it occupies
+the disk exactly like any other row and nothing will reclaim it until the
+server takes it. **The overdue measurement itself is always through the
+acknowledgement**; a row's own age is used only where there is no
+acknowledgement to measure from, and is never dressed up as a retention
+breach.
 
 **A gateway that has never drained anything says nothing about undrained
 rows.** Without a server link every row is undrained forever, by design, so
