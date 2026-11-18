@@ -1182,7 +1182,33 @@ two are easy to confuse:
 | overdue past retention + 13 h | is the **pruner** failing? | rows the server took, whose window has expired, still on disk |
 
 A gateway can be perfectly drained and still fill up, which is why both
-exist.
+exist. **Only eligible data counts here**: a row is eligible once the server
+has acknowledged it and its window has passed. An undrained row is never
+eligible — §6.4 forbids deleting it, so the pruner leaving it alone is
+correct behaviour, not a fault, and it is already reported at 48 hours by
+the alert above. This warning means one thing only: *data the vacuum was
+allowed to remove is still here.* **Nothing else warrants a warning.**
+
+#### Why this one is not in the same class as the pool-age alert
+
+Both print `ALERT:`, and that is where the resemblance ends. The difference
+is whether the gateway keeps doing its job, and a server implementation
+should not treat them alike:
+
+| | if it is ignored |
+|---|---|
+| **pool age stale** (`--pool-age-alert-hours`) | **Nothing stops.** Dispensing is never blocked. It means validation numbers have not been recycled or replaced — a hygiene and design-choice matter, not a functional one. |
+| **retention overdue**, left until the partition fills | **The gateway stops collecting data.** `_safe_commit()` fails on `SQLITE_FULL`, prints a fault, and **the row is not saved**. Nothing is ever deleted to make room, by design. |
+
+That second row is the whole point. Technical v3 §5.9 states the
+consequence directly: if the event-write path does not handle a full
+partition explicitly, *"the gateway silently stops buffering and the
+original no-buffer defect is back."* A disk that fills therefore undoes the
+reason this gateway exists, and the overdue-retention warning is the
+earliest notice that the mechanism meant to prevent it has stopped running.
+
+So: pool age is a note to act on when convenient. Overdue retention is a
+countdown.
 
 **Why 13 hours, and it is derived rather than chosen.** The job runs every
 12 hours, so a row still present 13 hours past its window means **at least
