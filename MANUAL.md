@@ -1097,15 +1097,48 @@ row, the server's copy is the record; analysis tools that read the
 gateway's own database stop seeing events older than three days. Remove
 the flag from `ExecStart` to delete nothing.
 
+**It also runs with `--require-zero-credits`, and that is the one flag not
+to remove.** The scheduled run does nothing at all while there is money on
+the machine. A customer who asks to cash out while the write path is held
+cannot be answered inside the ten seconds §15.7 allows, and **the machine
+locks into a handpay** — the defect this gateway exists to remove. A refused
+ticket in the same window costs nothing by comparison, because the gateway's
+state is untouched. Credits are the precondition for a cashout, so zero
+credits removes the risk.
+
+The gate lives in `db_maintain.py run`, not in the timer, so a server
+driving the tool on its own schedule gets it from the same place and neither
+scheduler can forget it. It is **off on the command line and on in the
+unit**, the same arrangement as `--prune-acked`, so running it by hand on an
+out-of-service cabinet is not blocked by whatever figure the database holds.
+
+A deferred run **logs why and exits 0**, because a deferral is the flag
+working; the next firing tries again. Two readings count as "do not", never
+as zero:
+
+| reading | what happens |
+|---|---|
+| credits are non-zero | deferred, with the figure and its age in the journal |
+| the newest figure is older than `--credit-max-age-s` (120 s) | deferred — the poller is not writing, so the machine's state cannot be established |
+| no `credit_samples` row and no `meters_current` row | deferred — this database cannot say, which is not the same as zero |
+
+**Deferring costs disk; proceeding on a guess costs a handpay.** The figure
+it reads is the same one, from the same two sources in the same order, that
+the heartbeat reports as `credit_meter` — so a deferral can always be
+explained against what the server saw.
+
 #### If a server schedules this instead of the timer
 
 A server can drive `db_maintain.py run` on its own schedule rather than
 leaving it to `systemd`. Three rules, and the first overrides everything
 else in this section.
 
-**Vacuum only when `credit_meter` is zero.** The heartbeat carries
-`credit_meter`, so this is directly observable and needs nothing new on the
-wire. The reason is not tidiness:
+**Vacuum only when `credit_meter` is zero — and `run` already enforces it.**
+Pass `--require-zero-credits` (the timer's unit does) and the tool defers
+itself; a server does not have to implement the gate, only decide whether to
+pass the flag. The heartbeat's `credit_meter` is the same figure the gate
+reads, so a server can also check it before calling. The reason is not
+tidiness:
 
 | what a customer does mid-vacuum | cost |
 |---|---|

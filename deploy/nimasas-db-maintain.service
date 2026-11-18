@@ -17,6 +17,18 @@
 #     machine_events                 72 hours
 #     every other drained table      30 days
 #
+# --require-zero-credits: IT DOES NOTHING WHILE THERE IS MONEY ON THE
+# MACHINE. A customer who asks to cash out while the write path is held
+# cannot be answered inside the ten seconds SAS 6.02 §15.7 allows, and the
+# machine locks into a handpay -- the defect this gateway exists to remove.
+# A refused ticket in the same window costs nothing by comparison, because
+# the gateway's state is untouched. Credits are the precondition for a
+# cashout, so zero credits removes the risk.
+#
+# A deferred run logs why and exits 0, because a deferral is this working.
+# The next firing tries again. A credit figure too stale to trust counts as
+# "do not", never as zero: deferring costs disk, guessing costs a handpay.
+#
 # A row the server has not acknowledged is never deleted, however old.
 # Never pruned at all: the validation pool, the machine epochs, and
 # meters_history -- the last because it does not drain yet, so the server
@@ -60,7 +72,8 @@ User=nimasas
 WorkingDirectory=/home/nimasas/NimaSAS
 ExecStart=/usr/bin/python3 /home/nimasas/NimaSAS/examples/db_maintain.py run \
     --db /home/nimasas/NimaSAS/gateway.sqlite3 \
-    --prune-acked
+    --prune-acked \
+    --require-zero-credits
 # Below the poller in every queue that matters: this is housekeeping, and
 # the poller is on a clock.
 Nice=10

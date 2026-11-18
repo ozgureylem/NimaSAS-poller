@@ -236,6 +236,74 @@ def _when_column(conn: sqlite3.Connection, table: str) -> str | None:
 
 # --- pruning (§6.4) ----------------------------------------------------------
 
+# How fresh the credit figure must be for --require-zero-credits to trust
+# it. The poller writes credit_samples every few cycles; two minutes is
+# several of those, so a reading older than this means the poller is not
+# writing and the gate cannot be evaluated.
+CREDIT_MAX_AGE_S = 120.0
+
+
+def current_credits(conn: sqlite3.Connection, *,
+                    now: str | None = None) -> tuple[int | None, float | None]:
+    """(credits, how many seconds old that figure is), or (None, None).
+
+    THE SAME SOURCE, IN THE SAME ORDER, AS THE HEARTBEAT'S `credit_meter`
+    (gateway/client.py build_heartbeat): newest credit_samples row, else
+    meters_current. The gate has to agree with the number the operator and
+    the server are looking at, or a deferred run cannot be explained.
+
+    None means this database cannot say -- no sample and no meter row. That
+    is not the same as zero and must never be treated as it.
+    """
+    now = now or utc_now()
+    for sql in (
+            "SELECT credits, sampled_at FROM credit_samples "
+            "ORDER BY id DESC LIMIT 1",
+            "SELECT sm_current_credits, polled_at FROM meters_current"):
+        try:
+            row = conn.execute(sql).fetchone()
+        except sqlite3.Error:
+            continue
+        if row is None or row[0] is None or row[1] is None:
+            continue
+        age = conn.execute(
+            "SELECT (julianday(?) - julianday(datetime(?))) * 86400.0",
+            (now, row[1])).fetchone()[0]
+        return int(row[0]), (None if age is None else float(age))
+    return None, None
+
+
+def may_vacuum_now(conn: sqlite3.Connection, *, max_age_s: float = CREDIT_MAX_AGE_S,
+                   now: str | None = None) -> tuple[bool, str]:
+    """(go ahead, why not) for --require-zero-credits.
+
+    WHY THE GATE EXISTS, because it is not about tidiness. If a customer
+    asks to cash out while the write path is held, the host cannot answer
+    inside the ten seconds §15.7 allows and THE MACHINE LOCKS INTO A
+    HANDPAY -- the defect this gateway was built to remove. A refused
+    ticket during the same window costs nothing by comparison. Credits on
+    the machine are the precondition for a cashout, so zero credits is what
+    removes the risk.
+
+    A reading this cannot trust is a refusal, not a go-ahead. Deferring
+    costs disk; proceeding on a guess costs a handpay.
+    """
+    credits, age = current_credits(conn, now=now)
+    if credits is None:
+        return False, ("this database has no credit figure to check (no "
+                       "credit_samples row and no meters_current row)")
+    if age is None or age > max_age_s:
+        shown = "unknown" if age is None else f"{age:.0f}s"
+        return False, (f"the newest credit figure is {shown} old, over the "
+                       f"{max_age_s:.0f}s limit -- the poller is not writing, "
+                       "so the machine's state cannot be established")
+    if credits != 0:
+        return False, (f"the machine holds {credits} credits (read {age:.0f}s "
+                       "ago); a cashout during maintenance would become a "
+                       "handpay")
+    return True, ""
+
+
 def _has_ever_drained(conn: sqlite3.Connection, tables) -> bool:
     """Has this gateway ever had a server link? Judged by evidence -- a row
     that was once acknowledged -- not by a flag.
@@ -528,6 +596,21 @@ def cmd_status(args) -> int:
 
 def cmd_run(args) -> int:
     conn = open_gateway_db(args.db)
+
+    # BEFORE anything takes the write lock, including the prune. Both
+    # schedulers -- the systemd timer and a server driving this tool -- get
+    # the gate from here, so neither can forget it.
+    if getattr(args, "require_zero_credits", False):
+        ok, why = may_vacuum_now(
+            conn, max_age_s=getattr(args, "credit_max_age_s", CREDIT_MAX_AGE_S))
+        if not ok:
+            # Exit 0, not a failure: a deferral is this working correctly.
+            # A non-zero status here would fill the journal with red for a
+            # machine that simply had a player on it.
+            log(f"deferred: {why}. Nothing was pruned or reclaimed; the next "
+                "scheduled run will try again.")
+            return 0
+
     started = time.monotonic()
     deadline = started + args.max_seconds
     before, facts = file_sizes(args.db), page_facts(conn)
@@ -632,6 +715,18 @@ def build_parser() -> argparse.ArgumentParser:
                    "acknowledged rows older than this for EVERY drained "
                    "table. For tests and one-off clean-ups; the timer uses "
                    "--prune-acked.")
+    r.add_argument("--require-zero-credits", action="store_true",
+                   help="do nothing unless the machine's credit meter reads "
+                        "zero. A cashout during maintenance cannot be "
+                        "answered inside the ten seconds SAS 6.02 §15.7 "
+                        "allows, so it becomes a handpay; credits are the "
+                        "precondition for a cashout. OFF here and ON in the "
+                        "timer's unit. A credit figure too stale to trust is "
+                        "treated as 'do not', not as zero.")
+    r.add_argument("--credit-max-age-s", type=float, default=CREDIT_MAX_AGE_S,
+                   help="how fresh the credit figure must be for "
+                        "--require-zero-credits to trust it "
+                        "(default: %(default)s)")
     r.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS,
                    help="stop after this long even with work left "
                    "(default %(default)s); the next run continues")
