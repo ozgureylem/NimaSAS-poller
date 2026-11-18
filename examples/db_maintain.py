@@ -121,8 +121,20 @@ NEVER_PRUNED = frozenset({
     # wiped or un-backed-up laptop loses meter history permanently. The
     # gateway is the backup of last resort, and this is the change that
     # makes it stop being one for meters.
-    "validation_pool", "pool_fills", "counters",
-    "validation_queries", "host_requests",
+    # pool_fills and host_requests LEFT on the operator's decision,
+    # 2026-11-18: both now carry a synced_at, drain, and are pruned on the
+    # 720-hour default like every other drained table.
+    #
+    # validation_pool STAYS. He asked for it too, and it is the one I have
+    # not done: it has no `id`, so neither the drain nor the pruner can
+    # address a row, and it holds the numbers tickets are printed with. A
+    # 720-hour window would delete numbers the server issued and still
+    # believes this gateway holds -- including AVAILABLE ones on a quiet
+    # cabinet -- which costs ticket-printing capacity and leaves nobody able
+    # to say where they went. The table is a few hundred rows; there is
+    # nothing to reclaim. See MANUAL.md and A49.
+    "validation_pool", "counters",
+    "validation_queries",
     # Which machine every other row belongs to. A gateway carried between
     # cabinets needs every epoch it ever recorded to place a late row.
     "machine_epochs"})

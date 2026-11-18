@@ -121,7 +121,8 @@ CREATE TABLE IF NOT EXISTS pool_fills (
     revoked INTEGER NOT NULL DEFAULT 0,-- numbers it revoked, if a replacement
     available_after INTEGER NOT NULL,  -- THE POOL SIZE, counted after the fill
     pool_epoch INTEGER,
-    batch_uuid TEXT
+    batch_uuid TEXT,
+    synced_at TEXT
 );
 -- KEEP IN STEP WITH examples/sql_poll_logger.py's SCHEMA, which defines
 -- pool_fills too because either process may reach a fresh database first.

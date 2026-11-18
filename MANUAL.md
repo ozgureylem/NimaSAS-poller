@@ -1336,8 +1336,42 @@ tables or never fire on the events, so there is one age per type:
 
 | table | retention | warns after |
 |---|---|---|
-| `machine_events` | 72 h — the fast one | **85 h** |
-| `ticket_out_history`, `ticket_in_completions`, `aft_completions`, `handpays` | 720 h (30 days, for disaster recovery) | **733 h** |
+| `machine_events`, `meters_history` | 72 h — the fast ones | **85 h** |
+| every other drained table | 720 h (30 days, for disaster recovery) | **733 h** |
+
+Since 2026-11-18 "every other drained table" means all of
+`ticket_out_history`, `ticket_in_events`, `ticket_in_completions`,
+`handpay_queue`, `aft_transfer_completions`, `interrogations`,
+`stream_gaps`, `poller_lifecycle`, `lab_auto_actions`, and the four that
+gained a `synced_at` that day: **`credit_samples`, `poll_errors`,
+`pool_fills`, `host_requests`**. Before that those four had no window at
+all and nothing could ever bound them.
+
+**`synced_at` is not a local pruning marker — it puts a table on the wire.**
+`drain_tables()` ships anything with both an `id` and a `synced_at` that is
+not in `NEVER_DRAINED`, and pruning *requires* draining, because the rule is
+*delete what the server acknowledged*. A table that does not drain is never
+acknowledged and so never pruned, whatever window it is given. That coupling
+is what decides which tables have the column:
+
+| table | has `synced_at`? | pruned? | why |
+|---|---|---|---|
+| `meters_current` | yes | **no** | one row replaced in place. Held off the wire by `NEVER_DRAINED` — it is the baseline a restart reads to recognise a RAM clear |
+| `sas_link_status` | no | no | one row replaced in place, and no `id` either |
+| `machine_epochs` | no | no | a gateway carried between cabinets needs **every** epoch it ever recorded to place a row that drains weeks later |
+| `interrogation_games` | no | no | child rows of `interrogations`; they belong to their parent, not to a window |
+| `validation_pool` | **no** | **no** | see below |
+
+**Why `validation_pool` is not pruned, although it was asked for.** It has
+no `id`, so neither the drain nor the pruner can address a row. And a
+720-hour window would delete validation numbers the server issued and still
+believes this gateway holds — **including available ones**, which on a quiet
+cabinet can easily sit unused for thirty days. That costs ticket-printing
+capacity, and a cabinet that cannot print a ticket pays by hand, which is
+the defect this gateway exists to remove. Nobody would be able to say where
+the numbers went, either: the server issued fifty and the gateway would
+report fewer. The table is a few hundred rows, so there is nothing to
+reclaim by it.
 
 **`meters_history` is on this schedule too, since 2026-11-18.** It carries a
 `synced_at`, it drains to the server, and `db_maintain` prunes it **72 hours

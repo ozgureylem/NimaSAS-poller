@@ -623,7 +623,8 @@ POOL_FILLS_DDL = """CREATE TABLE IF NOT EXISTS pool_fills (
     revoked INTEGER NOT NULL DEFAULT 0,-- numbers it revoked, if a replacement
     available_after INTEGER NOT NULL,  -- THE POOL SIZE, counted after the fill
     pool_epoch INTEGER,
-    batch_uuid TEXT
+    batch_uuid TEXT,
+    synced_at TEXT
 );"""
 
 SCHEMA = f"""
@@ -682,7 +683,11 @@ CREATE TABLE IF NOT EXISTS credit_samples (
     -- was taken. Non-decreasing within a cycle; a large step between two
     -- samples means the sampler was suppressing itself, which is the
     -- design working rather than a gap in the data.
-    heartbeats INTEGER NOT NULL
+    heartbeats INTEGER NOT NULL,
+    -- Operator, 2026-11-18: every table that CAN be drained and pruned
+    -- should be. Without this the ACK rule has nothing to attach to and the
+    -- table can never be bounded, however much it holds.
+    synced_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_credit_samples_at ON credit_samples (sampled_at);
@@ -803,7 +808,10 @@ CREATE TABLE IF NOT EXISTS poll_errors (
     occurred_at TEXT NOT NULL,
     poll_name TEXT NOT NULL,
     error_type TEXT NOT NULL,
-    message TEXT
+    message TEXT,
+    -- This table spikes: handover §1 records 1,302 rows in one hour when the
+    -- pool-age alert wrote one every cycle. Nothing bounded it.
+    synced_at TEXT
 );
 
 -- WHY A RUN ENDED, written to the DATABASE rather than to stdout.
@@ -1065,7 +1073,8 @@ CREATE TABLE IF NOT EXISTS host_requests (
     -- pool and an expiration, and inventing a column per field would make
     -- this table grow with every request kind.
     request_json TEXT,
-    error TEXT
+    error TEXT,
+    synced_at TEXT
 );
 
 -- The poller asks "is there anything pending" at every poll-slot boundary,
@@ -2346,6 +2355,31 @@ def migrate_epoch_columns(conn: sqlite3.Connection) -> None:
             print(f"migrated: added synced_at to {table} "
                   "(existing rows keep NULL -- they have never been sent, "
                   "and now they can be)")
+    # THE LAST FOUR TABLES WITH NOTHING BOUNDING THEM. Added 2026-11-18 on
+    # the operator's decision that every table which CAN be drained and
+    # pruned should be. Until a table has a synced_at the acknowledge-then-
+    # delete rule of §6.4 has nothing to attach to, so no retention window
+    # can ever apply to it however much it holds -- poll_errors has already
+    # reached 1,302 rows in an hour once (handover §1).
+    #
+    # Existing rows keep NULL, which is exactly true: they have never been
+    # sent. The drain therefore picks the whole backlog up on its first
+    # pass rather than skipping the history that predates the column.
+    #
+    # NOT GIVEN ONE, and each for its own reason: meters_current and
+    # sas_link_status are single rows replaced in place, so there is nothing
+    # to prune; validation_pool has no id and holds the numbers a ticket is
+    # printed with; interrogation_games belongs to its parent row rather
+    # than to a window; machine_epochs must keep every epoch to place a
+    # late row.
+    for table in ("credit_samples", "poll_errors", "pool_fills",
+                  "host_requests"):
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if columns and "synced_at" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN synced_at TEXT")
+            print(f"migrated: added synced_at to {table} "
+                  "(existing rows keep NULL -- they have never been sent, "
+                  "and now they can be, and be pruned at 720h after)")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(machine_events)")}
     if columns and "rte_fields" not in columns:
         conn.execute("ALTER TABLE machine_events ADD COLUMN rte_fields TEXT")
