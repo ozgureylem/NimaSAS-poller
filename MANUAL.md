@@ -1332,7 +1332,58 @@ What bounds it is the **ring, not time**:
 | mode | `meters_history` |
 |---|---|
 | `--mode ring` (the floor default) | capped at `--history-cap` rows, 200 by default, written at most every `--history-interval` seconds |
-| `--mode append` | **bounded by nothing.** It grows for as long as the poller runs |
+| `--mode append` | **bounded by nothing**, unless `--history-max-age-days` is set |
+
+**`--history-max-age-days` is how append mode gets a ceiling without giving
+up what append is for.** It caps by **age**, not by row count, so every
+sample inside the window is kept at full per-poll resolution. Off unless
+given; given without a number it is **40 days**. It applies in both modes.
+
+The file then **levels off** rather than shrinking, and that is the intended
+behaviour rather than a shortfall:
+
+| day, at the measured idle rate (~8.5 MB/day) | no window | 40-day window |
+|---|---|---|
+| 30 | 255 MB | 255 MB |
+| 50 | 425 MB | **340 MB** |
+| 59 | 500 MB — the warning fires | **340 MB** |
+| 365 | ~3 GB, until the partition fills | **340 MB** |
+
+Once the oldest rows start aging off, each day deletes about as much as it
+adds, and **SQLite reuses the freed pages**, so the file stops growing. The
+plateau is roughly *window × daily growth rate*.
+
+**Do not convert such a gateway with `enable-auto-vacuum`.** Returning pages
+to the filesystem and then re-allocating them is extra writes, and on
+flash-based hardware write wear is the binding constraint, not space.
+Reuse-in-place is what you want, and it needs no vacuum at all.
+
+The measured 8.5 MB/day is an **idle** cabinet. Under play the rate is
+higher — a meter decrease, a failed poll or an anomaly makes the next few
+polls log at full resolution — so the plateau is proportionally higher.
+Measure the under-load rate before trusting a figure, and set the window to
+whatever ceiling you want: `--db-size-warning-mb` is the backstop either way.
+
+**What it deletes, stated without softening: the gateway holds the only copy
+of `meters_history`**, because meter rows do not drain to a server yet. A row
+this removes is gone for good. What that does and does not cost:
+
+| | |
+|---|---|
+| cumulative meter totals | **unaffected.** SAS meters are lifetime counters, `meters_current` holds them, and it is in `NEVER_PRUNED` |
+| the drained tables — events, tickets, handpays, AFT | **untouched**, and the server has its own copy of them |
+| per-poll meter resolution older than the window | **gone.** This is the diagnostic time series, and it is the real cost |
+
+So a question like *"what did coin-in read at 14:32 six weeks ago"* stops
+being answerable; *"what is lifetime coin-in"* never does. For comparison, a
+floor gateway in `--mode ring` keeps about 200 rows — a few hours — so a
+40-day window is far more history than the floor retains.
+
+**And it narrows itself the moment meters drain.** While nothing is
+acknowledged the age alone decides. As soon as any `meters_history` row
+carries a `synced_at`, this deletes only acknowledged rows — the same rule
+the ring follows, for the same reason: *disk is recoverable and a deleted
+unacknowledged row is not.*
 
 So a gateway left in `--mode append` fills up without any alert in this
 section saying so — the pruner is not failing, there is simply nothing it is
