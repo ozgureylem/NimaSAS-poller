@@ -481,7 +481,7 @@ A lab/stress-test run: logs every single poll (uncapped), polling every
 | `--drain-priority` / `--no-drain-priority` | **ON** | Above 50% of the event budget §2.3.3 lets a host collect, defer the optional meter sweeps and spend the slots on general polls instead; resume below 30%. Coin in, coin out and games played are still read every cycle — only the 39 single meters, 13 Table C-7 chunks and 12 validation polls are deferred, and all of those are cumulative, so reading them a minute later costs nothing. A real time event the queue drops in the meantime is gone for good: no meter carries a player's turnover. **On by default since 2026-11-11**; it was off until the measurements settled the trade. `--no-drain-priority` turns it off and exists for measuring what the deferral is worth. |
 | `--drain-fast-poll` | off | While drain priority is active, poll at the machine's advertised fast rate (§12.2) instead of `--min-poll-interval`, and go back the moment it ends. Table 7.14e bit 0 is where the machine says it supports this; a machine that has not said so is never polled fast. |
 | `--drain-fast-poll-fallback SECONDS` | — | The rate to use during a drain when the machine advertises no fast rate of its own. |
-| `--server-ticket-authority` | off | **Ticket-in answered by the server** (spec V2 §9). On exception `0x67` the poller writes the escrowed ticket's number to `validation_queries`; the gateway client (`python3 -m gateway.client`, a separate process) sends it as `VALIDATION_QUERY` and writes the answer back; the poller sends LP `0x71` with the server's code and the server's amount. The gateway decides nothing — not validity, not the amount, not even for a ticket it printed. With no client or no server, every ticket is refused with `0x80` and returned, which is correct and not a degraded mode: **a server outage must halt ticket-in** (operator, 2026-11-15; MIGRATION-SPEC-AMENDMENTS A27). This is the only ticket authority there is — the `--lab-ticket-authority` file that once answered locally was removed the same day. The gateway client ships in this repository (`gateway/client.py`, documented in `SERVER-LINK.md`); in a checkout without a reachable server, this flag refuses every ticket. |
+| `--server-ticket-authority` | off | **Ticket-in answered by the server** (spec V2 §9). On exception `0x67` the poller writes the escrowed ticket's number to `validation_queries`; the gateway client (`python3 -m gateway.client`, a separate process) sends it as `VALIDATION_QUERY` and writes the answer back; the poller sends LP `0x71` with the server's code and the server's amount. The gateway decides nothing — not validity, not the amount, not even for a ticket it printed. With no client or no server, every ticket is refused with `0x80` and returned, which is correct and not a degraded mode: **a server outage must halt ticket-in** (MIGRATION-SPEC-AMENDMENTS A27). This is the only ticket authority there is — the `--lab-ticket-authority` file that once answered locally was removed the same day. The gateway client ships in this repository (`gateway/client.py`, documented in `SERVER-LINK.md`); in a checkout without a reachable server, this flag refuses every ticket. |
 | `--ticket-query-timeout SECONDS` | `2.0` | How long the poll loop waits for the server's answer to one ticket before refusing it locally. Nothing else is polled during the wait, so it is restricted to `0.1`–`4.0` — inside §2.3.3's 5 s ceiling. Spec V2 §15 lists `QUERY_TIMEOUT` as "pending lab"; this is a starting value. |
 | `--ticket-query-backoff SECONDS` | `30.0` | After an unanswered query, refuse tickets locally **without asking** for this long (spec V2 §9.2), so customer reinsertion cannot amplify a slow server. |
 | `--pool-age-alert-hours HOURS` | `36.0` | Print an active, repeated `ALERT:` line (and log a `PoolStale` row) every cycle the oldest available `validation_pool` number is at or above this age (spec V2 §7.4, §15). Never blocks dispensing. `0` or negative disables it. |
@@ -906,10 +906,11 @@ Attempts are bounded (ten, with backoff to thirty seconds). After that the
 poller exits and lets the supervisor restart it, because a loop that never
 ends is a gateway that never tells anyone.
 
-Operator, 2026-11-18, on why the default flipped: these floors do not use
-USB adapters, and no asset number is used more than once on a floor — so
-the device-renaming case is not their failure mode, while a headless
-gateway with no SSH that will not restart itself is a site visit.
+The default is on because of what these gateways are. They use hard
+serial ports, not USB adapters, so there is no re-enumeration to rename a
+device. No asset number is used more than once on a floor, so a swapped
+cabinet is identifiable. And they are headless with no SSH, so a poller
+that exits for a supervisor that cannot be reached is a site visit.
 
 **What the server is told about the link.** The poller keeps a one-row
 `sas_link_status` gauge, written **only when the state changes** so that
@@ -947,7 +948,7 @@ signal and the batch field as provenance for that batch.
 and sets `state: "down"`, the gateway sends an `ALERT` of kind
 `sas_link_down` — because a field somebody has to read is not the same as
 being told, and a gateway that gives up quietly at 03:00 is the failure
-this whole section exists to prevent (operator, 2026-11-18).
+this whole section exists to prevent.
 
 Once, and the mechanics matter:
 
@@ -1096,6 +1097,57 @@ The unit as shipped runs with `--prune-acked`. Once the server has a
 row, the server's copy is the record; analysis tools that read the
 gateway's own database stop seeing events older than three days. Remove
 the flag from `ExecStart` to delete nothing.
+
+#### If a server schedules this instead of the timer
+
+A server can drive `db_maintain.py run` on its own schedule rather than
+leaving it to `systemd`. Two things to get right, and the first is a
+correction to the obvious worry.
+
+**`run` does not need to wait for an idle machine.** It is not a `VACUUM`.
+It reclaims space with `PRAGMA incremental_vacuum(200)` — 200 pages per
+call, each a transaction of a few milliseconds, with a 50 ms pause between
+them and the poller writing in the gaps. Pruning is batched the same way,
+500 rows at a time, and the whole run stops at 120 seconds with work left
+for the next one. **Nothing in it holds the write lock for a length of time
+a cashout or a ticket would notice**, so gating it on "no credits, no
+games" is not needed — and it costs something real: a gate like that may
+never open on a busy cabinet, the run never happens, and `--mode append`'s
+sizing assumes two runs a day.
+
+**What it would cost if something did block the write path**, which is the
+number to design against rather than the duration of the block: a ticket
+whose `VALIDATION_QUERY` cannot be written is refused after
+`--ticket-query-timeout` (2 s), and that refusal then sets
+`--ticket-query-backoff` — **30 seconds in which tickets are refused
+locally without asking the server at all** (§9.2). So a ten-second block
+is not ten seconds of refusals; it is closer to forty, and a customer who
+reinserts immediately is refused again. The backoff exists so that
+reinsertion cannot amplify a slow server, and it does not know the slowness
+was self-inflicted.
+
+**The operation that does need the machine out of service is
+`enable-auto-vacuum`**, and "idle" is not a strong enough condition for it.
+It is one full `VACUUM`, run **once per database**, and it rewrites the
+whole file: on a 32-bit gateway with a 150 MB database on flash that is
+longer than the ten seconds §15.7 gives the poller to answer a cashout
+before the machine locks into a handpay. The tool refuses to run unless the
+poller and the gateway client are stopped — and with the poller stopped the
+risk is not a refused ticket but an **unattended cabinet**: nothing is
+draining the exception queue, which §2.2.1 requires to hold only 20
+elements, and a machine being played generates around 2.4 exceptions a
+second, so the queue overruns in roughly eight seconds and the host gets
+exception `0x70` plus a hole in its accounting. Do it with the cabinet out
+of service, not merely with zero credits on it.
+
+**What a server can actually test for idle, today.** The heartbeat carries
+`credit_meter`, so "no credits" is directly observable. **Games played is
+not on the wire** — meter rows do not drain to the server yet — so a
+games-based condition cannot be evaluated from what a server receives; the
+nearest available signal is the absence of recent rows in `EVENT_BATCH`.
+Any idle gate written now should therefore be credits-plus-no-recent-events,
+and should have a timeout after which it runs anyway, so that a cabinet
+which is never idle still gets maintained.
 
 ---
 
@@ -2444,10 +2496,7 @@ turn the next cashout into a handpay.
   (`python3 -m gateway.client`), ticket-in answered by a server, and a
   stand-in server that runs on a Windows or Linux laptop so both can be
   tested before the real gateway service exists. The whole of `gateway/`
-  ships here too, `service.py` included. (Corrected 2026-11-17: this said
-  "private repo only" and pointed at `docs/private/SERVER-LINK.md`, which
-  would have told a reader the server-link half of the system was not
-  delivered.)
+  ships here too, `service.py` included.
 - `saspy/client.py`, and `tests/test_client.py` in the private repository — the authoritative,
   current list of implemented long polls.
 - `saspy/crc.py` and `saspy/framing.py` — the module docstrings there
