@@ -159,7 +159,7 @@ for finding long polls we have not needed yet. Ships so other developers can exp
 ## What is deliberately missing
 
 The private repository sorts every tool into tiers, and one of them is
-**lab-only**: soak drivers, floor-survey apparatus, one-question probes, and
+**lab-only**: soak drivers, bench apparatus, one-question probes, and
 a ticket authority that redeems real tickets. 28 tools. They answer
 questions about one cabinet on one bench and would be noise — or a hazard —
 in a repository meant for building a product.

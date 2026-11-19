@@ -100,6 +100,12 @@ AUTH_TIMEOUT_S = 10.0              # §10.1; "pending lab"
 FRAME_COMPLETION_TIMEOUT_S = 10.0
 MAX_UNAUTHENTICATED = 8            # §10.6 item 2; "pending lab"
 INVITE_TIMEOUT_S = 30.0
+# A gateway that reports rows waiting while this server receives NONE from
+# it, for this long, has a stalled drain. Five minutes is twenty heartbeats
+# and three hundred invitations: a healthy drain delivers within a second
+# or two of each, and a backlog being worked through is delivering, so
+# neither comes near it. Short enough to be told the same morning.
+DRAIN_STALL_S = 300.0
 # How often an idle gateway is invited to drain. §12.2 expects a ticket
 # printed at one machine to be known to the server "in under a second" when
 # it is inserted at another; the heartbeat alone (15 s) cannot give that.
@@ -387,6 +393,13 @@ class Service:
         self.no_used_24h_noted: set[str] = set()
         self.missed_rotation_alerted: dict[str, float] = {}
         self.replay_alerted: set[tuple] = set()
+        # client_id -> rows this server has committed from it in this run,
+        # and for the stall check: (that count when it last moved, when
+        # rows were first seen waiting with none arriving, alerted yet?,
+        # when the last heartbeat came).
+        self.rows_received: dict[str, int] = {}
+        self.drain_progress: dict[str, tuple] = {}
+        self.sas_link_seen: dict[str, str | None] = {}
         self._jump_send_sequences()
         self.public_key = ed25519.public_key(seed)
         # number -> monotonic deadline. §12.2: "Lease timing runs on the
@@ -612,6 +625,97 @@ class Service:
             self.conn.commit()
         return {"placed": placed, "no_epochs_reported": no_epochs,
                 "before_first_epoch": before_first}
+
+    def note_drain(self, client_id: str, queue_depth) -> None:
+        """Raise `drain_stalled` when a gateway has rows waiting and none
+        are arriving. Called on every heartbeat.
+
+        WHY THE SERVER, AND WHY NOW. The gateway used to say so itself:
+        rows unacknowledged for 48 hours raised an alert from its
+        maintenance job. That alert was removed on the operator's decision
+        (2026-11-18, A48), and an undelivered row in a 30-day table is now
+        reported on the gateway only after about a month. A gateway is
+        also the wrong place to notice: it is headless, and the party that
+        knows nothing is arriving is the one it is not arriving AT.
+
+        It matters more than it did, too. The gateway now prunes on the
+        strength of the acknowledgement, so a drain that has stopped is no
+        longer just a disk filling -- it is the retention clock not
+        starting, on rows that exist nowhere else.
+
+        THE SIGNAL is this server's own count of rows committed from the
+        gateway, against the gateway's own `queue_depth`. Not the
+        gateway's `acked` marks: an older client does not send them, and
+        "what I received" is a fact this side holds without being told.
+
+        Three states it must not confuse, and does not:
+          * nothing waiting           -> not stalled, however long
+          * a backlog being worked    -> rows are arriving; not stalled
+          * rows waiting, none coming -> stalled after DRAIN_STALL_S
+        A gateway that is not connected sends no heartbeat and so never
+        reaches here: silence is a different fault with a different sign
+        (`last seen` in `status`).
+
+        Once per episode. It says so again only after the drain has moved
+        and stopped a second time.
+        """
+        if isinstance(queue_depth, bool) or not isinstance(queue_depth, int):
+            return
+        now, received = self.clock(), self.rows_received.get(client_id, 0)
+        last_count, waiting_since, alerted, last_beat = self.drain_progress.get(
+            client_id, (received, None, False, now))
+        # THE CLOCK COUNTS ONLY TIME THIS SERVER WATCHED ROWS WAIT. It
+        # starts at the first heartbeat that shows rows waiting, and starts
+        # again after a gap in heartbeats: a gateway that reconnects after
+        # an hour offline with a backlog has not had a stalled drain for an
+        # hour -- it has not had a link, and it gets its five minutes from
+        # now. Measuring from "when the queue was last seen empty" called
+        # that gateway stalled on its first heartbeat back.
+        if now - last_beat > 4 * 15.0:
+            waiting_since = None
+        if queue_depth <= 0 or received != last_count:
+            if alerted:
+                log(f"{client_id}: drain is moving again "
+                    f"({queue_depth} row(s) still waiting)")
+            self.drain_progress[client_id] = (
+                received, now if queue_depth > 0 else None, False, now)
+            return
+        if waiting_since is None:
+            waiting_since = now
+        self.drain_progress[client_id] = (last_count, waiting_since, alerted, now)
+        if not alerted and now - waiting_since >= DRAIN_STALL_S:
+            self.drain_progress[client_id] = (last_count, waiting_since, True, now)
+            self.alert("drain_stalled",
+                       f"reports {queue_depth} row(s) waiting to drain and "
+                       f"this server has received none for "
+                       f"{(now - waiting_since) / 60:.0f} minutes, with the "
+                       "link up and heartbeats arriving. Until it drains, "
+                       "those rows exist only on the gateway and its "
+                       "retention clock has not started for them. Look for "
+                       "event_too_large or database alerts from this gateway "
+                       "above this one.", client_id)
+
+    def note_sas_link(self, client_id: str, link) -> None:
+        """Log each change of the gateway's serial-link state.
+
+        `egm_status.online` is derived from the age of the last meter row
+        and cannot tell a cable fault from a dead poller. `sas_link` is the
+        poller's own word: up, reconnecting, or down (it gave up). A log
+        line per CHANGE, not per heartbeat, and no alert here -- the
+        gateway raises `sas_link_down` itself, once per outage, and two
+        alerts for one fault is how a channel gets ignored.
+        """
+        state = link.get("state") if isinstance(link, dict) else None
+        if client_id in self.sas_link_seen and self.sas_link_seen[client_id] == state:
+            return
+        first = client_id not in self.sas_link_seen
+        self.sas_link_seen[client_id] = state
+        if state is None:
+            if not first:
+                log(f"{client_id}: serial link state no longer reported")
+            return
+        log(f"{client_id}: serial link to the cabinet is {str(state).upper()}"
+            + (f" ({link.get('detail')})" if link.get("detail") else ""))
 
     def _jump_send_sequences(self) -> None:
         """On start, move every gateway's send sequence up to the clock.
@@ -1034,6 +1138,10 @@ class Service:
             raise
         for kind, detail in notes:
             self.alert(kind, detail, client_id)
+        # Counted only here, after the commit: the stall check asks "has
+        # anything ARRIVED", and a batch that was refused has not.
+        self.rows_received[client_id] = (
+            self.rows_received.get(client_id, 0) + len(acks))
         return acks
 
     def _ticket_printed(self, client_id: str, row: dict, now: str,
@@ -1545,6 +1653,8 @@ class Connection:
         svc.conn.commit()
         svc.note_machine(cid, payload.get("machine"),
                          payload.get("db_instance_id"))
+        svc.note_sas_link(cid, payload.get("sas_link"))
+        svc.note_drain(cid, payload.get("queue_depth"))
         decision = svc.pool_decision(cid, pool)
         if decision is not None:
             await self.send_pool(*decision)
@@ -1925,6 +2035,61 @@ def cmd_pool_size(args) -> int:
     return 0
 
 
+def _duration(seconds) -> str:
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return "an unknown time"
+    if seconds < 120:
+        return f"{seconds:.0f}s"
+    if seconds < 7200:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+def describe_sas_link(link, egm=None) -> str:
+    """One line for `status`: is the cabinet being polled, and if not, why.
+
+    Two signals, read TOGETHER, because neither answers it alone:
+
+      * `sas_link.state` is the poller's own word about the serial port:
+        up, reconnecting, or down (it gave up).
+      * `egm_status.online` is whether a meter row was written in the last
+        two minutes -- whether polling is actually HAPPENING.
+
+    The poller writes the link state only when it CHANGES, to spare the
+    gateway's flash. So "up" may have been written days ago, and the age
+    of that write says nothing: on a healthy gateway it is always old. A
+    poller that has died leaves "up" behind it. What exposes that is the
+    meters going stale while the link still reads up -- and that
+    combination is a dead or hung POLLER, not a cable, which is a
+    different visit by a different person.
+
+    All of it is as of the gateway's last heartbeat, so `last seen` above
+    must be recent for any of it to mean anything.
+    """
+    egm = egm if isinstance(egm, dict) else {}
+    if not isinstance(link, dict) or not link.get("state"):
+        return ("serial link: not reported (a gateway client older than "
+                "2026-11-18, or a poller that has not started since)")
+    state = str(link["state"])
+    held = _duration(link.get("for_s"))
+    detail = f" ({link['detail']})" if link.get("detail") else ""
+    if state == "reconnecting":
+        tries = (f", attempt {link['attempt']} of {link.get('max_attempts', '?')}"
+                 if link.get("attempt") else "")
+        return (f"serial link: RECONNECTING for {held}{tries} -- the poller "
+                f"is alive and cannot open the port; check the cable{detail}")
+    if state == "down":
+        return (f"serial link: DOWN for {held} -- the poller gave up "
+                f"reopening the port; nothing is polling this cabinet{detail}")
+    if state == "up" and egm.get("online") is False:
+        age = egm.get("meters_age_s")
+        stale = (f"no meter row for {_duration(age)}" if age is not None
+                 else "no meter row at all")
+        return (f"serial link: last reported UP, but {stale} -- the POLLER "
+                "has stopped or hung; this is not a cable fault")
+    return f"serial link: {state.upper()} for {held}"
+
+
 def cmd_machines(args) -> int:
     conn = open_db(args.db)
     service = Service(conn, load_seed(args.db))
@@ -2165,6 +2330,7 @@ def cmd_status(args) -> int:
             print(f"    egm online={egm.get('online')} sas={egm.get('sas_version')} "
                   f"queue_depth={beat.get('queue_depth')} "
                   f"credit_meter={beat.get('credit_meter')}")
+            print("    " + describe_sas_link(beat.get("sas_link"), egm))
         age = service.oldest_live_batch_age_hours(cid)
         print(f"    full issue: {service.pool_size(cid)} number(s); oldest "
               "live numbers: " + ("nothing issued yet" if age is None else

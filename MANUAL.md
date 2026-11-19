@@ -2564,19 +2564,41 @@ by hand at a cabinet, where typing the port is less friction than keeping a
 file in step with it. That is a defensible split, not an accident — but it
 is still a split, and it is the kind that only bites people who use both.
 
-### 7.7 Surveying machines on a live floor, headless
+### 7.7 Pointing a tool at a cabinet that is in service
 
-The headless floor-survey apparatus -- a wrapper script and a systemd
-unit that read a cabinet on boot and then power the gateway off, so an
-operator can walk a floor with no keyboard and no screen -- is lab-only
-and is not in this repository.
+Every tool here talks to a cabinet over RS-485, and two of the constraints
+on doing that have nothing to do with which tool it is.
 
-One fact from it applies to a tool that IS here, and is worth keeping:
-`meter_snapshot.py` sends long polls only and **never a general poll**,
-so it cannot consume a queued exception even while it is connected. It
-sends no AFT transfer, no handpay reset, no validation answer and no
-enable/disable. That is what makes it safe to point at a cabinet with a
-player on it.
+**Never plug into a SAS port that a live host is already driving.** Two
+masters on one line collide electrically. Both sides see CRC failures and
+timeouts, and the casino's own system starts logging faults against a
+machine that is fine. If the cabinet is wired to a CMS, **the cable has to
+be swapped, not shared** — and that is an operations decision, not a
+technical one.
+
+**Work on idle cabinets, and this is the constraint most often missed.**
+§2.2.1 requires a FIFO exception queue "of at least 20 elements in
+non-volatile memory", and says that "in the event of exception queue
+overrun, the oldest exception is lost". **While the CMS cable is unplugged,
+nothing is draining that queue.** On an idle machine almost nothing is
+generated and a ninety-second swap costs the CMS nothing. On a machine being
+played, a single player generates around **2.4 exceptions a second** — so a
+20-element queue fills in about **eight seconds**, and when the cable goes
+back the host gets exception `0x70`, buffer overflow, plus a hole in its
+accounting.
+
+So: **nobody playing, cable swapped rather than shared, back within the
+minute.** None of that is about this software being unsafe. It is what any
+second host on a SAS line costs the first one.
+
+**What `meter_snapshot.py` cannot do to a machine**, which is why it is the
+tool to reach for when a cabinet cannot be taken out of service: it sends
+**long polls only and never a general poll**, so it cannot consume a queued
+exception even while it is connected. It sends no AFT transfer, no handpay
+reset, no validation answer and no enable/disable. That is what makes it
+safe to point at a cabinet with a player on it — the electrical caution
+above still applies.
+
 ## 8. What the machines settled, and the tools that settled it
 
 Everything in this section was read off hardware between 26 and 30 October
@@ -2773,6 +2795,40 @@ committed while the mint failed would leave the gateway unable to dispense and
 turn the next cashout into a handpay.
 
 ---
+
+### 8.8 Max bet does not come from LP `0x1F`, and this was got wrong for weeks
+
+Table 7.10 makes LP `0x1F`'s max bet **one binary byte**: `01-FF`, "or FF if
+largest configured max bet greater than or equal to 255". **255 is a
+sentinel meaning "at least 255", never a reading.**
+
+The lab EGT reports 255 while eleven of its forty-eight games are configured
+above it and the true largest is **500**.
+
+LP `0xB5` is 2 BCD (0000–9999), and at **game number 0** Table 7.23b has it
+return "the largest max bet value" across every game the machine supports —
+the machine-level answer, unsaturated, and reachable even on a machine that
+answers LP `0x51` with zero games. `meter_snapshot.py` asks for game 0 first
+and unconditionally for exactly that reason.
+
+**Every zoom roulette station in the October survey reported 255; those
+cabinets' real max bets are still unknown.**
+
+### 8.9 The gateway's clock and the machine's are two different clocks
+
+A gateway carried to a cabinet may have no network and a flat RTC battery,
+so its own clock can be arbitrarily wrong — and then every file's
+`taken_at_utc` is wrong together, while looking perfectly fine. The EGM
+keeps its own time (LP `0x7E`), so recording both is what lets you work out
+later which clock to distrust.
+
+**They are in different time zones**, which is worth knowing before anyone
+subtracts one from the other. `taken_at_utc` is UTC; the machine reports its
+own **local** time. Measured on the lab cabinet: `taken_at_utc` 17:56:55
+against `machine_time` 115655 — 11:56:55 CST, the same instant, six hours
+apart on the page. **SAS does not report the cabinet's configured offset**,
+so the conversion is something you have to know rather than something the
+data carries.
 
 ## 9. Where to go next
 

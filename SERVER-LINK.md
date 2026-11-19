@@ -316,6 +316,34 @@ as it issues.
 `meters_history` drains like any other table but is **not pruned** on the
 gateway: that guard is deliberately still in place.
 
+### 2.5 What the server watches for by itself
+
+Two things a headless gateway cannot usefully report about itself:
+
+**A stalled drain.** If a gateway's heartbeat reports rows waiting and the
+server has received none from it for five minutes, the server raises
+`drain_stalled`, once per episode. A backlog that is being worked through
+is not a stall, however large; neither is a gateway that has only just
+reconnected. This matters because the gateway prunes on the server's
+acknowledgement: while a drain is stalled those rows exist only on the
+gateway, and the gateway itself no longer warns about undelivered rows
+until they are about a month old.
+
+**Whether the cabinet is being polled, and if not, why.** `status` prints
+one line per gateway from two signals read together:
+
+| `status` says | meaning |
+|---|---|
+| `serial link: UP for 3.2 h` | polling normally |
+| `RECONNECTING for 95s, attempt 4 of 10` | the poller is alive and cannot open the port: a cable or adapter |
+| `DOWN for 2.0 h` | the poller gave up reopening the port; nothing is polling |
+| `last reported UP, but no meter row for 25 min` | the **poller** has stopped or hung; not a cable |
+
+The last line is the reason both signals are needed. The poller writes its
+link state only when it changes, so a poller that dies leaves "up" behind
+it; what exposes it is the meters going stale. The gateway also sends an
+`ALERT` of kind `sas_link_down`, once per outage, when the poller gives up.
+
 ## 3. A test, with the prediction written down first
 
 | # | do this | predict this |
