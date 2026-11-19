@@ -10,8 +10,9 @@ WHY THIS IS NOT A CRON LINE SAYING `VACUUM`.
 
 VACUUM rewrites the whole file. While it does, nothing else can write --
 and the poller has ten seconds to answer a cashout (SAS 6.02 §15.7) before
-the machine gives up and locks into a handpay. On a 32-bit gateway with a
-150 MB database on flash, a VACUUM is longer than that. A nightly VACUUM
+the machine gives up and locks into a handpay. MEASURED ON THE LAB PI,
+2026-11-19: 34.6 SECONDS for a 103.6 MB database, 3.5x that window. It was
+an estimate here until then. A nightly VACUUM
 is therefore a nightly window in which a cashout becomes a handpay, and an
 event queue that nobody is draining. It also needs free disk about equal
 to the database (spec §6.5), so it cannot rescue a disk that is filling.

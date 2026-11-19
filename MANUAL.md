@@ -1228,7 +1228,9 @@ the run's time limit and continues on the next one.
 
 **`enable-auto-vacuum` is the exception, and it is not a scheduled job.** One
 full `VACUUM`, once per database, rewriting the whole file: on a 32-bit
-gateway with a 150 MB database that is longer than §15.7's ten seconds. The
+gateway that is far longer than §15.7's ten seconds — **measured on the lab
+Pi on 2026-11-19: 34.6 s for a 103.6 MB database**, three and a half times
+the window a cashout has before the machine locks into a handpay. The
 tool refuses to run unless the poller and gateway client are stopped. Do it
 with the cabinet **out of service**, where the exposure above does not
 apply at all — and note that with the poller stopped nothing is draining the
