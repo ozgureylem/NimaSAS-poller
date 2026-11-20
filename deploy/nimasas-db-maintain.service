@@ -79,12 +79,15 @@ WorkingDirectory=/home/nimasas/NimaSAS
 ExecStart=/usr/bin/python3 /home/nimasas/NimaSAS/examples/db_maintain.py run \
     --db /home/nimasas/NimaSAS/gateway.sqlite3 \
     --prune-acked \
-    --require-zero-credits
+    --require-zero-credits \
+    --repeat-min-freed-mb 7
 # Below the poller in every queue that matters: this is housekeeping, and
 # the poller is on a clock.
 Nice=10
 IOSchedulingClass=idle
-TimeoutStartSec=300
+# One cycle may be up to ten 120 s runs with a pause between them
+# (--repeat-min-freed-mb): about 21 minutes. This was 300 for a single run.
+TimeoutStartSec=1500
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=nimasas-db-maintain

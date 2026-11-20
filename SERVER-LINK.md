@@ -346,8 +346,11 @@ it; what exposes it is the meters going stale. The gateway also sends an
 
 ### 2.6 Maintenance on the server's say-so
 
-The gateway prunes and reclaims on its own timer (03:45 and 15:45). The
-server can also ask for a run now:
+The gateway prunes and reclaims on its own timer (03:45 and 15:45). Each
+of those cycles repeats the 120-second run straight away, up to ten
+times, for as long as a run returns at least 7 MB, then stops until the
+next cycle; every repeat checks the zero-credit gate again. The server
+can also ask for a run now:
 
 ```
 python -m gateway.service --db <stand-in db> maintain LAB-001
@@ -368,13 +371,14 @@ window and under ALERTS in `status`:
 | `maintenance_failed` | the tool exited with an error, or hung and was killed after 300 s |
 | `maintenance_refused` | the gateway would not start it: one already running, more than six in an hour, or a malformed request |
 
-Three options, and they are the whole of what a server can choose:
+Four options, and they are the whole of what a server can choose:
 
 | Option | Effect |
 |---|---|
 | `--no-prune` | reclaim free pages only; delete nothing |
 | `--ignore-credits` | run even while the machine holds credits |
 | `--wait-for-zero MINUTES` | if deferred, hold the request up to this long (720 at most) and run it when credits reach zero |
+| `--repeat-min-freed-mb MB` | run again, up to ten times, until a run shrinks the database file by less than this |
 
 **Without `--wait-for-zero` a deferred request is over.** Credits reaching
 zero afterwards start nothing; the next run is the timer's, or the next
@@ -388,6 +392,21 @@ the client restarts, the request is dropped and must be sent again.
 A run that starts the moment credits reach zero starts just after a
 cashout, which is when the next player may sit down. That is why waiting
 is asked for and not the default.
+
+**`--repeat-min-freed-mb`** exists because one run is limited to 120 seconds,
+and space comes back slowly: on the lab gateway two runs returned 8.6 and
+8.5 MB each with about 50 MB still free. With `--repeat-min-freed-mb 7` the
+gateway starts the tool again five seconds after each run for as long as
+the file shrank by at least 7 MB, ten runs at most, and sends **one**
+`maintenance_done` at the end with the total and each run's figure. Each
+run is a fresh start of the tool, so **each one passes the zero-credit
+gate again**. If credits appear part-way: with `--wait-for-zero` the
+series holds and carries on at zero; without it the series ends and what
+was already returned is reported as done, "stopped early".
+
+```
+python -m gateway.service --db <stand-in db> maintain LAB-001 --wait-for-zero 30 --repeat-min-freed-mb 7
+```
 
 `--ignore-credits` is for a lab. The gate exists because a cashout that
 arrives while the database is busy can run out its ten seconds and become
@@ -501,8 +520,10 @@ client derives `online`.
 **`0x02` PULL_INVITE** (S→G) —
 `{"invite_id", "max_events", "pool_topup"?, "replay"?, "maintain"?}`.
 `maintain` † is `{"prune_acked": bool, "require_zero_credits": bool,
-"wait_for_zero_s"?: int}` (the booleans default true and anything not a
-boolean is refused; the wait is 0 to 43200 seconds) and is answered later
+"wait_for_zero_s"?: int, "repeat_min_freed_bytes"?: int}` (the booleans
+default true and anything not a boolean is refused; the wait is 0 to
+43200 seconds; the repeat threshold is bytes of file shrinkage, 0 = one
+run) and is answered later
 by an `ALERT` of kind `maintenance_done`, `_deferred`, `_waiting`,
 `_failed` or `_refused` — see §2.6.
 `pool_topup` is a signed batch, below. `replay` † is

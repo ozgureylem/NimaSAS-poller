@@ -660,11 +660,24 @@ append wrote every cycle and the interval was ring-only.
 which is what each did before — so no existing command line changed. `0` is
 every cycle explicitly.
 
-**This is what lets a floor gateway run `append`.** The ring kept 200 rows,
-a few hours, which is not a disaster-recovery window; append at
-`--history-interval 1800` keeps every sample for the full 720-hour retention
-at about **48 rows a day — near 1.4 MB**, against roughly 264 MB if it wrote
-every cycle. `deploy/nimasas-poller.service` ships that way.
+**This is what lets a floor gateway run `append`.** The ring kept 200 rows —
+a few hours, which is not a disaster-recovery window. Append with a cadence
+keeps the full 720-hour retention instead, and the cadence sets the price:
+
+| `--history-interval` | rows/day | over the 720 h window |
+|---|---|---|
+| unset in append (every cycle) | ~9,072 | ≈ 255 MB |
+| **89 s — what the floor ships** | **~971** | **≈ 27 MB** |
+| 1800 s | ~48 | ≈ 1.3 MB |
+
+`deploy/nimasas-poller.service` ships **89 s**: thirty days of meter history
+at roughly a minute and a half of resolution, for about 27 MB against a
+512 MB warning.
+
+**89 is prime on purpose.** `--full-meter-interval` is 593 and
+`--validation-meters-interval` is 293, both prime for the same reason: a
+round cadence beats against the others and bunches writes into the same
+cycles instead of spreading them.
 
 A burst starts when any *cumulative* meter value goes down since the
 last successful poll (SAS meters are cumulative counters — a decrease

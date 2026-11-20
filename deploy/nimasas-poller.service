@@ -96,7 +96,7 @@ ExecStart=/usr/bin/python3 /home/nimasas/NimaSAS/examples/sql_poll_logger.py \
     --db /home/nimasas/NimaSAS/gateway.sqlite3 \
     --rte \
     --mode append \
-    --history-interval 1800 \
+    --history-interval 89 \
     --min-poll-interval 0.2 \
     --heartbeat-every 1 \
     --interval 2.0 \

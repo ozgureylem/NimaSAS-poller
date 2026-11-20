@@ -141,6 +141,16 @@ MAINTAIN_KILL_AFTER_S = 300.0
 # The last matters when the figure reads zero but is stale: the tool
 # refuses a stale figure, and without a spacing the client would start it
 # again on every look.
+# "Repeat until little comes back" (operator, 2026-11-19, after two
+# hardware runs returned 8.6 and 8.5 MB each with ~50 MB still free): one
+# request may run the tool again while each run shrinks the file by at
+# least the amount the server names. Every run is a fresh start of the
+# tool, so EVERY run passes the zero-credit gate again. Ten runs is twenty
+# minutes of work at the tool's own 120 s limit; the pause lets the poller
+# and the drain have the database to themselves in between.
+MAINTAIN_REPEAT_MAX_RUNS = 10
+MAINTAIN_REPEAT_PAUSE_S = 5.0
+MAINTAIN_REPEAT_MAX_BYTES = 1 << 40
 MAINTAIN_WAIT_MAX_S = 12 * 3600
 MAINTAIN_WAIT_LOOK_S = 2.0
 MAINTAIN_WAIT_RETRY_S = 30.0
@@ -633,6 +643,10 @@ class Link:
         #  "waited_from", "why"}. In memory only -- a client restart drops
         # it, and the server is told nothing further about that request.
         self.maintenance_wait: dict | None = None
+        # A request that asked to be repeated: {"command", "row_id",
+        # "below", "runs": [bytes each run gave back], "pending",
+        # "next_start"}. In memory only, like the wait.
+        self.maintenance_repeat: dict | None = None
         self.indexed: frozenset = frozenset()
 
     # -- sending --
@@ -849,6 +863,16 @@ class Link:
                    options)
             return
         options["wait_for_zero_s"] = wait_s
+        below = request.get("repeat_min_freed_bytes", 0)
+        if (isinstance(below, bool) or not isinstance(below, int)
+                or not 0 <= below <= MAINTAIN_REPEAT_MAX_BYTES):
+            refuse("repeat_min_freed_bytes must be a whole number of bytes from 0 "
+                   f"to {MAINTAIN_REPEAT_MAX_BYTES}, got {below!r}")
+            return
+        options["repeat_min_freed_bytes"] = below
+        if self.maintenance_repeat is not None:
+            refuse("an earlier request is still repeating", options)
+            return
         if self.maintenance is not None:
             refuse("a maintenance run is already in progress", options)
             return
@@ -873,6 +897,7 @@ class Link:
             command.append("--prune-acked")
         if options["require_zero_credits"]:
             command.append("--require-zero-credits")
+        size = self._db_bytes()
         output = tempfile.TemporaryFile(mode="w+")
         try:
             process = subprocess.Popen(command, stdout=output,
@@ -887,14 +912,75 @@ class Link:
             "VALUES (?, ?, 'running')",
             (now, json.dumps(options, sort_keys=True))).lastrowid
         self.conn.commit()
-        self.maintenance = (process, output, row_id, clock())
+        self.maintenance = (process, output, row_id, clock(), size)
         if wait_s:
             self.maintenance_wait = {
                 "command": command, "row_id": row_id, "why": "",
                 "waited_from": clock(), "deadline": clock() + wait_s,
-                "next_look": 0.0, "announced": False,
+                "next_look": 0.0, "announced": False, "holding": False,
                 "next_start": clock() + MAINTAIN_WAIT_RETRY_S}
+        if below:
+            self.maintenance_repeat = {
+                "command": command, "row_id": row_id, "below": below,
+                "runs": [], "pending": False, "next_start": 0.0}
         log(f"maintenance started at the server's request: {options}")
+
+    def _record_maintenance(self, row_id, outcome, summary, *,
+                            finished=True) -> None:
+        """Best effort. The alert and the log line are the report; this
+        row is the gateway's own copy, and a locked database must not cost
+        the report."""
+        try:
+            self.conn.execute(
+                "UPDATE link_maintenance SET outcome = ?, finished_at = ?, "
+                "output = ? WHERE id = ?",
+                (outcome, utc_now() if finished else None, summary, row_id))
+            self.conn.commit()
+        except sqlite3.Error as e:
+            log(f"could not record maintenance outcome {outcome!r}: {e}")
+
+    def _db_bytes(self) -> int:
+        """The database file alone. What a run "gave back" is how much
+        smaller this got: measured, not read out of the tool's wording."""
+        try:
+            return os.path.getsize(self.db_path)
+        except OSError:
+            return 0
+
+    def _start_again(self, command, row_id, now) -> str | None:
+        """Start the tool for a request that already has its row. Returns
+        why not, or None."""
+        size = self._db_bytes()
+        output = tempfile.TemporaryFile(mode="w+")
+        try:
+            process = subprocess.Popen(command, stdout=output,
+                                       stderr=subprocess.STDOUT,
+                                       stdin=subprocess.DEVNULL)
+        except OSError as e:
+            output.close()
+            return f"could not start the maintenance run: {e}"
+        self.maintenance = (process, output, row_id, now, size)
+        return None
+
+    def _repeat_summary(self, repeat) -> str:
+        runs = repeat["runs"]
+        return (f"{len(runs)} run(s), {sum(runs) / 1e6:.1f} MB returned in "
+                f"total ({', '.join(f'{r / 1e6:.1f}' for r in runs)})")
+
+    def _pump_maintenance_repeat(self, clock) -> None:
+        repeat = self.maintenance_repeat
+        if (repeat is None or not repeat["pending"]
+                or self.maintenance is not None):
+            return
+        now = clock()
+        if now < repeat["next_start"]:
+            return
+        why = self._start_again(repeat["command"], repeat["row_id"], now)
+        if why is not None:
+            repeat["next_start"] = now + MAINTAIN_WAIT_RETRY_S
+            return
+        repeat["pending"] = False
+        log(f"maintenance run {len(repeat['runs']) + 1} starting (repeat)")
 
     def _credits_read_zero(self) -> bool:
         """The client's own cheap look, used only to decide when to START
@@ -910,22 +996,28 @@ class Link:
 
     def _pump_maintenance_wait(self, clock) -> None:
         wait = self.maintenance_wait
-        if wait is None or self.maintenance is not None:
+        if (wait is None or not wait["holding"]
+                or self.maintenance is not None):
             return
         now = clock()
         if now >= wait["deadline"]:
             minutes = (wait["deadline"] - wait["waited_from"]) / 60
-            summary = (f"waited {minutes:.0f} min and the machine was never "
-                       f"at zero credits; nothing was pruned or reclaimed. "
-                       f"Last answer: {wait['why']}")[-1400:]
-            self.conn.execute(
-                "UPDATE link_maintenance SET outcome = 'deferred', "
-                "finished_at = ?, output = ? WHERE id = ?",
-                (utc_now(), summary, wait["row_id"]))
-            self.conn.commit()
-            self.maintenance_wait = None
-            log(f"maintenance deferred: {summary}")
-            self.maintenance_report = ("maintenance_deferred", summary)
+            repeat, outcome = self.maintenance_repeat, "deferred"
+            if repeat is not None and repeat["runs"]:
+                # Runs already happened; the machine then took credits and
+                # kept them. That is work done, cut short -- not a deferral.
+                outcome = "done"
+                summary = (f"{self._repeat_summary(repeat)} | stopped early: "
+                           f"the machine held credits until the {minutes:.0f} "
+                           f"min wait ran out. Last answer: {wait['why']}")[-1400:]
+            else:
+                summary = (f"waited {minutes:.0f} min and the machine was "
+                           "never at zero credits; nothing was pruned or "
+                           f"reclaimed. Last answer: {wait['why']}")[-1400:]
+            self.maintenance_wait = self.maintenance_repeat = None
+            log(f"maintenance {outcome}: {summary}")
+            self.maintenance_report = (f"maintenance_{outcome}", summary)
+            self._record_maintenance(wait["row_id"], outcome, summary)
             return
         if now < wait["next_look"] or now < wait["next_start"]:
             return
@@ -936,25 +1028,19 @@ class Link:
             return                          # the poller has the lock; look again
         if not zero:
             return
-        output = tempfile.TemporaryFile(mode="w+")
-        try:
-            process = subprocess.Popen(wait["command"], stdout=output,
-                                       stderr=subprocess.STDOUT,
-                                       stdin=subprocess.DEVNULL)
-        except OSError as e:
-            output.close()
-            wait["why"] = f"could not start the maintenance run: {e}"
-            wait["next_start"] = now + MAINTAIN_WAIT_RETRY_S
-            return
         wait["next_start"] = now + MAINTAIN_WAIT_RETRY_S
-        self.maintenance = (process, output, wait["row_id"], now)
+        why = self._start_again(wait["command"], wait["row_id"], now)
+        if why is not None:
+            wait["why"] = why
+            return
+        wait["holding"] = False
         log("credits read zero: starting the maintenance run that was waiting")
 
     def pump_maintenance(self, *, clock=time.monotonic) -> None:
         """Collect a finished run and tell the server how it ended. Called
         every tick; does nothing while a run is still going."""
         if self.maintenance is not None:
-            process, output, row_id, started = self.maintenance
+            process, output, row_id, started, size_before = self.maintenance
             code = process.poll()
             if code is None and clock() - started > MAINTAIN_KILL_AFTER_S:
                 process.kill()
@@ -981,16 +1067,52 @@ class Link:
                     outcome = "done"
                 summary = " | ".join(lines)[-1400:] or "(no output)"
                 wait = self.maintenance_wait
-                if wait is not None and wait["row_id"] == row_id:
+                repeat = self.maintenance_repeat
+                if (outcome == "done" and repeat is not None
+                        and repeat["row_id"] == row_id):
+                    gave = max(0, size_before - self._db_bytes())
+                    repeat["runs"].append(gave)
+                    log(f"maintenance run {len(repeat['runs'])}: "
+                        f"{gave / 1e6:.1f} MB returned | {summary}")
+                    if (gave >= repeat["below"]
+                            and len(repeat["runs"]) < MAINTAIN_REPEAT_MAX_RUNS):
+                        repeat["pending"] = True
+                        repeat["next_start"] = clock() + MAINTAIN_REPEAT_PAUSE_S
+                        outcome = None
+                    else:
+                        why = ("the run limit was reached"
+                               if gave >= repeat["below"] else
+                               f"the last run returned under "
+                               f"{repeat['below'] / 1e6:.1f} MB")
+                        summary = (f"{self._repeat_summary(repeat)}; stopped "
+                                   f"because {why} | last run: {summary}")[-1400:]
+                elif (outcome == "deferred" and repeat is not None
+                        and repeat["runs"]
+                        and not (wait is not None and clock() < wait["deadline"])):
+                    outcome = "done"
+                    summary = (f"{self._repeat_summary(repeat)} | stopped "
+                               f"early: {summary}")[-1400:]
+                elif outcome == "failed" and repeat is not None and repeat["runs"]:
+                    summary = (f"{self._repeat_summary(repeat)} before this "
+                               f"| {summary}")[-1400:]
+                if outcome is None:
+                    pass
+                elif wait is not None and wait["row_id"] == row_id:
                     if outcome == "deferred" and clock() < wait["deadline"]:
+                        wait["holding"] = True
                         # Not an ending. Hold the request, and say so ONCE:
                         # a server that asked and heard nothing for half an
                         # hour could not tell waiting from lost.
                         wait["why"] = summary
-                        self.conn.execute(
-                            "UPDATE link_maintenance SET outcome = 'waiting', "
-                            "output = ? WHERE id = ?", (summary, row_id))
-                        self.conn.commit()
+                        self._record_maintenance(row_id, "waiting", summary,
+                                                 finished=False)
+                        if wait["announced"]:
+                            # Hardware, 2026-11-19: a run started from the
+                            # wait and then nothing was ever printed. A
+                            # second deferral was the one ending that said
+                            # nothing anywhere. The server is still told
+                            # once; this log is told every time.
+                            log(f"maintenance still waiting: {summary}")
                         if not wait["announced"]:
                             wait["announced"] = True
                             left = (wait["deadline"] - clock()) / 60
@@ -1000,17 +1122,16 @@ class Link:
                             log(f"maintenance waiting: {note}")
                             self.maintenance_report = ("maintenance_waiting", note)
                         outcome = None
-                    else:
-                        self.maintenance_wait = None
                 if outcome is not None:
-                    self.conn.execute(
-                        "UPDATE link_maintenance SET outcome = ?, "
-                        "finished_at = ?, output = ? WHERE id = ?",
-                        (outcome, utc_now(), summary, row_id))
-                    self.conn.commit()
+                    self.maintenance_wait = self.maintenance_repeat = None
+                    # Said and queued BEFORE the row is written. The write
+                    # can meet the poller's lock, and an outcome lost to
+                    # that is a run nobody ever hears the end of.
                     log(f"maintenance {outcome}: {summary}")
                     self.maintenance_report = (f"maintenance_{outcome}", summary)
+                    self._record_maintenance(row_id, outcome, summary)
         self._pump_maintenance_wait(clock)
+        self._pump_maintenance_repeat(clock)
         if self.maintenance_report is not None and self.sock is not None:
             # Kept until it is actually sent. A run that finishes while the
             # link is down must still be reported when it comes back.

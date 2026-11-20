@@ -2345,6 +2345,12 @@ def cmd_maintain(args) -> int:
                "require_zero_credits": not args.ignore_credits}
     if wait_min:
         options["wait_for_zero_s"] = int(wait_min * 60)
+    below_mb = getattr(args, "repeat_min_freed_mb", 0) or 0
+    if not 0 <= below_mb <= 100000:
+        print("--repeat-min-freed-mb is in megabytes, 0 or more.", file=sys.stderr)
+        return 2
+    if below_mb:
+        options["repeat_min_freed_bytes"] = int(below_mb * 1_000_000)
     conn.execute("INSERT INTO commands (created_at, client_id, kind, detail) "
                  "VALUES (?, ?, 'maintain', ?)",
                  (utc_now(), args.client_id, json.dumps(options, sort_keys=True)))
@@ -2360,6 +2366,11 @@ def cmd_maintain(args) -> int:
               f"maintenance_waiting, holds the request for up to {wait_min:g} "
               "min, and starts the run by itself when credits read zero. If "
               "they never do, it answers maintenance_deferred at the end.")
+    if below_mb:
+        print(f"The gateway runs it again, up to ten times, while each run "
+              f"shrinks the database file by at least {below_mb:g} MB. Every "
+              "run checks the credits again. One alert at the end gives the "
+              "total.")
     print("The running service sends it within a second if the gateway is "
           "connected. The run takes up to two minutes; the result arrives in "
           "the `serve` window and under ALERTS in `status` as "
@@ -2583,6 +2594,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="if the machine holds credits, have the gateway hold "
                         "the request this long and run it when credits reach "
                         "zero (default 0: one attempt, no waiting)")
+    m.add_argument("--repeat-min-freed-mb", type=float, default=0, metavar="MB",
+                   help="run again, up to ten times, until a run shrinks the "
+                        "database file by less than this (default 0: one run)")
     m.set_defaults(func=cmd_maintain)
 
     sub.add_parser("machines", help="which cabinets each gateway has been "

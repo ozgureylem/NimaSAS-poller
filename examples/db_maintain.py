@@ -701,6 +701,51 @@ def cmd_run(args) -> int:
     return 0
 
 
+# Operator, 2026-11-19, after two hardware runs each returned ~8.5 MB in
+# their 120 s with ~50 MB still free: "repeat run without waiting 12 hours;
+# once it is less than 7 MB, it should still wait for the next cycle."
+# Ten runs is twenty minutes; the pause gives the poller the database to
+# itself between them.
+REPEAT_MAX_RUNS = 10
+REPEAT_PAUSE_S = 5.0
+
+
+def cmd_run_repeating(args, *, sleep=time.sleep) -> int:
+    """`run`, again and again while each run shrinks the file by at least
+    --repeat-min-freed-mb. Without that option: exactly one run, as before.
+
+    EVERY repeat is a whole cmd_run, so every repeat passes the credit
+    gate again -- a player who sits down between two runs stops the
+    series. A deferred run shrinks nothing, which is below any threshold,
+    so it ends the series by the same rule and needs no case of its own.
+
+    What a run "returned" is measured on the file, not taken from what it
+    printed.
+    """
+    below = getattr(args, "repeat_min_freed_mb", 0) * 1_000_000
+    runs = 0
+    while True:
+        before = file_sizes(args.db)["db"]
+        rc = cmd_run(args)
+        runs += 1
+        if rc != 0 or below <= 0:
+            return rc
+        gave = before - file_sizes(args.db)["db"]
+        if gave < below:
+            log(f"run {runs} returned {mb(max(gave, 0))}, under the "
+                f"{args.repeat_min_freed_mb:g} MB that would repeat it; the next "
+                "scheduled cycle continues")
+            return rc
+        if runs >= REPEAT_MAX_RUNS:
+            log(f"run {runs} returned {mb(gave)} and more could follow, but "
+                f"{REPEAT_MAX_RUNS} runs is the limit for one cycle; the "
+                "next scheduled cycle continues")
+            return rc
+        log(f"run {runs} returned {mb(gave)}; running again in "
+            f"{REPEAT_PAUSE_S:g}s")
+        sleep(REPEAT_PAUSE_S)
+
+
 def cmd_enable(args) -> int:
     ok, message = enable_auto_vacuum(args.db)
     print(message if ok else f"REFUSED: {message}", file=sys.stdout if ok else sys.stderr)
@@ -750,7 +795,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS,
                    help="stop after this long even with work left "
                    "(default %(default)s); the next run continues")
-    r.set_defaults(func=cmd_run)
+    r.add_argument("--repeat-min-freed-mb", type=float, default=0.0, metavar="MB",
+                   help="run again straight away, up to "
+                   f"{REPEAT_MAX_RUNS} times, for as long as a run shrinks "
+                   "the database file by at least this much; then stop until "
+                   "the next scheduled cycle. Every repeat checks the credit "
+                   "gate again. Default 0: one run")
+    r.set_defaults(func=cmd_run_repeating)
 
     e = sub.add_parser("enable-auto-vacuum",
                        help="ONE-TIME: convert the database so `run` can "
