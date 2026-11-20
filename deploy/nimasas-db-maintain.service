@@ -29,11 +29,17 @@
 # The next firing tries again. A credit figure too stale to trust counts as
 # "do not", never as zero: deferring costs disk, guessing costs a handpay.
 #
-# A row the server has not acknowledged is never deleted, however old.
-# Never pruned at all: the validation pool, the machine epochs, and
-# meters_history -- the last because it does not drain yet, so the server
-# holds no copy of it. In --mode append that table therefore still grows;
-# this job cannot bound it until meters drain.
+# A row the server has not acknowledged is never deleted, however old. A
+# gateway with no server therefore prunes nothing and grows, deliberately:
+# disk is recoverable and a deleted unacknowledged row is not.
+#
+# Never pruned at all: the validation pool, the machine epochs, and the
+# single-row tables (meters_current, sas_link_status) -- one row replaced
+# in place has nothing to prune.
+#
+# meters_history IS pruned, since 2026-11-18, and on the 30-day window
+# since 2026-11-19. That is what bounds --mode append; this comment used to
+# say the opposite, from the months the table did not drain.
 #
 # The windows are a disaster-recovery margin: the gateway is the server's
 # backup of last resort. What that costs: analysis tools that read THIS

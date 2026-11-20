@@ -145,8 +145,8 @@ NEVER_PRUNED = frozenset({
 # acknowledged it.
 #
 # WRITTEN AS "72 HOURS IS THE EXCEPTION". One table is big -- machine_events
-# at roughly 39 MB a day -- and the rest together are about a megabyte a
-# month. So the short window is named for the tables that need it, and
+# at roughly 39 MB a day -- and it is the only one named. So the short
+# window is named for the table that needs it, and
 # everything else, INCLUDING A TABLE ADDED TOMORROW, gets the long one. A
 # retention policy should fail toward keeping things.
 #
@@ -172,11 +172,20 @@ NEVER_PRUNED = frozenset({
 # So the number below is a real budget now: it is how old a server backup
 # may be and still be made whole from the floor. Shortening it to save
 # disk shortens that.
-RETENTION_HOURS = {"machine_events": 72.0,
-                   "meters_history": 72.0}      # live since 2026-11-18
-                                                # (still listed there by
-                                                # choice, not by blocker --
-                                                # see the note above it)
+# meters_history MOVED OUT on 2026-11-19, operator's decision: "pruning
+# after 720 hours, warning after 733 ... i meant meter history". Its 72
+# hours were inherited from the years it sat inert in NEVER_PRUNED, never
+# chosen for a table that drains. Meter history is disaster-recovery
+# material like everything else, so it takes the long window by falling
+# through to DEFAULT_RETENTION_HOURS rather than being named here.
+#
+# WHAT THAT COSTS, and it is the whole of the trade: on the lab soak,
+# 72 hours held about 27,000 rows; 720 hours holds roughly 269,000, near
+# 264 MB at the measured ~982 bytes a row. The file plateaus an order of
+# magnitude higher -- about 25 MB of meter history becomes about 264 MB --
+# so --db-size-warning-mb (500) stops being a formality and becomes the
+# guard that matters.
+RETENTION_HOURS = {"machine_events": 72.0}
 DEFAULT_RETENTION_HOURS = 30 * 24.0
 
 

@@ -47,7 +47,9 @@ import os
 import select
 import socket
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -124,6 +126,25 @@ NEVER_DRAINED = frozenset({"meters_current"})
 # already sent. A confused or compromised server must not be able to keep
 # a gateway re-draining forever, so the GATEWAY counts, whatever arrives.
 REPLAY_MAX_PER_HOUR = 3
+# Server-requested maintenance (examples/db_maintain.py run). The same
+# reasoning as the replay limit: it is the server reaching into the
+# gateway, so the gateway counts. Six an hour is ample for an operator
+# testing and useless for a loop.
+MAINTAIN_MAX_PER_HOUR = 6
+# db_maintain stops itself at 120 s with work left. This is the client's
+# own limit on top, for a run that has hung rather than one that is busy.
+MAINTAIN_KILL_AFTER_S = 300.0
+# "Wait for zero credits": the longest a server may ask the gateway to
+# hold a deferred request (the timer comes round every twelve hours
+# anyway), how often the client looks at the credit figure while holding
+# one, and the least time between two starts of the tool for one request.
+# The last matters when the figure reads zero but is stale: the tool
+# refuses a stale figure, and without a spacing the client would start it
+# again on every look.
+MAINTAIN_WAIT_MAX_S = 12 * 3600
+MAINTAIN_WAIT_LOOK_S = 2.0
+MAINTAIN_WAIT_RETRY_S = 30.0
+MAINTAIN_SCRIPT = Path(__file__).resolve().parent.parent / "examples" / "db_maintain.py"
 
 UNSUPPORTED = {
     MessageType.ON_DEMAND_PULL: "ON_DEMAND_PULL (§10.7)",
@@ -602,6 +623,16 @@ class Link:
         self.buffer_since: float | None = None
         self.instance = db_instance_id(conn)
         self.tables: list[str] = []
+        # A server-requested maintenance run: (process, its output file,
+        # link_maintenance row id, monotonic start), and a finished result
+        # still waiting to be told to the server.
+        self.maintenance = None
+        self.maintenance_report: tuple | None = None
+        # A request that was deferred and asked to wait for zero credits:
+        # {"command", "row_id", "deadline", "next_look", "next_start",
+        #  "waited_from", "why"}. In memory only -- a client restart drops
+        # it, and the server is told nothing further about that request.
+        self.maintenance_wait: dict | None = None
         self.indexed: frozenset = frozenset()
 
     # -- sending --
@@ -619,7 +650,7 @@ class Link:
                             payload=payload, key=self.cfg["hmac_key"])
         self.sock.sendall(data)
 
-    def alert(self, kind: str, detail: str) -> bool:
+    def alert(self, kind: str, detail: str, *, quiet: bool = False) -> bool:
         """True if the frame went out, False if the link refused it.
 
         Every caller but one ignores the answer, because for them the log
@@ -628,7 +659,8 @@ class Link:
         counted a FAILED send as done would make the 3am give-up silent
         again, which is the whole thing it exists to prevent.
         """
-        log(f"ALERT {kind}: {detail}")
+        if not quiet:      # a retry of something already logged
+            log(f"ALERT {kind}: {detail}")
         try:
             self.send(MessageType.ALERT, {"timestamp": utc_now(),
                                           "kind": kind, "detail": detail})
@@ -753,6 +785,238 @@ class Link:
             self.alert("replay_applied",
                        f"{total} row(s) will drain again: {rows}")
 
+    # -- maintenance the server asked for --
+
+    def on_maintain(self, request, *, clock=time.monotonic) -> None:
+        """Start `db_maintain.py run` because the server asked.
+
+        The gateway is headless: after commissioning nobody logs in, so
+        the only parties that can decide "prune and reclaim NOW" are the
+        timer on the gateway and the server. This is the server's way.
+
+        WHAT THE SERVER MAY CHOOSE, and it is two switches and nothing
+        else: whether to prune acknowledged rows, and whether to insist on
+        zero credits first. It cannot name a database, a path, a retention
+        or an argument. The command line is assembled HERE from fixed
+        strings; nothing from the request reaches it but those two
+        booleans. A request key this does not know is ignored.
+
+        The credit gate defaults ON and stays on unless the server says
+        otherwise in so many words, because of what it guards: a cashout
+        that arrives while the write path is busy runs out its ten seconds
+        (§15.7) and becomes a handpay.
+
+        IT RUNS AS A SEPARATE PROCESS, and this function returns at once.
+        A run can take two minutes; this loop also carries every ticket-in
+        question to the server, and a ticket must not wait behind
+        housekeeping. The outcome goes back as an ALERT when the process
+        ends (pump_maintenance), and is kept in link_maintenance either
+        way.
+
+        Never `enable-auto-vacuum`. That is a full VACUUM, it needs the
+        poller stopped, and it is not something to start from a distance.
+        """
+        now = utc_now()
+
+        def refuse(reason, options=None):
+            self.conn.execute(
+                "INSERT INTO link_maintenance (requested_at, options_json, "
+                "outcome, finished_at, output) VALUES (?, ?, 'refused', ?, ?)",
+                (now, json.dumps(options, sort_keys=True) if options else None,
+                 now, reason))
+            self.conn.commit()
+            self.alert("maintenance_refused", reason)
+
+        if not isinstance(request, dict):
+            refuse("the request is not an object")
+            return
+        options = {}
+        for key, default in (("prune_acked", True),
+                             ("require_zero_credits", True)):
+            value = request.get(key, default)
+            if not isinstance(value, bool):
+                refuse(f"{key} must be true or false, got {value!r}")
+                return
+            options[key] = value
+        wait_s = request.get("wait_for_zero_s", 0)
+        if (isinstance(wait_s, bool) or not isinstance(wait_s, int)
+                or not 0 <= wait_s <= MAINTAIN_WAIT_MAX_S):
+            refuse("wait_for_zero_s must be a whole number of seconds from 0 "
+                   f"to {MAINTAIN_WAIT_MAX_S}, got {wait_s!r}")
+            return
+        if wait_s and not options["require_zero_credits"]:
+            refuse("wait_for_zero_s makes no sense with the credit gate off",
+                   options)
+            return
+        options["wait_for_zero_s"] = wait_s
+        if self.maintenance is not None:
+            refuse("a maintenance run is already in progress", options)
+            return
+        if self.maintenance_wait is not None:
+            refuse("an earlier request is still waiting for zero credits",
+                   options)
+            return
+        recent = self.conn.execute(
+            "SELECT COUNT(*) FROM link_maintenance WHERE outcome <> 'refused' "
+            "AND datetime(requested_at) > datetime(?, '-1 hour')",
+            (now,)).fetchone()[0]
+        if recent >= MAINTAIN_MAX_PER_HOUR:
+            refuse(f"{recent} maintenance runs in the last hour; this gateway "
+                   f"allows {MAINTAIN_MAX_PER_HOUR}", options)
+            return
+        if not MAINTAIN_SCRIPT.exists():
+            refuse(f"{MAINTAIN_SCRIPT} is not in this checkout", options)
+            return
+
+        command = [sys.executable, str(MAINTAIN_SCRIPT), "run", "--db", self.db_path]
+        if options["prune_acked"]:
+            command.append("--prune-acked")
+        if options["require_zero_credits"]:
+            command.append("--require-zero-credits")
+        output = tempfile.TemporaryFile(mode="w+")
+        try:
+            process = subprocess.Popen(command, stdout=output,
+                                       stderr=subprocess.STDOUT,
+                                       stdin=subprocess.DEVNULL)
+        except OSError as e:
+            output.close()
+            refuse(f"could not start the maintenance run: {e}", options)
+            return
+        row_id = self.conn.execute(
+            "INSERT INTO link_maintenance (requested_at, options_json, outcome) "
+            "VALUES (?, ?, 'running')",
+            (now, json.dumps(options, sort_keys=True))).lastrowid
+        self.conn.commit()
+        self.maintenance = (process, output, row_id, clock())
+        if wait_s:
+            self.maintenance_wait = {
+                "command": command, "row_id": row_id, "why": "",
+                "waited_from": clock(), "deadline": clock() + wait_s,
+                "next_look": 0.0, "announced": False,
+                "next_start": clock() + MAINTAIN_WAIT_RETRY_S}
+        log(f"maintenance started at the server's request: {options}")
+
+    def _credits_read_zero(self) -> bool:
+        """The client's own cheap look, used only to decide when to START
+        the tool again. It is not the gate: the tool checks for itself,
+        including how old the figure is, and its answer is the one that
+        counts."""
+        credits = _optional(self.conn, "SELECT credits FROM credit_samples "
+                                       "ORDER BY id DESC LIMIT 1")
+        if credits is None:
+            credits = _optional(self.conn,
+                                "SELECT sm_current_credits FROM meters_current")
+        return credits == 0
+
+    def _pump_maintenance_wait(self, clock) -> None:
+        wait = self.maintenance_wait
+        if wait is None or self.maintenance is not None:
+            return
+        now = clock()
+        if now >= wait["deadline"]:
+            minutes = (wait["deadline"] - wait["waited_from"]) / 60
+            summary = (f"waited {minutes:.0f} min and the machine was never "
+                       f"at zero credits; nothing was pruned or reclaimed. "
+                       f"Last answer: {wait['why']}")[-1400:]
+            self.conn.execute(
+                "UPDATE link_maintenance SET outcome = 'deferred', "
+                "finished_at = ?, output = ? WHERE id = ?",
+                (utc_now(), summary, wait["row_id"]))
+            self.conn.commit()
+            self.maintenance_wait = None
+            log(f"maintenance deferred: {summary}")
+            self.maintenance_report = ("maintenance_deferred", summary)
+            return
+        if now < wait["next_look"] or now < wait["next_start"]:
+            return
+        wait["next_look"] = now + MAINTAIN_WAIT_LOOK_S
+        try:
+            zero = self._credits_read_zero()
+        except sqlite3.Error:
+            return                          # the poller has the lock; look again
+        if not zero:
+            return
+        output = tempfile.TemporaryFile(mode="w+")
+        try:
+            process = subprocess.Popen(wait["command"], stdout=output,
+                                       stderr=subprocess.STDOUT,
+                                       stdin=subprocess.DEVNULL)
+        except OSError as e:
+            output.close()
+            wait["why"] = f"could not start the maintenance run: {e}"
+            wait["next_start"] = now + MAINTAIN_WAIT_RETRY_S
+            return
+        wait["next_start"] = now + MAINTAIN_WAIT_RETRY_S
+        self.maintenance = (process, output, wait["row_id"], now)
+        log("credits read zero: starting the maintenance run that was waiting")
+
+    def pump_maintenance(self, *, clock=time.monotonic) -> None:
+        """Collect a finished run and tell the server how it ended. Called
+        every tick; does nothing while a run is still going."""
+        if self.maintenance is not None:
+            process, output, row_id, started = self.maintenance
+            code = process.poll()
+            if code is None and clock() - started > MAINTAIN_KILL_AFTER_S:
+                process.kill()
+                process.wait()
+                code = "killed"
+            if code is not None:
+                output.seek(0)
+                text = output.read()
+                output.close()
+                self.maintenance = None
+                # The tool's own lines, minus its timestamps: what was
+                # pruned, what was reclaimed, or why it stood down.
+                lines = [line.split("] ", 1)[-1].strip()
+                         for line in text.splitlines() if line.strip()]
+                if code == "killed":
+                    outcome = "failed"
+                    lines.append(f"killed after {MAINTAIN_KILL_AFTER_S:.0f}s")
+                elif code != 0:
+                    outcome = "failed"
+                    lines.append(f"exit status {code}")
+                elif any(line.startswith("deferred:") for line in lines):
+                    outcome = "deferred"
+                else:
+                    outcome = "done"
+                summary = " | ".join(lines)[-1400:] or "(no output)"
+                wait = self.maintenance_wait
+                if wait is not None and wait["row_id"] == row_id:
+                    if outcome == "deferred" and clock() < wait["deadline"]:
+                        # Not an ending. Hold the request, and say so ONCE:
+                        # a server that asked and heard nothing for half an
+                        # hour could not tell waiting from lost.
+                        wait["why"] = summary
+                        self.conn.execute(
+                            "UPDATE link_maintenance SET outcome = 'waiting', "
+                            "output = ? WHERE id = ?", (summary, row_id))
+                        self.conn.commit()
+                        if not wait["announced"]:
+                            wait["announced"] = True
+                            left = (wait["deadline"] - clock()) / 60
+                            note = (f"{summary} | holding the request for up "
+                                    f"to {left:.0f} more min and starting it "
+                                    "when credits read zero")[-1400:]
+                            log(f"maintenance waiting: {note}")
+                            self.maintenance_report = ("maintenance_waiting", note)
+                        outcome = None
+                    else:
+                        self.maintenance_wait = None
+                if outcome is not None:
+                    self.conn.execute(
+                        "UPDATE link_maintenance SET outcome = ?, "
+                        "finished_at = ?, output = ? WHERE id = ?",
+                        (outcome, utc_now(), summary, row_id))
+                    self.conn.commit()
+                    log(f"maintenance {outcome}: {summary}")
+                    self.maintenance_report = (f"maintenance_{outcome}", summary)
+        self._pump_maintenance_wait(clock)
+        if self.maintenance_report is not None and self.sock is not None:
+            # Kept until it is actually sent. A run that finishes while the
+            # link is down must still be reported when it comes back.
+            if self.alert(*self.maintenance_report, quiet=True):
+                self.maintenance_report = None
+
     def on_invite(self, payload: dict) -> None:
         if payload.get("pool_topup") is not None:
             self.on_pool(payload["pool_topup"], replace=False)
@@ -760,6 +1024,8 @@ class Link:
             # BEFORE collecting events, so the rows it puts back are in
             # this very batch.
             self.on_replay(payload["replay"])
+        if payload.get("maintain") is not None:
+            self.on_maintain(payload["maintain"])
         try:
             max_events = max(0, min(int(payload.get("max_events", 0)), 1000))
         except (TypeError, ValueError):
@@ -970,6 +1236,7 @@ class Link:
                 next_heartbeat = max(next_heartbeat + HEARTBEAT_INTERVAL_S,
                                      now + 1.0)
             self.pump_queries()
+            self.pump_maintenance()
             readable, _, _ = select.select([self.sock], [], [], TICK_S)
             if readable:
                 chunk = self.sock.recv(65536)

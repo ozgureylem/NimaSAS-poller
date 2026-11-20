@@ -1362,7 +1362,7 @@ tables or never fire on the events, so there is one age per type:
 
 | table | retention | warns after |
 |---|---|---|
-| `machine_events`, `meters_history` | 72 h — the fast ones | **85 h** |
+| `machine_events` | 72 h — the fast one | **85 h** |
 | every other drained table | 720 h (30 days, for disaster recovery) | **733 h** |
 
 Since 2026-11-18 "every other drained table" means all of
@@ -1399,22 +1399,26 @@ the numbers went, either: the server issued fifty and the gateway would
 report fewer. The table is a few hundred rows, so there is nothing to
 reclaim by it.
 
-**`meters_history` is on this schedule too, since 2026-11-18.** It carries a
-`synced_at`, it drains to the server, and `db_maintain` prunes it **72 hours
-after the server acknowledges each row** — the same window and the same rule
-as `machine_events`. Its row therefore warns at **85 h** like any other
-fast table.
+**`meters_history` is on this schedule too, since 2026-11-18**, and on the
+**long** window since 2026-11-19. It carries a `synced_at`, it drains to the
+server, and `db_maintain` prunes it **720 hours after the server
+acknowledges each row** — the same window as the ticket tables, warning at
+**733 h**. Its first 72 hours were inherited from the years it sat inert in
+`NEVER_PRUNED`, never chosen for a table that drains; meter history is
+disaster-recovery material like everything else.
 
 That is what bounds the database in `--mode append`, and it bounds it hard:
 
 | | |
 |---|---|
-| meter history kept | 72 h after acknowledgement |
-| at the lab's measured idle rate (~8.5 MB/day) | **≈ 25 MB**, then level |
+| meter history kept | 720 h (30 days) after acknowledgement |
+| at the lab's measured idle rate (~8.5 MB/day) | **≈ 264 MB**, then level |
 | mechanism | ordinary `--prune-acked`; no second rule, no age cap |
 
-So append mode does **not** have to be given up to keep the file small.
-Every sample is kept at full per-poll resolution for three days, the server
+So append mode does **not** have to be given up to keep the file small —
+though at 30 days "small" means a quarter of the 500 MB warning rather than
+a twentieth of it, and `--db-size-warning-mb` stops being a formality.
+Every sample is kept at full per-poll resolution for a month, the server
 has them, and the gateway reclaims the space once it does. The file levels
 off because deletions match insertions and SQLite reuses the freed pages —
 it does not shrink, and does not need to.

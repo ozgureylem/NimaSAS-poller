@@ -132,6 +132,19 @@ CREATE TABLE IF NOT EXISTS pool_fills (
 -- makes acknowledged rows drain again, so anything that counts drained
 -- rows needs to be able to tell a replay from ordinary traffic, and the
 -- gateway's own rate limit is counted from this table.
+-- EVERY MAINTENANCE RUN THE SERVER ASKED FOR, run or refused, with what it
+-- printed. The gateway is headless: this row and the alert sent back are
+-- the only places the outcome exists.
+CREATE TABLE IF NOT EXISTS link_maintenance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    requested_at TEXT NOT NULL,
+    options_json TEXT,
+    outcome TEXT NOT NULL,            -- 'running' | 'done' | 'deferred'
+                                      -- | 'failed' | 'refused'
+    finished_at TEXT,
+    output TEXT
+);
+
 CREATE TABLE IF NOT EXISTS link_replays (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     requested_at TEXT NOT NULL,

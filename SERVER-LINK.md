@@ -344,6 +344,62 @@ link state only when it changes, so a poller that dies leaves "up" behind
 it; what exposes it is the meters going stale. The gateway also sends an
 `ALERT` of kind `sas_link_down`, once per outage, when the poller gives up.
 
+### 2.6 Maintenance on the server's say-so
+
+The gateway prunes and reclaims on its own timer (03:45 and 15:45). The
+server can also ask for a run now:
+
+```
+python -m gateway.service --db <stand-in db> maintain LAB-001
+```
+
+`serve` must be running; it delivers the request within a second, or when
+the gateway next connects. The gateway client starts
+`examples/db_maintain.py run --prune-acked --require-zero-credits` on its
+own database as a separate process (so ticket-in questions keep flowing
+while it runs) and reports the outcome as an alert, visible in the `serve`
+window and under ALERTS in `status`:
+
+| Alert | Meaning |
+|---|---|
+| `maintenance_done` | it ran; the detail says what was pruned and reclaimed |
+| `maintenance_deferred` | the machine held credits, or no fresh credit figure was available; **nothing was deleted** |
+| `maintenance_waiting` | only with `--wait-for-zero`: deferred for now, and the gateway is holding the request |
+| `maintenance_failed` | the tool exited with an error, or hung and was killed after 300 s |
+| `maintenance_refused` | the gateway would not start it: one already running, more than six in an hour, or a malformed request |
+
+Three options, and they are the whole of what a server can choose:
+
+| Option | Effect |
+|---|---|
+| `--no-prune` | reclaim free pages only; delete nothing |
+| `--ignore-credits` | run even while the machine holds credits |
+| `--wait-for-zero MINUTES` | if deferred, hold the request up to this long (720 at most) and run it when credits reach zero |
+
+**Without `--wait-for-zero` a deferred request is over.** Credits reaching
+zero afterwards start nothing; the next run is the timer's, or the next
+request. With it, the gateway answers `maintenance_waiting` once, looks at
+the credit figure every two seconds, and starts the run by itself — at
+most one start every 30 seconds — then answers `maintenance_done`. If the
+time runs out first it answers `maintenance_deferred`. A second request is
+refused while one is waiting. The wait is held in the client's memory: if
+the client restarts, the request is dropped and must be sent again.
+
+A run that starts the moment credits reach zero starts just after a
+cashout, which is when the next player may sit down. That is why waiting
+is asked for and not the default.
+
+`--ignore-credits` is for a lab. The gate exists because a cashout that
+arrives while the database is busy can run out its ten seconds and become
+a handpay.
+
+What the server cannot do: name a database or a path, change a retention
+period, or start the one-time `enable-auto-vacuum` conversion. The gateway
+builds the command line itself from fixed parts. Pruning still deletes
+only rows the server has acknowledged and whose retention has passed
+**since that acknowledgement**, so a request cannot remove anything the
+timer would not have removed.
+
 ## 3. A test, with the prediction written down first
 
 | # | do this | predict this |
@@ -443,7 +499,12 @@ yet record them anywhere the client can read. `meters_age_s` † is how the
 client derives `online`.
 
 **`0x02` PULL_INVITE** (S→G) —
-`{"invite_id", "max_events", "pool_topup"?, "replay"?}`.
+`{"invite_id", "max_events", "pool_topup"?, "replay"?, "maintain"?}`.
+`maintain` † is `{"prune_acked": bool, "require_zero_credits": bool,
+"wait_for_zero_s"?: int}` (the booleans default true and anything not a
+boolean is refused; the wait is 0 to 43200 seconds) and is answered later
+by an `ALERT` of kind `maintenance_done`, `_deferred`, `_waiting`,
+`_failed` or `_refused` — see §2.6.
 `pool_topup` is a signed batch, below. `replay` † is
 
 ```json

@@ -1614,14 +1614,15 @@ class Connection:
         self.writer.write(self.service.encode(self.client_id, message_type, payload))
         await self.writer.drain()
 
-    async def invite(self, pool=None, replay=None) -> None:
+    async def invite(self, pool=None, replay=None, maintain=None) -> None:
         """One outstanding invitation per gateway. The server sets the
         pace (§3): a second invite before the first is answered would be
         the server flooding itself."""
         now = time.monotonic()
         self.invites = {i: at for i, at in self.invites.items()
                         if now - at < INVITE_TIMEOUT_S}
-        if self.invites and pool is None and replay is None:
+        if (self.invites and pool is None and replay is None
+                and maintain is None):
             return
         invite_id = f"inv_{secrets.token_hex(6)}"
         self.invites[invite_id] = now
@@ -1633,6 +1634,11 @@ class Connection:
             # Rides on the invitation: §10.2 has no message of its own for
             # it, and a replay is by nature followed by a drain.
             payload["replay"] = replay
+        if maintain is not None:
+            # The same carriage as a replay, for the same reason: §10.2
+            # has no message for it. Two booleans; the gateway builds its
+            # own command line and answers with an ALERT when the run ends.
+            payload["maintain"] = maintain
         await self.send(MessageType.PULL_INVITE, payload)
 
     async def send_pool(self, kind: str, batch: dict) -> None:
@@ -1883,10 +1889,19 @@ class Server:
                 "SELECT id, client_id, kind FROM commands "
                 "WHERE state = 'pending' ORDER BY id").fetchall():
             connection = self.connections.get(client_id)
-            if kind not in ("replace_pool", "aft_transfer"):
+            if kind not in ("replace_pool", "aft_transfer", "maintain"):
                 state, detail = "failed", f"unknown command {kind!r}"
             elif connection is None:
                 continue         # stays pending until that gateway connects
+            elif kind == "maintain":
+                # "sent", not "done": the run takes up to two minutes on
+                # the gateway and its outcome comes back as an ALERT
+                # (maintenance_done / _deferred / _failed / _refused).
+                options = json.loads(
+                    svc.conn.execute("SELECT detail FROM commands WHERE id = ?",
+                                     (cmd_id,)).fetchone()[0])
+                await connection.invite(maintain=options)
+                state, detail = "sent", json.dumps(options, sort_keys=True)
             elif kind == "aft_transfer":
                 # The payload was validated when it was queued; this just
                 # delivers it. The gateway answers through the ordinary
@@ -2306,6 +2321,57 @@ def cmd_replace_pool(args) -> int:
     return 0
 
 
+def cmd_maintain(args) -> int:
+    """Ask a gateway to prune and reclaim NOW, instead of at its timer.
+
+    The gateway is headless; this and its own 03:45/15:45 timer are the
+    only two things that can start the job. What is asked for is two
+    switches. The gateway decides everything else, and may refuse.
+    """
+    conn = open_db(args.db)
+    if not conn.execute("SELECT 1 FROM gateways WHERE client_id = ?",
+                        (args.client_id,)).fetchone():
+        print(f"{args.client_id} is not commissioned.", file=sys.stderr)
+        return 2
+    wait_min = getattr(args, "wait_for_zero", 0) or 0
+    if not 0 <= wait_min <= 720:
+        print("--wait-for-zero is in minutes, from 0 to 720.", file=sys.stderr)
+        return 2
+    if wait_min and args.ignore_credits:
+        print("--wait-for-zero and --ignore-credits contradict each other.",
+              file=sys.stderr)
+        return 2
+    options = {"prune_acked": not args.no_prune,
+               "require_zero_credits": not args.ignore_credits}
+    if wait_min:
+        options["wait_for_zero_s"] = int(wait_min * 60)
+    conn.execute("INSERT INTO commands (created_at, client_id, kind, detail) "
+                 "VALUES (?, ?, 'maintain', ?)",
+                 (utc_now(), args.client_id, json.dumps(options, sort_keys=True)))
+    conn.commit()
+    print(f"queued for {args.client_id}: "
+          + ("prune acknowledged rows, then reclaim space"
+             if options["prune_acked"] else "reclaim space only (no prune)")
+          + ("; ONLY if the machine holds zero credits."
+             if options["require_zero_credits"]
+             else "; EVEN IF the machine holds credits."))
+    if wait_min:
+        print(f"If the machine holds credits, the gateway answers "
+              f"maintenance_waiting, holds the request for up to {wait_min:g} "
+              "min, and starts the run by itself when credits read zero. If "
+              "they never do, it answers maintenance_deferred at the end.")
+    print("The running service sends it within a second if the gateway is "
+          "connected. The run takes up to two minutes; the result arrives in "
+          "the `serve` window and under ALERTS in `status` as "
+          "maintenance_done, maintenance_deferred, maintenance_failed or "
+          "maintenance_refused.")
+    if not options["require_zero_credits"]:
+        print("NOTE: without the credit gate, a cashout that lands while the "
+              "database is busy can run out its ten seconds and become a "
+              "handpay. Fine in the lab; not on a floor.")
+    return 0
+
+
 def cmd_status(args) -> int:
     conn = open_db(args.db)
     service = Service(conn, load_seed(args.db))
@@ -2352,6 +2418,8 @@ def cmd_status(args) -> int:
             note = ("  <- NOT SENT. Stays pending until that gateway's "
                     "`python3 -m gateway.client run` connects.")
         print(f"  {cmd_id:4d} {created} {cid} {kind} [{state}]{note}")
+        if detail and kind == "maintain":
+            print(f"       {detail}")
         if detail and kind == "aft_transfer":
             try:
                 d = json.loads(detail)
@@ -2501,6 +2569,21 @@ def build_parser() -> argparse.ArgumentParser:
                        "a new one (POOL_REPLACE, §7.4)")
     r.add_argument("client_id")
     r.set_defaults(func=cmd_replace_pool)
+
+    m = sub.add_parser("maintain", help="ask a gateway to prune acknowledged "
+                       "rows and reclaim space now (it reports back as an "
+                       "alert)")
+    m.add_argument("client_id")
+    m.add_argument("--no-prune", action="store_true",
+                   help="reclaim free pages only; delete nothing")
+    m.add_argument("--ignore-credits", action="store_true",
+                   help="run even if the machine holds credits (lab use: "
+                        "the default waits for zero)")
+    m.add_argument("--wait-for-zero", type=float, default=0, metavar="MINUTES",
+                   help="if the machine holds credits, have the gateway hold "
+                        "the request this long and run it when credits reach "
+                        "zero (default 0: one attempt, no waiting)")
+    m.set_defaults(func=cmd_maintain)
 
     sub.add_parser("machines", help="which cabinets each gateway has been "
                    "attached to, and how many rows came from each"
