@@ -183,8 +183,9 @@ NEVER_PRUNED = frozenset({
 # 72 hours held about 27,000 rows; 720 hours holds roughly 269,000, near
 # 264 MB at the measured ~982 bytes a row. The file plateaus an order of
 # magnitude higher -- about 25 MB of meter history becomes about 264 MB --
-# so --db-size-warning-mb (500) stops being a formality and becomes the
-# guard that matters.
+# so --db-size-warning-mb stops being a formality and becomes the guard
+# that matters. Raised from 500 to 750 on the soak unit, 2026-11-19, with
+# the plateau computed at roughly 275 MB -- see A50 and A51.
 RETENTION_HOURS = {"machine_events": 72.0}
 DEFAULT_RETENTION_HOURS = 30 * 24.0
 
