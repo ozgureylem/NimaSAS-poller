@@ -650,10 +650,21 @@ overwritten with the latest values from all of them, unconditionally,
 every cycle. Whether that cycle *also* writes a new row to
 `meters_history` depends on the mode:
 
-- In `append` mode, always.
-- In `ring` mode, only if: this is the first poll ever, or
-  `--history-interval` seconds have passed since the last history
-  write, or a **burst** is active.
+In **both** modes since 2026-11-19, only if: this is the first poll ever, or
+`--history-interval` seconds have passed since the last history write, or a
+**burst** is active. **The mode decides whether old rows are ever evicted;
+the interval decides how often one is written.** They used to be tangled:
+append wrote every cycle and the interval was ring-only.
+
+`--history-interval` unset means every cycle in `append` and 60 s in `ring`,
+which is what each did before — so no existing command line changed. `0` is
+every cycle explicitly.
+
+**This is what lets a floor gateway run `append`.** The ring kept 200 rows,
+a few hours, which is not a disaster-recovery window; append at
+`--history-interval 1800` keeps every sample for the full 720-hour retention
+at about **48 rows a day — near 1.4 MB**, against roughly 264 MB if it wrote
+every cycle. `deploy/nimasas-poller.service` ships that way.
 
 A burst starts when any *cumulative* meter value goes down since the
 last successful poll (SAS meters are cumulative counters — a decrease

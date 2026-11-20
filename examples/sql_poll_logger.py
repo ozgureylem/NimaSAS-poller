@@ -1408,12 +1408,19 @@ SAS_MAX_POLL_INTERVAL_S = 5.0
 class HistoryConfig:
     mode: str = "ring"  # "ring" or "append"
     cap: int = DEFAULT_HISTORY_CAP  # ring mode only; ignored in append mode
-    interval: float = DEFAULT_HISTORY_INTERVAL  # ring mode only; ignored in append mode
+    # Seconds between history rows, in BOTH modes since 2026-11-19. 0 means
+    # every cycle. None means "not asked for" and is resolved per mode in
+    # __post_init__: every cycle for append, DEFAULT_HISTORY_INTERVAL for
+    # ring -- what each did before the interval applied to append, so no
+    # existing caller changes behaviour.
+    interval: float | None = None
     burst_count: int = DEFAULT_BURST_COUNT
 
     def __post_init__(self) -> None:
         if self.mode not in ("ring", "append"):
             raise ValueError(f"mode must be 'ring' or 'append', got {self.mode!r}")
+        if self.interval is None:
+            self.interval = 0.0 if self.mode == "append" else DEFAULT_HISTORY_INTERVAL
 
 
 @dataclass
@@ -7273,14 +7280,29 @@ def poll_and_log(
     if decreased or anomaly:
         state.burst_remaining = history.burst_count
 
-    if history.mode == "append":
-        write_history = True
-    elif state.burst_remaining > 0:
+    # THE CADENCE IS NOW INDEPENDENT OF THE MODE (2026-11-19). It used to
+    # read `if mode == "append": write_history = True`, so append wrote a row
+    # every cycle and `interval` was documented as ring-only. The operator
+    # needs append ON THE FLOOR -- "200 rows is nothing, we'll need the meter
+    # history for disaster recovery" -- without a row every two seconds, so
+    # the two ideas are separated: MODE decides whether old rows are ever
+    # evicted, INTERVAL decides how often a row is written. Append with
+    # interval 0 is the old behaviour exactly, and is still what the lab runs.
+    #
+    # THE BURST STAYS ABOVE THE INTERVAL, and that is what makes a long
+    # interval safe. `decreased` is computed every cycle from the in-memory
+    # last_meters, not from this table, so a RAM clear or a rollover is
+    # detected at full poll resolution however rarely history is written --
+    # and when it is, the next burst_count polls are written regardless of
+    # the interval. A thirty-minute cadence therefore costs resolution only
+    # across stretches where nothing happened.
+    if state.burst_remaining > 0:
         write_history = True
         state.burst_remaining -= 1
     else:
         write_history = (
             state.last_history_write is None
+            or history.interval <= 0
             or (mono_now - state.last_history_write) >= history.interval
         )
 
@@ -7564,9 +7586,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--history-interval",
         type=float,
-        default=DEFAULT_HISTORY_INTERVAL,
-        help="minimum seconds between meters_history writes in ring mode, outside a burst "
-        "(default: %(default)s); ignored in append mode",
+        default=None,
+        help="minimum seconds between meters_history writes, outside a burst, "
+        f"in BOTH modes. Unset it defaults to {DEFAULT_HISTORY_INTERVAL:g}s in "
+        "ring mode and to every cycle in append mode, which is what each did "
+        "before this applied to append. 0 means every cycle. A burst -- a "
+        "meter decrease, a failed poll, an anomaly -- overrides it, so a long "
+        "interval costs resolution only where nothing happened",
     )
     parser.add_argument(
         "--burst-count",
@@ -8099,7 +8125,7 @@ def main() -> int:
     history = HistoryConfig(
         mode=args.mode,
         cap=args.history_cap,
-        interval=args.history_interval,
+        interval=args.history_interval,   # None: HistoryConfig resolves it
         burst_count=args.burst_count,
     )
     state = PollState()
