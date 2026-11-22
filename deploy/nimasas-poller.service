@@ -105,6 +105,39 @@ WorkingDirectory=/home/nimasas/NimaSAS
 # the code's own default back to the pre-correction value. The default in
 # sql_poll_logger.py has been 0 since 11-13; this line now agrees with it.
 #
+# THE LAB CONFIGURATION IS NOW THE FLOOR CONFIGURATION. Operator,
+# 2026-11-22: "From now on, lab configuration is going to be used on the
+# floor... ticket authority is going to be the server. We'll allow server
+# aft and let's increase the db size warning."
+#
+# --server-ticket-authority: the server answers every ticket-in. The
+#   gateway decides nothing -- not validity, not the amount, not even for a
+#   ticket it printed. With no client or no server every ticket is refused
+#   with 0x80 and returned, which is correct: a server outage must halt
+#   ticket-in (A27). --lab-ticket-authority, which once answered locally,
+#   was removed on 2026-11-15 and does not exist to be turned on.
+#
+# --allow-server-aft REVERSES THE READ-ONLY POSTURE of 2026-11-08 ("no AFT
+#   fund transfer, no machine state change, read only"), deliberately and
+#   on the operator's word. The server may now move money onto a cabinet.
+#   It REQUIRES --serve-host-requests, which is the channel an AFT_TRANSFER
+#   arrives on; the poller treats the pair as an error rather than a
+#   warning, because the flag reads as "the server may move money" and
+#   would otherwise be silently false for a whole run.
+#
+# --decline-aft-cashout and --drain-fast-poll were not named individually;
+#   they are the remainder of "lab configuration" and are applied under
+#   that instruction. The first declines §8.7 host cashout with an
+#   all-zeros LP 0x72 so a cashout takes the ticket path instead of burning
+#   ~8 s in stage 1, and moves no money. The second polls at the machine's
+#   advertised fast rate during a drain, gated on Table 7.14e bit 0, so a
+#   cabinet that has not declared support is never polled fast.
+#
+# --db-size-warning-mb 750 matches the lab. The floor plateau is far below
+#   it -- about 27 MB of meter history at --history-interval 89 over the
+#   720 h window, plus machine_events at 72 h -- so this is headroom, not a
+#   forecast.
+
 # THE OTHER INTERVALS, given by the operator 2026-11-22 and PRIME by
 # convention, so the periodic sweeps do not beat against each other and
 # bunch their polls into the same cycles:
@@ -141,7 +174,12 @@ ExecStart=/usr/bin/python3 /home/nimasas/NimaSAS/examples/sql_poll_logger.py \
     --full-meter-interval 593 \
     --validation-meters-interval 293 \
     --credit-poll-every 3 \
-    --db-size-warning-mb 512
+    --drain-fast-poll \
+    --decline-aft-cashout \
+    --serve-host-requests \
+    --allow-server-aft \
+    --server-ticket-authority \
+    --db-size-warning-mb 750
 
 # A SIGKILLed or power-cut poller leaves REAL TIME EVENT REPORTING ENABLED in
 # the cabinet, and the next start's general_poll() then reads Table 12.5's

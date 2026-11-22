@@ -1301,8 +1301,15 @@ DEFAULT_TABLE_C7_INTERVAL = 0.0
 # 39 single polls, and they are then the only way to reach them. So
 # decide_c7_support() forces both intervals back to every cycle when it
 # turns C-7 off. See --c7-probation-minutes.
-DEFAULT_FULL_METER_INTERVAL = 1800.0
-DEFAULT_VALIDATION_METERS_INTERVAL = 1800.0
+#
+# 593 AND 293 SUPERSEDE 1800/1800, operator 2026-11-22. Prime by
+# convention, like --history-interval 89 and --credit-poll-every 3, so the
+# periodic sweeps do not beat against each other and bunch their polls into
+# the same cycles. 1800/1800 came from the 2026-11-13 arithmetic that put
+# C-7 on every cycle; the shape of that decision stands, only the two
+# numbers moved.
+DEFAULT_FULL_METER_INTERVAL = 593.0
+DEFAULT_VALIDATION_METERS_INTERVAL = 293.0
 
 # How long a run may spend deciding whether this cabinet answers Table C-7
 # at all. §4.4 lets a machine ignore a long poll it does not implement, so
