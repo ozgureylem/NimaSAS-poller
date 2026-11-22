@@ -105,12 +105,29 @@ WorkingDirectory=/home/nimasas/NimaSAS
 # the code's own default back to the pre-correction value. The default in
 # sql_poll_logger.py has been 0 since 11-13; this line now agrees with it.
 #
-# --full-meter-interval and --validation-meters-interval are left as the
-# skips below pending the operator's check of the agreed values (he is
-# reconstructing them from the conversation history; the convention is
-# prime numbers, as with --history-interval 89 here and 593/293/3 on the
-# soak). Nothing here depends on them: every meter the session-boundary
-# work needs is in the C-7 sweep.
+# THE OTHER INTERVALS, given by the operator 2026-11-22 and PRIME by
+# convention, so the periodic sweeps do not beat against each other and
+# bunch their polls into the same cycles:
+#
+#     --interval              2.0 s      the poll cycle itself
+#     --table-c7-interval     0          every cycle (above)
+#     --full-meter-interval   593 s      the 39 single meters
+#     --validation-meters-interval 293 s the 12 ticket polls
+#     --history-interval      89 s       a meters_history row
+#     --credit-poll-every     3 cycles   the LP 0x1A credit gauge
+#
+# This REPLACES --skip-full-meter-sweep and --skip-validation-meters-sweep,
+# which this unit carried while C-7 was at 300. C-7 supersedes the single
+# sweep for coverage, but it is the CHEAP source rather than the only one:
+# a cabinet that will not answer LP 0x6F still has those meters behind the
+# 39 single polls, so skipping them outright left no fallback. At 593 s and
+# 293 s against a 2 s cycle they run about once in 297 and once in 147
+# cycles, and drain priority defers them under load anyway.
+#
+# --credit-poll-every was absent, and its default is 0 (off), so this unit
+# took NO credit samples. 0x000C arrives with C-7 every cycle, but the LP
+# 0x1A gauge is one poll against thirteen chunks -- which is what keeps a
+# current-credit reading coming when drain priority defers the C-7 sweep.
 ExecStart=/usr/bin/python3 /home/nimasas/NimaSAS/examples/sql_poll_logger.py \
     /home/nimasas/gateway.ini \
     --db /home/nimasas/NimaSAS/gateway.sqlite3 \
@@ -121,8 +138,9 @@ ExecStart=/usr/bin/python3 /home/nimasas/NimaSAS/examples/sql_poll_logger.py \
     --heartbeat-every 1 \
     --interval 2.0 \
     --table-c7-interval 0 \
-    --skip-full-meter-sweep \
-    --skip-validation-meters-sweep \
+    --full-meter-interval 593 \
+    --validation-meters-interval 293 \
+    --credit-poll-every 3 \
     --db-size-warning-mb 512
 
 # A SIGKILLed or power-cut poller leaves REAL TIME EVENT REPORTING ENABLED in
