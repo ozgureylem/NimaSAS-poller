@@ -91,6 +91,26 @@ WorkingDirectory=/home/nimasas/NimaSAS
 #
 # --no-drain-priority turns it off, and exists for measuring what the
 # deferral is worth. It does not belong on a floor gateway.
+# --table-c7-interval 0 means EVERY CYCLE, and it is cheaper than the
+# alternative rather than dearer. MIGRATION-SPEC-AMENDMENTS, 2026-11-13:
+# C-7 supersedes the single-meter sweep -- 13 chunked polls fetch what 39
+# single ones fetch and about 115 meters besides -- so the corrected
+# arithmetic is 22 polls a cycle against 73. Operator, the same day: "C7
+# will poll more frequently than full meter and validation intervals. Only
+# time we will fallback to other meters is going to be if any machine
+# doesn't provide c7 meters in future."
+#
+# This unit carried 300 from the day it was written "for review" and was
+# never revisited after that correction, so it spent nine days overriding
+# the code's own default back to the pre-correction value. The default in
+# sql_poll_logger.py has been 0 since 11-13; this line now agrees with it.
+#
+# --full-meter-interval and --validation-meters-interval are left as the
+# skips below pending the operator's check of the agreed values (he is
+# reconstructing them from the conversation history; the convention is
+# prime numbers, as with --history-interval 89 here and 593/293/3 on the
+# soak). Nothing here depends on them: every meter the session-boundary
+# work needs is in the C-7 sweep.
 ExecStart=/usr/bin/python3 /home/nimasas/NimaSAS/examples/sql_poll_logger.py \
     /home/nimasas/gateway.ini \
     --db /home/nimasas/NimaSAS/gateway.sqlite3 \
@@ -100,7 +120,7 @@ ExecStart=/usr/bin/python3 /home/nimasas/NimaSAS/examples/sql_poll_logger.py \
     --min-poll-interval 0.2 \
     --heartbeat-every 1 \
     --interval 2.0 \
-    --table-c7-interval 300 \
+    --table-c7-interval 0 \
     --skip-full-meter-sweep \
     --skip-validation-meters-sweep \
     --db-size-warning-mb 512
