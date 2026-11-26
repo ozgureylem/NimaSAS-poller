@@ -767,21 +767,69 @@ def cmd_run_repeating(args, *, sleep=time.sleep) -> int:
 
     What a run "returned" is measured on the file, not taken from what it
     printed.
+
+    BUT FILE SHRINKAGE ALONE IS THE WRONG STOP SIGNAL, and 2026-11-26 showed
+    why. A run pruned **522,500** machine_events rows, spent its whole
+    --max-seconds budget doing it, had no time left to vacuum, and returned
+    0.0 MB. It left **27,194 free pages** inside the file. By the old rule
+    that is "returned under 5.0 MB, stop" -- identical to a run with nothing
+    left to do -- so the series ended at precisely the moment a second run
+    would have found nothing to prune, spent its entire budget vacuuming, and
+    handed back a hundred megabytes.
+
+    So a run continues the series if it returned bytes OR if it left enough
+    reclaimable pages behind AND it made progress. Progress is the file
+    shrinking or the freelist growing; pruning does the latter. Without the
+    progress test a database with auto_vacuum NONE -- where no page can ever
+    be returned -- would run the full ten every cycle for nothing.
     """
     below = getattr(args, "repeat_min_freed_mb", 0) * 1_000_000
+
+    def free_bytes() -> int:
+        """Reclaimable pages sitting inside the file, in bytes.
+
+        Catches broadly and returns 0 on any trouble: this is the loop's
+        bookkeeping, and a database that cannot be opened for a PRAGMA must
+        end the series quietly rather than raise out of a maintenance run
+        that has already done its work.
+        """
+        conn = None
+        try:
+            conn = open_gateway_db(args.db)
+            f = page_facts(conn)
+            return int(f["freelist_count"]) * int(f["page_size"])
+        except Exception:
+            return 0
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     runs = 0
     while True:
         before = file_sizes(args.db)["db"]
+        free_before = free_bytes()
         rc = cmd_run(args)
         runs += 1
         if rc != 0 or below <= 0:
             return rc
         gave = before - file_sizes(args.db)["db"]
-        if gave < below:
+        free_after = free_bytes()
+        # The run did SOMETHING: the file shrank, or it pruned and the pages
+        # it released are sitting in the freelist for the next run.
+        progress = gave > 0 or free_after > free_before
+        if gave < below and not (free_after >= below and progress):
             log(f"run {runs} returned {mb(max(gave, 0))}, under the "
-                f"{args.repeat_min_freed_mb:g} MB that would repeat it; the next "
+                f"{args.repeat_min_freed_mb:g} MB that would repeat it, and "
+                f"{mb(free_after)} is reclaimable; the next "
                 "scheduled cycle continues")
             return rc
+        if gave < below:
+            log(f"run {runs} returned {mb(max(gave, 0))} to the filesystem "
+                f"but freed {mb(free_after)} INSIDE the file -- it spent its "
+                "budget pruning and had none left to vacuum. Running again so "
+                "the next one can hand those pages back")
         if runs >= REPEAT_MAX_RUNS:
             log(f"run {runs} returned {mb(gave)} and more could follow, but "
                 f"{REPEAT_MAX_RUNS} runs is the limit for one cycle; the "

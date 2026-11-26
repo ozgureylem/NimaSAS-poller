@@ -2383,6 +2383,51 @@ def cmd_maintain(args) -> int:
     return 0
 
 
+def describe_maintenance(m) -> str:
+    """One line answering "is this gateway's database being looked after".
+
+    Added 2026-11-26 with the heartbeat field (A52). The field existed for a
+    day without this, which made it useless: the gateway reported that nobody
+    had enabled its maintenance timer and the server printed everything
+    except that.
+
+    The four timer states are kept apart deliberately. 'absent' is the
+    2026-11-26 failure -- six days, no timer installed, 80 MB -> 353 MB, and
+    a gateway that looked healthy in every other line of this report. null is
+    NOT that: it means the gateway could not ask systemd, and printing it as
+    absent would send somebody to re-install a timer that is already running.
+    """
+    if not isinstance(m, dict):
+        return ("maintenance: not reported (a gateway client older than "
+                "2026-11-26)")
+    timer, unit = m.get("timer"), m.get("timer_unit") or "its timer"
+    since, outcome = m.get("since_done_h"), m.get("last_attempt_outcome")
+
+    if m.get("last_done_at") is None:
+        ran = "NEVER COMPLETED a run"
+    elif since is None:
+        ran = f"last completed {m['last_done_at']}"
+    elif since < 48:
+        ran = f"last completed {since:.1f}h ago"
+    else:
+        ran = f"LAST COMPLETED {since / 24:.1f} DAYS AGO"
+
+    if timer == "absent":
+        return (f"maintenance: *** {unit} IS NOT INSTALLED *** -- nothing "
+                f"schedules pruning on this gateway and its database grows "
+                f"unbounded; {ran}")
+    if timer == "inactive":
+        return (f"maintenance: {unit} is installed but NOT RUNNING; {ran}")
+    if timer is None:
+        return (f"maintenance: timer state unknown -- this gateway could not "
+                f"ask systemd, which is not the same as no timer; {ran}")
+
+    note = ""
+    if outcome == "deferred":
+        note = " (last attempt DEFERRED: the machine held credits)"
+    return f"maintenance: {unit} active, {ran}{note}"
+
+
 def cmd_status(args) -> int:
     conn = open_db(args.db)
     service = Service(conn, load_seed(args.db))
@@ -2408,6 +2453,7 @@ def cmd_status(args) -> int:
                   f"queue_depth={beat.get('queue_depth')} "
                   f"credit_meter={beat.get('credit_meter')}")
             print("    " + describe_sas_link(beat.get("sas_link"), egm))
+            print("    " + describe_maintenance(beat.get("maintenance")))
         age = service.oldest_live_batch_age_hours(cid)
         print(f"    full issue: {service.pool_size(cid)} number(s); oldest "
               "live numbers: " + ("nothing issued yet" if age is None else

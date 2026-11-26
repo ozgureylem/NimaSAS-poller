@@ -7431,11 +7431,38 @@ def poll_and_log(
     pace = getattr(getattr(client, "transport", None),
                    "_min_poll_interval", 0.0) or 0.0
     capacity = (1.0 / pace) if pace > 0 else 0.0
+
+    # THE PERCENTAGE MUST BE AGAINST THE DIVISOR THE DECISION USES, and for
+    # a day it was not. Corrected 2026-11-26 (HANDOVER §15o).
+    #
+    # `capacity` above is read live off the transport, so while
+    # --drain-fast-poll is engaged it is the FAST rate -- 25/s at 40 ms
+    # rather than 5/s at 200 ms. But _should_drain() decides against
+    # `state.baseline_capacity`, deliberately: §9 records the exit condition
+    # being corrected to "leave against the 3.3/s baseline budget rather
+    # than the fast-poll-inflated capacity, which was turning the defence
+    # off while it was still draining."
+    #
+    # The logic was fixed there and THIS LINE KEPT THE OLD DIVISOR, so the
+    # printed percentage fell as the defence engaged and kept falling the
+    # harder it worked. The operator watched a mash on 2026-11-26 and saw
+    # `3.20/25.0ev/s=13%` beside a deferred sweep, against an engage
+    # threshold of 50%, and reasonably concluded something was broken.
+    # Nothing was: 3.20 against the 5.0 baseline is 64%.
+    #
+    # So report the baseline ratio, and name the fast rate separately when
+    # one is in force -- the reader needs both, but only one of them is
+    # deciding anything.
+    budget = state.baseline_capacity or capacity
     collected = state.events_this_cycle
     rate = (collected / meter_poll_elapsed) if meter_poll_elapsed > 0 else 0.0
-    used = (100.0 * rate / capacity) if capacity else 0.0
-    headroom = f"{rate:.2f}/{capacity:.1f}ev/s={used:.0f}%"
-    # What _should_drain() reads on the next cycle.
+    used = (100.0 * rate / budget) if budget else 0.0
+    fast = (f" (draining at {capacity:.1f}/s)"
+            if capacity > budget + 0.01 else "")
+    headroom = f"{rate:.2f}/{budget:.1f}ev/s={used:.0f}%{fast}"
+    # What _should_drain() reads on the next cycle. STILL the live capacity:
+    # it is the fallback used when baseline_capacity is unset, and storing
+    # the baseline here would make that fallback a tautology.
     state.last_event_rate, state.last_capacity = rate, capacity
 
     # WHAT CAN ACTUALLY BE MEASURED, AND WHAT CANNOT.
@@ -7475,7 +7502,7 @@ def poll_and_log(
             f"§12.5.3's own arithmetic. The sweep took "
             f"{meter_poll_elapsed:.1f}s across {meter_poll_count} long "
             f"polls and {heartbeat_count} general polls, collecting "
-            f"{rate:.2f} of a {capacity:.1f}/s budget. "
+            f"{rate:.2f} of a {budget:.1f}/s budget{fast}. "
             + sweep_remedies(
                 drain_priority=drain_priority, was_draining=draining,
                 full_meter_sweep=full_meter_sweep,
@@ -7495,14 +7522,14 @@ def poll_and_log(
         # A long sweep that loses nothing is a COST, not a fault: it buys
         # 154 Table C-7 meters and 39 single ones. Said once, quietly.
         print(f"[{now}] note: sweep {meter_poll_elapsed:.1f}s over "
-              f"--interval {interval}s, collecting {rate:.2f}/{capacity:.1f} "
-              f"events/s with nothing reported lost")
+              f"--interval {interval}s, collecting {rate:.2f}/{budget:.1f} "
+              f"events/s{fast} with nothing reported lost")
 
     if used >= 70.0:
         print(f"[{now}] ** EVENT HEADROOM {used:.0f}% -- {rate:.2f} events/s "
-              f"against the {capacity:.1f}/s that §2.3.3 pacing allows us to "
-              f"collect. Above this the queue builds, and a stalled long poll "
-              f"is dead air where nothing drains. "
+              f"against the {budget:.1f}/s baseline §2.3.3 pacing allows us "
+              f"to collect{fast}. Above this the queue builds, and a stalled "
+              f"long poll is dead air where nothing drains. "
               + sweep_remedies(
                   drain_priority=drain_priority, was_draining=draining,
                   full_meter_sweep=full_meter_sweep,
