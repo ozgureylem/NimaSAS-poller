@@ -614,6 +614,47 @@ def cmd_status(args) -> int:
     return 0
 
 
+def record_local_run(conn, outcome: str, summary: str,
+                     *, enabled: bool = True) -> None:
+    """Write this run into link_maintenance as source='local'.
+
+    WHY THIS EXISTS. Until 2026-11-26 this script recorded nothing at all.
+    Only the SERVER-requested path left a row, written by gateway/client.py,
+    so a gateway whose systemd timer pruned faithfully twice a day was
+    indistinguishable -- in the one table that answers "when was this
+    database last maintained" -- from one where the timer had never been
+    installed. That second case was real: the lab gateway ran for six days
+    with no timer at all and the database went 80 MB -> 353 MB, and nothing
+    anywhere could have said so. See HANDOVER.md §15m.
+
+    The heartbeat now reports the last run from this table, which makes the
+    gap worse than cosmetic: without this function a correctly-configured
+    floor unit would report "never maintained" on every beat.
+
+    source='local' rather than 'server' is not decoration. MAINTAIN_MAX_PER_HOUR
+    in the client exists to stop a server hammering the gateway, and it counts
+    'server' rows only -- a timer doing its job must not spend the server's
+    budget and get the next real request refused.
+
+    NEVER raises. Bookkeeping about maintenance must not be able to fail
+    maintenance; an old database that predates the link schema simply gets
+    no row.
+    """
+    if not enabled:
+        return
+    try:
+        now = utc_now()
+        conn.execute(
+            "INSERT INTO link_maintenance (requested_at, options_json, "
+            "outcome, finished_at, output, source) "
+            "VALUES (?, NULL, ?, ?, ?, 'local')",
+            (now, outcome, now, summary[:2000]))
+        conn.commit()
+    except sqlite3.Error as e:
+        log(f"could not record this run in link_maintenance ({e}); the run "
+            "itself was unaffected")
+
+
 def cmd_run(args) -> int:
     conn = open_gateway_db(args.db)
 
@@ -629,6 +670,8 @@ def cmd_run(args) -> int:
             # machine that simply had a player on it.
             log(f"deferred: {why}. Nothing was pruned or reclaimed; the next "
                 "scheduled run will try again.")
+            record_local_run(conn, "deferred", f"deferred: {why}",
+                             enabled=not getattr(args, "no_record", False))
             return 0
 
     started = time.monotonic()
@@ -693,9 +736,12 @@ def cmd_run(args) -> int:
 
     log(f"write-ahead log checkpoint: {checkpoint(conn)}")
     after = file_sizes(args.db)
-    log(f"database {mb(before['db'])} -> {mb(after['db'])}, log "
-        f"{mb(before['-wal'])} -> {mb(after['-wal'])}, in "
-        f"{time.monotonic() - started:.1f}s")
+    summary = (f"database {mb(before['db'])} -> {mb(after['db'])}, log "
+               f"{mb(before['-wal'])} -> {mb(after['-wal'])}, in "
+               f"{time.monotonic() - started:.1f}s")
+    log(summary)
+    record_local_run(conn, "done", summary,
+                     enabled=not getattr(args, "no_record", False))
     # Exit 0 even with an ALERT above: under a systemd timer a non-zero exit
     # marks the UNIT failed, and "maintenance failed" is not what happened.
     return 0
@@ -795,6 +841,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS,
                    help="stop after this long even with work left "
                    "(default %(default)s); the next run continues")
+    r.add_argument("--no-record", action="store_true",
+                   help="do not write this run into link_maintenance. The "
+                        "gateway client passes it, because the client already "
+                        "keeps its own row for a server-requested run and two "
+                        "rows for one run would double-count. A timer or a "
+                        "person should leave it off.")
     r.add_argument("--repeat-min-freed-mb", type=float, default=0.0, metavar="MB",
                    help="run again straight away, up to "
                    f"{REPEAT_MAX_RUNS} times, for as long as a run shrinks "

@@ -464,6 +464,10 @@ proposals, and RamSys should treat them as open until agreed.
  "egm_status": {"online": true, "sas_version": "602",
                 "meters_age_s": 3.1, "last_poll_ms": null, "headroom_pct": null},
  "disk_critical": false, "credit_meter": 12550,
+ "maintenance": {"timer": "active", "timer_unit": "nimasas-db-maintain.timer",
+                 "last_done_at": "2026-11-26T03:45:00+00:00",
+                 "since_done_h": 14.9, "last_attempt_at": "...",
+                 "last_attempt_outcome": "done"},
  "machine": {"id": 3, "started_at": "...", "ended_at": null,
              "reason": "machine_changed", "serial_number": "...",
              "asset_number": 246, "sas_version": "602"}}
@@ -471,6 +475,35 @@ proposals, and RamSys should treat them as open until agreed.
 
 `machine` † is the open machine epoch: the cabinet the gateway is on now.
 It is `null` until the poller has identified one.
+
+`maintenance` † answers "is this gateway's database being looked after, and
+if not, why not" — a question the link could not previously ask.
+
+- `timer` — `"active"`, `"inactive"`, `"absent"`, or **`null`**. The four are
+  distinct and a server must not merge them. `"absent"` is a *measurement*:
+  systemd was asked and said the maintenance unit is not installed.
+  **`null` means the question could not be put** (no systemd, a non-Linux
+  host, the call failed), and treating it as `"absent"` would raise an alarm
+  on every gateway that is merely hard to interrogate.
+- `timer_unit` — which unit was asked about. A gateway with one database
+  reports the default; a host with two reports whichever maintains *this*
+  one.
+- `last_done_at` / `since_done_h` — the last run that actually completed,
+  from either scheduler. `null` on a gateway that has never been maintained,
+  which on a newly commissioned unit is correct and on an old one is the
+  thing to chase.
+- `last_attempt_at` / `last_attempt_outcome` — the last run of any outcome,
+  so a gateway that **defers** every run because a player is always on it
+  (`"deferred"`) is distinguishable from one where nothing is scheduled at
+  all.
+
+**Why the pair matters.** A gateway can look entirely healthy — service up,
+link up, events flowing — while its database grows without bound, because
+nothing in the heartbeat used to report whether the job that bounds it was
+ever scheduled. On 2026-11-26 exactly that was found on the lab gateway:
+six days, no timer installed, 80 MB to 353 MB, and no signal anywhere. At
+fleet scale "was the timer enabled on that one" is not answerable by
+inspection, so the gateway now says.
 
 Two further top-level fields †, not shown above:
 

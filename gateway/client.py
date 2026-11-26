@@ -560,7 +560,91 @@ def sas_link_status(conn: sqlite3.Connection) -> dict | None:
     }
 
 
-def build_heartbeat(conn: sqlite3.Connection, tables: list[str], db_path: str) -> dict:
+# The systemd unit whose timer maintains THIS gateway's database. A floor
+# unit has one; the lab box has two databases and therefore two units, which
+# is why this is a flag rather than a constant. The maintenance PARAMETERS
+# are identical between them -- operator, 2026-11-26: "We're getting the
+# gateway ready for a live floor, we can't use two different parameters."
+# Only the database path and the unit name differ, because they must.
+DEFAULT_MAINTENANCE_TIMER = "nimasas-db-maintain.timer"
+# Asked of systemd, not of the database, so it is cached: the heartbeat
+# fires every 15 s and a subprocess per beat is 5,760 forks a day on a
+# 1 GHz 32-bit gateway, to answer a question that changes when a human runs
+# systemctl.
+MAINTENANCE_TIMER_RECHECK_S = 900.0
+_TIMER_CACHE: dict = {"unit": None, "at": None, "state": None}
+
+
+def maintenance_timer_state(unit: str = DEFAULT_MAINTENANCE_TIMER, *,
+                            clock=time.monotonic, run=None,
+                            cache: dict | None = None) -> str | None:
+    """'active' | 'inactive' | 'absent', or None when we cannot tell.
+
+    None and 'absent' are DIFFERENT and the server must not merge them.
+    'absent' is a measurement: systemd was asked and said the unit is not
+    installed -- which is the 2026-11-26 failure, where the lab gateway ran
+    six days with no timer and grew 80 MB -> 353 MB in silence. None means
+    the question could not be put (no systemctl, a non-Linux host, the call
+    failed), and reporting that as 'absent' would cry wolf on every gateway
+    that is merely hard to interrogate.
+    """
+    cache = _TIMER_CACHE if cache is None else cache
+    now = clock()
+    if (cache.get("unit") == unit and cache.get("at") is not None
+            and now - cache["at"] < MAINTENANCE_TIMER_RECHECK_S):
+        return cache["state"]
+    runner = run if run is not None else subprocess.run
+    state: str | None = None
+    try:
+        done = runner(["systemctl", "show", unit,
+                       "--property=LoadState", "--property=ActiveState"],
+                      capture_output=True, text=True, timeout=10)
+        fields = dict(
+            line.split("=", 1) for line in (done.stdout or "").splitlines()
+            if "=" in line)
+        load = fields.get("LoadState")
+        if load == "not-found":
+            state = "absent"
+        elif load:
+            state = "active" if fields.get("ActiveState") == "active" else "inactive"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        state = None
+    cache.update({"unit": unit, "at": now, "state": state})
+    return state
+
+
+def maintenance_status(conn: sqlite3.Connection, unit: str = DEFAULT_MAINTENANCE_TIMER,
+                       **kw) -> dict:
+    """What the server needs to answer "is this gateway being maintained?"
+
+    Both halves matter and neither is sufficient. `last_done_at` says whether
+    the job is happening; `timer` says WHY it is not, which is the difference
+    between a gateway that deferred twice today because a player was sitting
+    at it and one where nobody ran the install step.
+    """
+    def one(where: str):
+        try:
+            return conn.execute(
+                "SELECT requested_at, outcome FROM link_maintenance "
+                f"WHERE {where} ORDER BY id DESC LIMIT 1").fetchone()
+        except sqlite3.Error:
+            return None
+
+    done = one("outcome = 'done'")
+    attempt = one("outcome <> 'refused'")
+    since = _seconds_since(done[0]) if done else None
+    return {
+        "timer": maintenance_timer_state(unit, **kw),
+        "timer_unit": unit,
+        "last_done_at": done[0] if done else None,
+        "since_done_h": None if since is None else round(since / 3600.0, 2),
+        "last_attempt_at": attempt[0] if attempt else None,
+        "last_attempt_outcome": attempt[1] if attempt else None,
+    }
+
+
+def build_heartbeat(conn: sqlite3.Connection, tables: list[str], db_path: str,
+                    *, maintenance_timer: str = DEFAULT_MAINTENANCE_TIMER) -> dict:
     """§10.4 and Appendix B.3. Fields this gateway cannot yet measure are
     sent as null, never as a plausible-looking default: `last_poll_ms` and
     `headroom_pct` are not recorded anywhere the client can read."""
@@ -611,6 +695,13 @@ def build_heartbeat(conn: sqlite3.Connection, tables: list[str], db_path: str) -
         # hears about a dead poller from a live client.
         "sas_link": sas_link_status(conn),
         "disk_critical": disk_critical,
+        # IS THIS GATEWAY BEING MAINTAINED, and if not, why not. Added
+        # 2026-11-26 after the lab gateway ran six days with no maintenance
+        # timer installed -- service active, link up, heartbeat green, and
+        # the database growing 80 MB -> 353 MB with nothing able to say so.
+        # At ~1,000 units "did somebody enable the timer on that one" is not
+        # answerable by looking at the fleet unless the fleet reports it.
+        "maintenance": maintenance_status(conn, maintenance_timer),
         "credit_meter": credits,
         # The cabinet this gateway is on NOW: the open machine epoch, with
         # the serial and asset number the poller read off the wire. null
@@ -625,9 +716,11 @@ class Link:
     """One authenticated connection, and the two counters §10.3 persists."""
 
     def __init__(self, conn: sqlite3.Connection, cfg: dict, db_path: str,
-                 only_tables: frozenset | None = None):
+                 only_tables: frozenset | None = None,
+                 maintenance_timer: str = DEFAULT_MAINTENANCE_TIMER):
         self.conn, self.cfg, self.db_path = conn, cfg, db_path
         self.only_tables = only_tables
+        self.maintenance_timer = maintenance_timer
         self.sock: socket.socket | None = None
         self.buffer = bytearray()
         self.buffer_since: float | None = None
@@ -880,8 +973,14 @@ class Link:
             refuse("an earlier request is still waiting for zero credits",
                    options)
             return
+        # source='server' ONLY. This limit exists to stop a SERVER hammering
+        # the gateway; a local timer doing its scheduled job must not spend
+        # the server's budget and get the next real request refused. Rows
+        # written before the column existed default to 'server', which is
+        # what they all were.
         recent = self.conn.execute(
             "SELECT COUNT(*) FROM link_maintenance WHERE outcome <> 'refused' "
+            "AND source = 'server' "
             "AND datetime(requested_at) > datetime(?, '-1 hour')",
             (now,)).fetchone()[0]
         if recent >= MAINTAIN_MAX_PER_HOUR:
@@ -892,7 +991,11 @@ class Link:
             refuse(f"{MAINTAIN_SCRIPT} is not in this checkout", options)
             return
 
-        command = [sys.executable, str(MAINTAIN_SCRIPT), "run", "--db", self.db_path]
+        # --no-record: db_maintain.py writes its own link_maintenance row
+        # (source='local') since 2026-11-26, and this method writes one too.
+        # Without the flag a server-requested run would appear twice.
+        command = [sys.executable, str(MAINTAIN_SCRIPT), "run",
+                   "--db", self.db_path, "--no-record"]
         if options["prune_acked"]:
             command.append("--prune-acked")
         if options["require_zero_credits"]:
@@ -1236,7 +1339,8 @@ class Link:
         if frozenset(self.tables) != self.indexed:
             ensure_drain_indexes(self.conn, self.tables)
             self.indexed = frozenset(self.tables)
-        beat = build_heartbeat(self.conn, self.tables, self.db_path)
+        beat = build_heartbeat(self.conn, self.tables, self.db_path,
+                               maintenance_timer=self.maintenance_timer)
         # An epoch id means nothing without the database it counts in: a
         # re-imaged gateway starts again from epoch 1.
         beat["db_instance_id"] = self.instance
@@ -1392,7 +1496,9 @@ def run(args) -> int:
             "top-up will be refused until the poller has created the table.")
     # Before anything touches the sequence counters.
     _lock = claim_single_instance(args.db)          # noqa: F841 -- held
-    link = Link(conn, cfg, args.db, only)
+    link = Link(conn, cfg, args.db, only,
+                maintenance_timer=getattr(args, "maintenance_timer",
+                                          DEFAULT_MAINTENANCE_TIMER))
     log(f"gateway client for {cfg['client_id']}, database {args.db} "
         f"(instance {link.instance}), server "
         f"{cfg['server_host']}:{cfg['server_port']}")
@@ -1532,6 +1638,16 @@ def build_parser() -> argparse.ArgumentParser:
                    "drained can hold hundreds of thousands of machine_events "
                    "rows; naming the ticket tables here gets the money "
                    "records to the server without waiting behind them.")
+    r.add_argument("--maintenance-timer", default=DEFAULT_MAINTENANCE_TIMER,
+                   metavar="UNIT",
+                   help="the systemd timer that maintains THIS database, "
+                        "reported in the heartbeat so the server can see "
+                        "gateways nobody enabled it on (default: "
+                        "%(default)s). A floor unit has one and should not "
+                        "set this. The lab box has two databases, so the "
+                        "soak client passes nimasas-db-maintain-soak.timer. "
+                        "The maintenance parameters are identical either "
+                        "way; only the database and the unit name differ.")
     # For tests, which cannot wait out thirty real seconds to see what a
     # lock timeout does. Not a tuning knob: §6.1 fixes it at 30 s.
     r.add_argument("--busy-timeout-ms", type=int, default=30_000,

@@ -142,7 +142,22 @@ CREATE TABLE IF NOT EXISTS link_maintenance (
     outcome TEXT NOT NULL,            -- 'running' | 'done' | 'deferred'
                                       -- | 'failed' | 'refused'
     finished_at TEXT,
-    output TEXT
+    output TEXT,
+    -- WHO ASKED. 'server' is a MAINTAIN the server sent and this client
+    -- drove; 'local' is the systemd timer (or a hand-run) recording its own
+    -- work through db_maintain.py.
+    --
+    -- Added 2026-11-26 because the two paths were indistinguishable and one
+    -- of them was invisible: db_maintain.py recorded nothing at all, so a
+    -- gateway whose timer pruned twice a day looked, from this table, like
+    -- one that had never been maintained. The heartbeat now reports the
+    -- last run from here, and would have raised a false alarm on every
+    -- correctly-configured unit without this column.
+    --
+    -- It also keeps MAINTAIN_MAX_PER_HOUR honest: that limit exists to stop
+    -- a SERVER hammering the gateway, so it counts 'server' rows only. A
+    -- local timer run must not spend the server's budget.
+    source TEXT NOT NULL DEFAULT 'server'
 );
 
 CREATE TABLE IF NOT EXISTS link_replays (
@@ -319,6 +334,18 @@ def ensure_link_schema(conn: sqlite3.Connection) -> None:
                     # ALTER. That is the outcome we wanted.
                     pass
         backfill_issue_seq(conn)
+    # link_maintenance.source, for databases created before 2026-11-26.
+    # NOT NULL with a default is safe in ALTER TABLE and backfills every
+    # existing row to 'server', which is what they all were: nothing else
+    # could write this table until db_maintain.py learned to.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(link_maintenance)")}
+    if cols and "source" not in cols:
+        try:
+            conn.execute("ALTER TABLE link_maintenance ADD COLUMN "
+                         "source TEXT NOT NULL DEFAULT 'server'")
+        except sqlite3.OperationalError:
+            # The other process won the race between PRAGMA and ALTER.
+            pass
     conn.commit()
 
 
