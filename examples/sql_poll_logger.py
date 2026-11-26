@@ -3028,6 +3028,47 @@ def _live_drain_probe(state: "PollState", started: float, *,
     return probe
 
 
+def _restricted_ticket_note(values: dict) -> str:
+    """The restricted ticket meters, for the cycle line, when non-zero.
+
+    RESTRICTED MONEY MOVES, AND THE CYCLE LINE SHOWED IT AS NOTHING.
+
+    Operator, 2026-11-26: "restricted credits can leave the machine only by
+    playable ticket out (or aft restricted credit out)" -- general EGM
+    behaviour, and he was explicit that it is not a statement about this
+    configuration. What restricted credit cannot do is leave as CASHABLE.
+
+    ON THIS GATEWAY THAT MAKES IT NARROWER STILL. We ship
+    --decline-aft-cashout, which refuses the AFT host cashout (0x6A) and
+    forces the ticket path -- three of them were declined in burst arm D3
+    before the validation request. So of the two exits restricted credit
+    has in the protocol, our configuration closes one: **the playable
+    ticket out is the only way restricted money leaves this machine**, and
+    ticket_out_restricted_cents is the sole meter that witnesses it.
+
+    The cycle line printed only the cashable pair. So an operator building
+    playable tickets -- push restricted by AFT, cash out, take the ticket,
+    which is what this cabinet did all evening -- watched 116.26 leave at
+    22:01:56 and saw `ticket_out_cashable_cents` flat. The money moved, the
+    only exit it had was used, and the one line a human reads said nothing.
+
+    NON-ZERO GATED on purpose. A cashable-only floor machine never holds
+    restricted credit; adding two permanently-zero fields to every cycle
+    line on every gateway to serve the lab would make the line harder to
+    read for the many to help the few. A machine that has never seen
+    restricted money prints exactly what it printed before.
+
+    Same class as §15o and §15p: an instrument rendering a real event as a
+    non-event. Three times in one week, in three fields of the same line.
+    """
+    r_in = values.get("ticket_in_restricted_cents") or 0
+    r_out = values.get("ticket_out_restricted_cents") or 0
+    if not (r_in or r_out):
+        return ""
+    return (f" ticket_in_restricted_cents={r_in}"
+            f" ticket_out_restricted_cents={r_out}")
+
+
 def _event_window(state: "PollState", now_mono: float,
                   fallback: float) -> float:
     """Seconds since the event counters were last zeroed.
@@ -7652,10 +7693,12 @@ def poll_and_log(
         note += ", meter decrease detected"
     elif anomaly:
         note += ", anomaly signaled"
+    restricted_note = _restricted_ticket_note(values)
     print(
         f"[{now}] {headroom} coin_in={values['total_coin_in']} coin_out={values['total_coin_out']} "
         f"games_played={values['games_played']} ticket_in_cashable_cents={values['ticket_in_cashable_cents']} "
-        f"ticket_out_cashable_cents={values['ticket_out_cashable_cents']} "
+        f"ticket_out_cashable_cents={values['ticket_out_cashable_cents']}"
+        f"{restricted_note} "
         f"meter_poll={meter_poll_elapsed:.3f}s/{meter_poll_count}lp+{heartbeat_count}gp"
         f"{credit_note} — {note}"
     )
