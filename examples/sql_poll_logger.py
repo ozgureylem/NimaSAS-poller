@@ -1518,6 +1518,58 @@ class PollState:
     stream_credits_lost: int = 0
     # Headroom: events collected and the window they arrived in.
     events_this_cycle: int = 0
+    # THE WINDOW THOSE EVENTS ARRIVED IN. monotonic, set where the counters
+    # above are zeroed -- which is the ONLY place they are zeroed, so this
+    # stays matched to the numerator even across the failure paths that
+    # return early without resetting.
+    #
+    # WHY THIS FIELD EXISTS. The rate was events_this_cycle divided by
+    # `meter_poll_elapsed`, the SWEEP's duration. Those are different
+    # windows, and not by a little:
+    #
+    #   * events_this_cycle is incremented in _dispatch_exception, which
+    #     runs at the cycle-top general poll (BEFORE the sweep starts) and
+    #     inside _drain_sleep (AFTER the cycle has reported and reset).
+    #     Its window is the whole cycle, reset to reset.
+    #   * meter_poll_elapsed is monotonic_fn() - mono_now, and mono_now is
+    #     taken after the cycle-top poll. Its window is the sweep alone.
+    #
+    # So a short sweep divided a cycle's worth of events by a fraction of
+    # the cycle. MEASURED on the operator's 2026-11-26 19:51-19:55 run,
+    # 74 cycles decoded from the printed rate and sweep (the numerator is
+    # recoverable exactly -- largest residual off an integer, 0.03):
+    #
+    #   steady play   2 events / 0.622 s sweep = 3.22/s reported
+    #                 2 events / 2.66  s cycle = 0.75/s true      4.3x
+    #   burst       153 events / 1.154 s sweep = 132.61/s reported
+    #               153 events / 23.92 s cycle = 6.39/s true     20.7x
+    #
+    # AND THE INFLATION IS LARGEST EXACTLY WHEN THE DEFENCE IS WORKING,
+    # because drain priority is what shortens the sweep (22 long polls to
+    # 8, 9.06 s to 0.62 s). The defence inflated the number deciding
+    # whether the defence stayed engaged.
+    #
+    # WHAT IT COST. _should_drain() leaves at DRAIN_LEAVE_FRACTION of the
+    # baseline budget. Over 142.6 s of ordinary single-game-per-cycle play
+    # (54 cycles, 63 games, 128 events) the reported mean was 3.62/s = 72%
+    # of the 5.0/s budget, so drain priority LATCHED; the true mean was
+    # 0.90/s = 18%, below the 30% leave fraction, so it should have
+    # released. It stayed on for 3 m 46 s and let go only when play
+    # stopped entirely (0.00 ev/s, 19:55:01).
+    #
+    # A latch is not what this defence is. Drain priority abandons the
+    # optional sweep AND pins the poller to 40 ms (SAS_FAST_POLL_INTERVAL_S);
+    # held indefinitely on a machine that is simply being played, that is
+    # continuous 40 ms polling with Table C-7 and the full meter sweep
+    # permanently stale: a conditional defence degraded into unconditional
+    # fast polling, which is the one thing this design is meant not to do.
+    #
+    # Simulating the corrected rates back through the UNCHANGED 50%/30%
+    # dead band over that same run: 3 transitions, drain priority on for 7
+    # of 73 cycles, engaging one cycle BEFORE the 153-event burst and
+    # releasing when it ended. No flapping, so no new hysteresis is needed
+    # -- the fractions were never the problem. HANDOVER §15q.
+    events_window_mono: float = 0.0
     # SEEN, not filed. events_this_cycle is incremented in
     # _dispatch_exception, and the heartbeat QUEUES most codes into `seen`
     # to dispatch after the sweep -- so mid-sweep that counter is still
@@ -2974,6 +3026,34 @@ def _live_drain_probe(state: "PollState", started: float, *,
                 on_fire()
         return True
     return probe
+
+
+def _event_window(state: "PollState", now_mono: float,
+                  fallback: float) -> float:
+    """Seconds since the event counters were last zeroed.
+
+    The window `state.events_this_cycle` was accumulated over, so that the
+    rate built from it divides matched quantities. See
+    PollState.events_window_mono for the measurement this corrects and
+    what the mismatch cost.
+
+    TAKES A TIMESTAMP, NOT A CLOCK. Every caller has just read the clock
+    to close its own sweep, and that read is the right instant: it is the
+    one stored as the next window's start, so consecutive windows abut
+    exactly instead of leaving the reporting work in neither. Reading
+    again here would also have made poll_and_log() call monotonic_fn()
+    once more per cycle, which the scripted-clock tests detect as a
+    StopIteration -- a real signal that the cycle's timing had changed
+    shape, not a test artefact to work around.
+
+    `fallback` is used only before the first reset has happened -- the
+    very first cycle of a run, and any caller (a test) that never set the
+    anchor. Passing the sweep duration there keeps the old behaviour for
+    that one cycle rather than dividing by the time since the epoch.
+    """
+    if not state.events_window_mono:
+        return fallback
+    return max(now_mono - state.events_window_mono, 0.0)
 
 
 def _should_drain(state: "PollState", enter: float = DRAIN_ENTER_FRACTION,
@@ -6848,7 +6928,9 @@ def poll_and_log(
             last_accepted_bill_poll=last_accepted_bill_poll and not draining,
         )
     except _MeterPollFailure as failure:
-        meter_poll_elapsed = monotonic_fn() - mono_now
+        # Read once; also the window end passed to _event_window() below.
+        mono_fail_end = monotonic_fn()
+        meter_poll_elapsed = mono_fail_end - mono_now
         # A DEAD LONG POLL IS A DEAD LINK, AND IT STARTS THE GAP CLOCK.
         #
         # Operator, 2026-11-17, stating the rule after a five-second cable
@@ -6900,11 +6982,12 @@ def poll_and_log(
         _pace = getattr(getattr(client, "transport", None),
                         "_min_poll_interval", 0.0) or 0.0
         state.last_capacity = (1.0 / _pace) if _pace > 0 else 0.0
-        if meter_poll_elapsed > 0:
+        _window = _event_window(state, mono_fail_end, meter_poll_elapsed)
+        if _window > 0:
             state.last_event_rate = max(
                 state.events_seen_live + state.preempted_events_live,
                 state.events_this_cycle
-            ) / meter_poll_elapsed
+            ) / _window
         # A 24-REISSUE PRE-EMPTION IS A BURST. Act on it here, not next
         # cycle.
         #
@@ -6995,10 +7078,12 @@ def poll_and_log(
                 # evidence: a saturated channel COLLECTS almost nothing
                 # precisely because the long poll is stalled, so measuring
                 # collection throughput reads a burst as silence.
-                if meter_poll_elapsed > 0:
+                _window = _event_window(state, mono_fail_end,
+                                        meter_poll_elapsed)
+                if _window > 0:
                     state.last_event_rate = max(
                         state.events_seen_live, state.events_this_cycle
-                    ) / meter_poll_elapsed
+                    ) / _window
         return
 
     # Only a cycle that actually READ C-7 consumes the cadence. Two ways a
@@ -7187,7 +7272,14 @@ def poll_and_log(
                               "rescales every figure in the database.")
                     _safe_commit(conn, now)
 
-    meter_poll_elapsed = monotonic_fn() - mono_now
+    # Read ONCE and kept: this same instant closes the sweep and opens the
+    # next event-rate window at the reset below, so the window is exactly
+    # one cycle period end to end. Reading the clock again down there would
+    # also be correct, and would cost a call per cycle for the microseconds
+    # of printing in between -- during which nothing polls, so no event can
+    # arrive.
+    mono_sweep_end = monotonic_fn()
+    meter_poll_elapsed = mono_sweep_end - mono_now
     # What this cycle actually put on the wire, not what the flags allow.
     #
     # This used to read ``table_c7_sweep`` -- the flag saying C-7 sweeps are
@@ -7455,7 +7547,9 @@ def poll_and_log(
     # deciding anything.
     budget = state.baseline_capacity or capacity
     collected = state.events_this_cycle
-    rate = (collected / meter_poll_elapsed) if meter_poll_elapsed > 0 else 0.0
+    # MATCHED WINDOW, not the sweep. See PollState.events_window_mono.
+    window = _event_window(state, mono_sweep_end, meter_poll_elapsed)
+    rate = (collected / window) if window > 0 else 0.0
     used = (100.0 * rate / budget) if budget else 0.0
     fast = (f" (draining at {capacity:.1f}/s)"
             if capacity > budget + 0.01 else "")
@@ -7546,6 +7640,12 @@ def poll_and_log(
     state.preempted_events_live = 0
     state.overflows_this_cycle = 0
     state.gaps_this_cycle = 0
+    # THE NUMERATOR'S WINDOW RESTARTS HERE, with the numerator. Everything
+    # counted from now until the next reset -- the drain sleep below, the
+    # next cycle's top general poll, the next sweep -- is divided by the
+    # time since this line. The failure paths above return without
+    # resetting, deliberately, and this anchor stays with them.
+    state.events_window_mono = mono_sweep_end
 
     note = "history written" if write_history else "history skipped (cadence)"
     if decreased:
@@ -8522,6 +8622,9 @@ def main() -> int:
         getattr(client, "transport", None), "_min_poll_interval", 0.0) or 0.0
     state.baseline_capacity = (
         1.0 / state.normal_poll_interval if state.normal_poll_interval else 0.0)
+    # The first cycle has no previous reset to measure from. Anchor it here
+    # so it divides by its own elapsed time rather than by the epoch.
+    state.events_window_mono = time.monotonic()
 
     cycle = 0
     reconnect_attempt = 0
