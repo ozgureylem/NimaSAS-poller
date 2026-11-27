@@ -2429,20 +2429,43 @@ def describe_maintenance(m) -> str:
 
 
 def _aft_gateway_answer(conn, transfer_id) -> tuple:
-    """The GATEWAY's own answer to a pushed AFT: (state, reason).
+    """The GATEWAY's own answer to a pushed AFT: (state, the text verbatim).
 
-    `commands.state` only ever says what the SERVER did -- 'pending' until
-    a gateway connects, then 'sent' forever. It cannot say what the machine
+    `commands.state` only ever says what the SERVER did: 'pending' until a
+    gateway connects, then 'sent' forever. It cannot say what the machine
     answered, and for months it read `[sent]` for transfers the cabinet had
-    declined.
+    declined. Operator, 2026-11-26, after a 0x87: "AFT didn't land."
 
-    Operator, 2026-11-26, after a 0x87: "AFT didn't land." The server said
-    `[sent]`, the reason was on the gateway, and the gateway is headless.
+    READ FROM lab_auto_actions, AND THE FIRST VERSION OF THIS DID NOT.
 
-    The answer was already arriving all along: the poller finishes its
-    host_requests row with a state and an error, the client drains that row,
-    and it lands in `ingest`. Nothing needed to be sent -- only read. Matched
-    on the transfer_id both sides already carry.
+    It read the gateway's `host_requests` row, on the reasoning that the
+    poller finishes that row with a state and a reason, the client drains
+    it, and it lands in `ingest` -- so nothing new needed sending. **That
+    was wrong twice over, and hardware found it within minutes:** every
+    command printed `gateway: pending`, including ones whose money had
+    demonstrably landed.
+
+      1. The drain selects `WHERE synced_at IS NULL`, sends, then stamps
+         synced_at. A row travels EXACTLY ONCE, in whatever state it held
+         at that instant. host_requests rows are created 'pending' and
+         finished later, and the client drains every second, so it
+         reliably catches them pending and the final state never leaves
+         the gateway.
+      2. Clearing synced_at on finish would not help. The ingest upsert is
+         deliberately append-only -- "a re-sent row changes nothing
+         (§11.1)" -- so the server would discard the finished content on
+         principle. **A state that changes after creation cannot be
+         carried by an append-only ingest.**
+
+    lab_auto_actions is append-only BY NATURE: one row per action, written
+    once, with the outcome already in it. That is why it has carried the
+    real answer all along -- `status 0x00 SUCCESSFUL`, `status 0x87
+    FAILED: ...`, `REFUSED: inside the 120.0s minimum interval` -- while
+    the row this function used to read said `pending`.
+
+    THE TEXT IS RETURNED VERBATIM, not re-worded. It was written for a
+    person to act on and it already names the remedy; re-deriving a
+    category from it would be a third chance to lose the reason.
 
     Returns (None, None) when no answer has arrived, which is a real state
     and not an error: a queued transfer the gateway has not reached yet.
@@ -2450,7 +2473,7 @@ def _aft_gateway_answer(conn, transfer_id) -> tuple:
     if not transfer_id:
         return None, None
     row = conn.execute(
-        "SELECT row_json FROM ingest WHERE table_name = 'host_requests' "
+        "SELECT row_json FROM ingest WHERE table_name = 'lab_auto_actions' "
         "   AND row_json LIKE ? ORDER BY row_id DESC LIMIT 1",
         (f"%{transfer_id}%",)).fetchone()
     if row is None:
@@ -2461,7 +2484,19 @@ def _aft_gateway_answer(conn, transfer_id) -> tuple:
         return None, None
     if not isinstance(parsed, dict):
         return None, None
-    return parsed.get("state"), parsed.get("error")
+    text = parsed.get("outcome")
+    if not text:
+        return None, None
+    text = str(text)
+    if text.startswith("status 0x00"):
+        state = "done"
+    elif text.startswith("REFUSED"):
+        state = "refused"
+    elif "FAILED" in text:
+        state = "failed"
+    else:
+        state = "answered"
+    return state, text
 
 
 def cmd_status(args) -> int:
