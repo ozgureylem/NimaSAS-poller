@@ -4477,6 +4477,13 @@ HANDPAY_LEVEL_CANCELLED_CREDITS = 0x80
 # Table 8.3e. Named because the message it produces has to name the pool,
 # and a bare 0x8F in a condition is the kind of literal nobody recognises.
 AFT_STATUS_RESTRICTED_POOL_MISMATCH = 0x8F
+# Table 8.3e's "gaming machine unable to perform transfers at this time".
+# MEASURED on this cabinet across three cells, 2026-11-26/27 (burst arms
+# D3/D4/D5): it is returned for a restricted transfer that would commit a
+# NEW pool while a game is in progress. The same transfer succeeds on an
+# idle machine, and a transfer onto the pool the machine already holds
+# succeeds under full load. Neither load nor restricted alone provokes it.
+AFT_STATUS_UNABLE_AT_THIS_TIME = 0x87
 # Table 8.3e's category for a transfer that fully succeeded, taken from
 # the decoder itself so the two can never drift.
 AFT_CATEGORY_SUCCESSFUL = describe_aft_transfer_status(0x00)[0]
@@ -6016,6 +6023,37 @@ def _lookup_ticket_out_local(conn: sqlite3.Connection, validation_number: int):
 
 
 
+@dataclass(frozen=True)
+class AftPushResult:
+    """What a server AFT push did, and WHY, in one object.
+
+    This used to be a bare `bool`, and the reason was written to
+    lab_auto_actions and then dropped. So the host_requests row the server
+    reads said `failed` with "see lab_auto_actions and poll_errors" --
+    two tables on a gateway that §15 says gets no SSH.
+
+    Operator, 2026-11-27, having watched a 0x87 vanish: "how can we solve
+    this?" This is the answer's first half -- the reason now exists as a
+    value instead of only as a log line.
+
+    `outcome` is a host_requests state, deliberately the same vocabulary
+    link_maintenance already uses ('done' | 'refused' | 'failed'):
+
+      done     the cabinet took the money
+      refused  the system worked and declined -- a cap, or the cabinet's
+               own non-zero status. NOT an error, and the
+               --allow-server-aft branch already got this right.
+      failed   something broke mid-exchange and the outcome is unknown
+
+    Truthy when done, so `if ok:` at the call site keeps its meaning.
+    """
+    outcome: str
+    reason: str
+
+    def __bool__(self) -> bool:
+        return self.outcome == "done"
+
+
 def _server_aft_credit(client, conn: sqlite3.Connection, now: str,
                        state: "PollState", *, cashable_cents: int,
                        restricted_cents: int, nonrestricted_cents: int,
@@ -6038,24 +6076,36 @@ def _server_aft_credit(client, conn: sqlite3.Connection, now: str,
     """
     total = cashable_cents + restricted_cents + nonrestricted_cents
     if total <= 0:
-        return False
+        return AftPushResult("refused", "nothing to transfer: the request "
+                             "carried no cashable, restricted or "
+                             "nonrestricted amount")
     if state.aft_pushes >= AFT_PUSH_MAX_PER_RUN:
         _record_lab_action(conn, now, "aft_credit", f"server {transfer_id}",
                            f"REFUSED: this run has already made "
                            f"{state.aft_pushes} AFT pushes, the cap")
-        return False
+        return AftPushResult(
+            "refused", f"this poller run has already made "
+            f"{state.aft_pushes} AFT pushes, which is the "
+            f"{AFT_PUSH_MAX_PER_RUN} cap. Restarting the poller resets it.")
     if state.aft_cents_pushed + total > AFT_PUSH_MAX_TOTAL_CENTS:
         _record_lab_action(conn, now, "aft_credit", f"server {transfer_id}",
                            f"REFUSED: would take this run past the "
                            f"{AFT_PUSH_MAX_TOTAL_CENTS / 100:,.2f} cap")
-        return False
+        return AftPushResult(
+            "refused", f"this would take the poller run past its "
+            f"{AFT_PUSH_MAX_TOTAL_CENTS / 100:,.2f} total cap "
+            f"({state.aft_cents_pushed / 100:,.2f} already pushed). "
+            f"Restarting the poller resets it.")
     if (state.aft_last_push_mono is not None
             and monotonic_fn() - state.aft_last_push_mono
             < AFT_PUSH_MIN_INTERVAL_S):
         _record_lab_action(conn, now, "aft_credit", f"server {transfer_id}",
                            f"REFUSED: inside the "
                            f"{AFT_PUSH_MIN_INTERVAL_S}s minimum interval")
-        return False
+        return AftPushResult(
+            "refused", f"inside the {AFT_PUSH_MIN_INTERVAL_S:.0f}s minimum "
+            f"interval between AFT pushes. Wait and send it again; "
+            f"restarting the poller also resets it.")
     # LP 0x74 with lock code 0xFF: status only, no lock. Needed for the
     # asset number the transfer must carry, and it is the one read that
     # proves the cabinet is actually answering before money is sent.
@@ -6070,7 +6120,9 @@ def _server_aft_credit(client, conn: sqlite3.Connection, now: str,
         _safe_commit(conn, now)
         # Silence is not consent. Refusing to push on a failed read is the
         # difference between this and a money printer.
-        return False
+        return AftPushResult(
+            "failed", f"the cabinet did not answer LP 0x74 (lock/status), so "
+            f"nothing was sent to it: {type(e).__name__}: {e}")
     tag = f"SRV{transfer_id[:8]}" if transfer_id else f"SRV{int(time.time())}"
     try:
         result = client.aft_transfer_funds(
@@ -6097,7 +6149,11 @@ def _server_aft_credit(client, conn: sqlite3.Connection, now: str,
             f"FAILED ({type(e).__name__}: {e}) -- it may or may not have "
             "landed. Not retried: reusing the ID risks status 0x81, a fresh "
             "one risks paying twice. Reconcile from the meters.")
-        return False
+        return AftPushResult(
+            "failed", f"the transfer exchange broke after the machine may "
+            f"have acted ({type(e).__name__}: {e}). NOT retried: reusing the "
+            f"transaction ID risks status 0x81 and a fresh one risks paying "
+            f"twice. Reconcile from the meters.")
     state.aft_pushes += 1
     state.aft_cents_pushed += total
     state.aft_last_push_mono = monotonic_fn()
@@ -6136,6 +6192,21 @@ def _server_aft_credit(client, conn: sqlite3.Connection, now: str,
                 f"{lock.restricted_pool_id}, or clear the "
                 f"{lock.current_restricted_amount / 100:,.2f} restricted "
                 "balance first.")
+    elif (result.transfer_status == AFT_STATUS_UNABLE_AT_THIS_TIME
+            and restricted_cents
+            and lock.restricted_pool_id != pool_id):
+        # MEASURED, not inferred -- see AFT_STATUS_UNABLE_AT_THIS_TIME.
+        # 0x8F had a hint from the first day and 0x87 had none, so the
+        # one status this cabinet actually returns under load was the one
+        # nobody was told anything about.
+        hint = (f" -- §8.3: this cabinet returns 0x87 for a restricted "
+                f"transfer that would commit a NEW pool while a game is in "
+                f"progress. It is on pool {lock.restricted_pool_id} and this "
+                f"asked for pool {pool_id}. The same push succeeds on an "
+                f"idle machine, and a push to pool "
+                f"{lock.restricted_pool_id} succeeds under full load. Wait "
+                f"for play to pause, or push to pool "
+                f"{lock.restricted_pool_id}.")
     _record_lab_action(
         conn, now, "aft_credit",
         f"server {transfer_id} as {tag}: "
@@ -6155,7 +6226,16 @@ def _server_aft_credit(client, conn: sqlite3.Connection, now: str,
     #
     # Compared against the decoder rather than a literal, so the next
     # person to rename a category breaks a test instead of a report.
-    return category == AFT_CATEGORY_SUCCESSFUL
+    if category == AFT_CATEGORY_SUCCESSFUL:
+        return AftPushResult("done", "")
+    # THE CABINET DECLINING IS A REFUSAL, NOT A FAILURE. It answered, the
+    # exchange completed, and it said no -- with a reason that now travels
+    # instead of staying in lab_auto_actions.
+    _, detail = describe_aft_transfer_status(result.transfer_status)
+    return AftPushResult(
+        "refused",
+        f"the cabinet answered 0x{result.transfer_status:02X} {category}: "
+        f"{detail}{hint}")
 
 
 def _make_request_servicer(client, conn: sqlite3.Connection, state=None, *,
@@ -6242,7 +6322,7 @@ def _make_request_servicer(client, conn: sqlite3.Connection, state=None, *,
                     error="no poll state; cannot account for AFT caps")
             return
         spent_before = state.aft_pushes
-        ok = _server_aft_credit(
+        res = _server_aft_credit(
             client, conn, now_fn(), state,
             cashable_cents=int(asked.get("cashable") or 0),
             restricted_cents=int(asked.get("restricted") or 0),
@@ -6250,14 +6330,23 @@ def _make_request_servicer(client, conn: sqlite3.Connection, state=None, *,
             pool_id=int(asked.get("pool_id") or 0),
             expiration=int(asked.get("expiration") or 0),
             transfer_id=str(asked.get("transfer_id") or ""))
+        # THE REASON GOES IN THE ROW THE SERVER READS.
+        #
+        # This said `state_name="done" if ok else "failed"` with
+        # error="the transfer did not complete; see lab_auto_actions and
+        # poll_errors". Three things wrong with that, all fixed here: a
+        # refusal was filed as a failure, the specific reason was dropped,
+        # and what replaced it pointed at two tables on a headless box.
+        #
+        # The --allow-server-aft branch above has always done this
+        # correctly, so the right behaviour was already in this function.
         _finish(req_id, started,
-                state_name="done" if ok else "failed",
+                state_name=res.outcome,
                 served_from="aft",
                 amount=(int(asked.get("cashable") or 0)
                         + int(asked.get("restricted") or 0)
                         + int(asked.get("nonrestricted") or 0)),
-                error=None if ok else "the transfer did not complete; see "
-                                      "lab_auto_actions and poll_errors",
+                error=None if res else res.reason,
                 polls=max(0, state.aft_pushes - spent_before))
 
     def service() -> None:

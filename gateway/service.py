@@ -2428,6 +2428,42 @@ def describe_maintenance(m) -> str:
     return f"maintenance: {unit} active, {ran}{note}"
 
 
+def _aft_gateway_answer(conn, transfer_id) -> tuple:
+    """The GATEWAY's own answer to a pushed AFT: (state, reason).
+
+    `commands.state` only ever says what the SERVER did -- 'pending' until
+    a gateway connects, then 'sent' forever. It cannot say what the machine
+    answered, and for months it read `[sent]` for transfers the cabinet had
+    declined.
+
+    Operator, 2026-11-26, after a 0x87: "AFT didn't land." The server said
+    `[sent]`, the reason was on the gateway, and the gateway is headless.
+
+    The answer was already arriving all along: the poller finishes its
+    host_requests row with a state and an error, the client drains that row,
+    and it lands in `ingest`. Nothing needed to be sent -- only read. Matched
+    on the transfer_id both sides already carry.
+
+    Returns (None, None) when no answer has arrived, which is a real state
+    and not an error: a queued transfer the gateway has not reached yet.
+    """
+    if not transfer_id:
+        return None, None
+    row = conn.execute(
+        "SELECT row_json FROM ingest WHERE table_name = 'host_requests' "
+        "   AND row_json LIKE ? ORDER BY row_id DESC LIMIT 1",
+        (f"%{transfer_id}%",)).fetchone()
+    if row is None:
+        return None, None
+    try:
+        parsed = json.loads(row[0])
+    except (ValueError, TypeError):
+        return None, None
+    if not isinstance(parsed, dict):
+        return None, None
+    return parsed.get("state"), parsed.get("error")
+
+
 def cmd_status(args) -> int:
     conn = open_db(args.db)
     service = Service(conn, load_seed(args.db))
@@ -2485,6 +2521,15 @@ def cmd_status(args) -> int:
                     ("cashable_cents", "restricted_cents",
                      "nonrestricted_cents") if d.get(k))
                     + (f", pool {d['pool_id']}" if d.get("pool_id") else ""))
+                # WHAT THE MACHINE SAID, not what we did with the request.
+                answer, why = _aft_gateway_answer(conn, d.get("transfer_id"))
+                if answer:
+                    print(f"       gateway: {answer}"
+                          + (f" -- {why}" if why else ""))
+                elif state == "sent":
+                    print("       gateway: no answer yet. 'sent' means the "
+                          "server handed it over, NOT that the machine "
+                          "took it.")
             except (ValueError, TypeError, KeyError):
                 pass
     pending = sum(1 for r in rows if r[4] == "pending")
