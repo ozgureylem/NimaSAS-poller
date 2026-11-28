@@ -91,6 +91,46 @@ MIN_REFILL = 15
 POOL_ROTATION_HOURS = 35.0
 POOL_AGE_ALERT_HOURS = 36.0
 ROTATION_SWEEP_S = 300.0
+
+# SERVER-SIDE AUTOMATED MAINTENANCE (A55). Off unless `serve` is given
+# --auto-maintain-after.
+#
+# How often the server LOOKS. One gateway is queued per sweep, which is the
+# whole staggering mechanism: a floor of twenty machines spreads over five
+# hours without hashing client ids or jittering a clock, and a single
+# gateway is maintained as promptly as it would have been anyway.
+MAINTENANCE_SWEEP_S = 900.0
+# The DEFAULT hours since a gateway last completed a run before the server
+# queues one. The gateway's own timer fires every twelve hours (03:45 and
+# 15:45), so eighteen leaves the local timer to win normally and has the
+# server step in only where the timer is absent, stopped, or has been
+# deferring. A server that competed with the timer would double the work
+# and halve the clarity of who did what.
+DEFAULT_AUTO_MAINTAIN_AFTER_H = 18.0
+# What the server asks for. Three of the four match
+# deploy/nimasas-db-maintain.service, so a server-driven run and a
+# timer-driven run are the same job and "last completed 3h ago" means one
+# thing whoever drove it.
+#
+# THE FOURTH IS DELIBERATELY DIFFERENT, and the first draft of this claimed
+# otherwise. The timer passes no --wait-for-zero: it attempts once and, if
+# the machine holds credits, gives up and tries again in twelve hours. That
+# is right for a timer. It is wrong here, because the server only fires at
+# all once DEFAULT_AUTO_MAINTAIN_AFTER_H has already passed -- and the
+# commonest reason a gateway gets that overdue is credits sitting on the
+# machine. Observed 2026-11-26/27: repeated maintenance_deferred, then 26.4
+# hours with nothing pruned, because the cabinet was parked. A run that
+# attempts once would fail for exactly the reason the timer already failed.
+#
+# So the server holds the request for up to thirty minutes and starts it
+# when credits read zero, which is what the operator himself sent by hand
+# on 2026-11-26 (command 34: wait_for_zero_s 1800) and what finally worked.
+AUTO_MAINTAIN_OPTIONS = {
+    "prune_acked": True,
+    "require_zero_credits": True,
+    "repeat_min_freed_bytes": 7_000_000,
+    "wait_for_zero_s": 1800,
+}
 DRAIN_MAX_EVENTS = 25
 LEASE_DURATION_S = 45.0            # must exceed the EGM's own ~30 s return
 REJECT_CYCLE_THRESHOLD = 3
@@ -1788,6 +1828,12 @@ class Server:
         # is up: a server restarted at hour 34.9 must not wait five minutes
         # more and deliver the rotation late.
         self.last_rotation_sweep = float("-inf")
+        # Same reasoning as the rotation sweep: a server restarted after an
+        # outage must not add fifteen minutes to a gateway that is already
+        # overdue.
+        self.last_maintenance_sweep = float("-inf")
+        # 0 or None disables it. Set from `serve --auto-maintain-after`.
+        self.auto_maintain_after_h: float = 0.0
 
     def adopt(self, connection: Connection) -> None:
         self.unauthenticated -= 1
@@ -1873,6 +1919,108 @@ class Server:
             if time.monotonic() - last_expiry > 3600:
                 last_expiry = time.monotonic()
 
+    def maintenance_sweep(self) -> str | None:
+        """Queue a maintain for the most overdue connected gateway, if any.
+
+        WHY THE SERVER NEEDS THIS AT ALL. A52 built the heartbeat field that
+        lets the server SEE an unmaintained gateway, and argued that seeing
+        was most of the benefit: *"the server can now see which gateways are
+        unmaintained without having to be the thing that drives them."*
+        That holds for a gateway whose timer is working. It does nothing for
+        the three cases the field was built to expose -- timer absent, timer
+        installed but stopped, and a timer that fires and defers every time
+        -- where somebody has to notice the line and type a command.
+        2026-11-26 is the example: six days, no timer, 80 MB -> 353 MB, on a
+        gateway healthy in every other line of the report.
+
+        WHY IT DOES NOT REPLACE THE TIMER. The gateway's timer works with no
+        server at all, which is not hypothetical: on 2026-11-27 the
+        operator's laptop was off for about 23 hours and the local timer
+        pruned 273,114 rows without a server in sight. A server-driven-only
+        design would have maintained nothing that day. So this is a safety
+        net with a long fuse, not a scheduler: the default
+        DEFAULT_AUTO_MAINTAIN_AFTER_H is 18 hours against a timer that fires
+        every 12, so a working timer always gets there first and the server
+        never queues anything.
+
+        SELF-REGULATING, WITH NO MODE TO SET. "Overdue" is computed from the
+        heartbeat's last completion whatever drove it -- the timer, a human,
+        or this. Whoever runs first resets the clock and the other sees a
+        recent run and skips. Nothing has to know which mechanism is in
+        charge, which is why there is no flag for that.
+
+        ONE GATEWAY PER SWEEP, deliberately. See MAINTENANCE_SWEEP_S.
+
+        Returns the client_id queued, or None. Separate from the async
+        housekeeping so it is testable without a running loop.
+        """
+        after_h = self.auto_maintain_after_h or 0.0
+        if after_h <= 0:
+            return None
+        overdue: list[tuple[float, str]] = []
+        for client_id in sorted(self.connections):
+            row = self.service.conn.execute(
+                "SELECT last_heartbeat FROM gateways WHERE client_id = ?",
+                (client_id,)).fetchone()
+            if not row or not row[0]:
+                continue
+            try:
+                beat = json.loads(row[0])
+            except (ValueError, TypeError):
+                continue
+            m = beat.get("maintenance")
+            if not isinstance(m, dict):
+                # A client older than A52 cannot be judged overdue; saying
+                # so once is better than maintaining it on a guess.
+                continue
+            if m.get("last_done_at") is None:
+                # Never completed one. Treat as maximally overdue rather
+                # than as unknown: this is the 2026-11-26 case.
+                since = float("inf")
+            else:
+                since = m.get("since_done_h")
+                if not isinstance(since, (int, float)):
+                    continue
+                since = float(since)
+            if since < after_h:
+                continue
+            overdue.append((since, client_id))
+        if not overdue:
+            return None
+        overdue.sort(reverse=True)
+        _, client_id = overdue[0]
+        # DO NOT QUEUE A SECOND WHILE ONE IS IN FLIGHT. A maintain sits at
+        # 'sent' for up to two minutes of running plus up to thirty of
+        # waiting for zero credits, and the heartbeat's last-completed does
+        # not move until it finishes -- so without this every sweep would
+        # queue another one at a gateway that is already working.
+        inflight = self.service.conn.execute(
+            "SELECT 1 FROM commands WHERE client_id = ? AND kind = 'maintain' "
+            "  AND state IN ('pending','sent') "
+            "  AND created_at > strftime('%Y-%m-%dT%H:%M:%S', 'now', ?) "
+            "LIMIT 1",
+            (client_id, f"-{int(max(1.0, after_h) * 3600)} seconds")).fetchone()
+        if inflight:
+            return None
+        self.service.conn.execute(
+            "INSERT INTO commands (created_at, client_id, kind, detail) "
+            "VALUES (?, ?, 'maintain', ?)",
+            (utc_now(), client_id,
+             json.dumps(AUTO_MAINTAIN_OPTIONS, sort_keys=True)))
+        self.service.conn.commit()
+        since, _ = overdue[0]
+        self.service.alert(
+            "maintenance_scheduled",
+            f"queued automatically: this gateway last completed a run "
+            + ("never" if since == float("inf") else f"{since:.1f}h ago")
+            + f", past the {after_h:g}h --auto-maintain-after threshold. Its "
+            f"own timer fires every 12h, so reaching this means the timer is "
+            f"absent, stopped, or deferring. Same options as the timer: "
+            f"prune acknowledged rows, only at zero credits, hold up to "
+            f"30 min for zero, repeat while each run frees 5 MB.",
+            client_id=client_id)
+        return client_id
+
     async def _housekeep_once(self, svc, last_expiry: float) -> None:
         svc.expire_leases()
         for connection in list(self.connections.values()):
@@ -1885,6 +2033,12 @@ class Server:
         if time.monotonic() - self.last_rotation_sweep >= ROTATION_SWEEP_S:
             self.last_rotation_sweep = time.monotonic()
             await self.rotation_sweep()
+        if (time.monotonic() - self.last_maintenance_sweep
+                >= MAINTENANCE_SWEEP_S):
+            self.last_maintenance_sweep = time.monotonic()
+            # Queues a commands row; the dispatch loop below sends it on
+            # this same pass, so there is no extra round trip.
+            self.maintenance_sweep()
         for cmd_id, client_id, kind in svc.conn.execute(
                 "SELECT id, client_id, kind FROM commands "
                 "WHERE state = 'pending' ORDER BY id").fetchall():
@@ -1933,12 +2087,31 @@ async def serve(args) -> None:
     conn = open_db(args.db)
     service = Service(conn, load_seed(args.db), system_id=args.system_id)
     server = Server(service)
+    server.auto_maintain_after_h = float(
+        getattr(args, "auto_maintain_after", 0) or 0)
     listener = await asyncio.start_server(server.handle, args.host, args.port)
     names = ", ".join(str(s.getsockname()) for s in listener.sockets)
     log(f"gateway service STAND-IN listening on {names}; database {args.db}")
     log(f"pool signing public key: {service.public_key.hex()}")
     known = [r[0] for r in conn.execute("SELECT client_id FROM gateways")]
     log(f"commissioned gateways: {', '.join(known) if known else 'NONE -- run commission first'}")
+    # SAY WHICH MODE THIS IS, at startup, in both directions. A52's field
+    # exists because a gateway nobody maintained looked healthy for six
+    # days; a server nobody told to maintain anything should not look like
+    # one that was.
+    if server.auto_maintain_after_h > 0:
+        log(f"automated maintenance ON: every "
+            f"{MAINTENANCE_SWEEP_S / 60:.0f} min the most overdue connected "
+            f"gateway is queued a maintain if it has not completed one for "
+            f"{server.auto_maintain_after_h:g}h, ONE per sweep. The "
+            f"gateway's own 12-hourly timer normally gets there first; "
+            f"reaching this threshold means its timer is absent, stopped, "
+            f"or deferring.")
+    else:
+        log("automated maintenance OFF (--auto-maintain-after not given). "
+            "Each gateway's own timer is the only thing scheduling pruning; "
+            "`status` shows which gateways have one and when each last "
+            "completed a run.")
     async with listener:
         await asyncio.gather(listener.serve_forever(), server.housekeeping())
 
@@ -2644,6 +2817,18 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("serve", help="listen for gateways")
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=DEFAULT_PORT)
+    s.add_argument("--auto-maintain-after", type=float, default=0,
+                   metavar="HOURS",
+                   help="queue a maintain for any connected gateway that has "
+                        "not completed one for this long (0, the default: "
+                        f"off; a sensible value is "
+                        f"{DEFAULT_AUTO_MAINTAIN_AFTER_H:g}). The gateway's "
+                        "own timer fires every 12h, so this is a safety net "
+                        "for a timer that is absent, stopped or deferring, "
+                        "not a replacement for it: a gateway with a working "
+                        "timer never reaches the threshold. One gateway is "
+                        "queued per sweep, which staggers a floor. The run "
+                        "itself is the gateway's decision and it may refuse.")
     s.add_argument("--system-id", type=int, default=DEFAULT_SYSTEM_ID,
                    help="validation system ID for minted numbers, 1-99 "
                    "(default %(default)s; 0 means 'deny' in Table 15.8a)")

@@ -1001,6 +1001,9 @@ class Link:
         if options["require_zero_credits"]:
             command.append("--require-zero-credits")
         size = self._db_bytes()
+        # Captured BEFORE the run so the repeat rule can tell "freed pages
+        # it had no budget to return" from "found nothing to free".
+        free = self._free_bytes()
         output = tempfile.TemporaryFile(mode="w+")
         try:
             process = subprocess.Popen(command, stdout=output,
@@ -1015,7 +1018,7 @@ class Link:
             "VALUES (?, ?, 'running')",
             (now, json.dumps(options, sort_keys=True))).lastrowid
         self.conn.commit()
-        self.maintenance = (process, output, row_id, clock(), size)
+        self.maintenance = (process, output, row_id, clock(), size, free)
         if wait_s:
             self.maintenance_wait = {
                 "command": command, "row_id": row_id, "why": "",
@@ -1050,10 +1053,41 @@ class Link:
         except OSError:
             return 0
 
+    def _free_bytes(self) -> int:
+        """Reclaimable pages sitting INSIDE the file, in bytes.
+
+        The number that decides whether another run is worth starting, and
+        this class did not read it. `examples/db_maintain.py` has had it
+        since HANDOVER §15n; the server-driven path here kept the rule §15n
+        replaced, so the two loops disagreed for two days and the one the
+        server used was the broken one.
+
+        Returns 0 on any trouble: this is the loop's bookkeeping, and a
+        PRAGMA that will not answer must end the series quietly rather than
+        raise out of a maintenance run that has already done its work.
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
+            free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            page = conn.execute("PRAGMA page_size").fetchone()[0]
+            return int(free) * int(page)
+        except Exception:      # noqa: BLE001 - bookkeeping, never fatal
+            return 0
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _start_again(self, command, row_id, now) -> str | None:
         """Start the tool for a request that already has its row. Returns
         why not, or None."""
         size = self._db_bytes()
+        # Captured BEFORE the run so the repeat rule can tell "freed pages
+        # it had no budget to return" from "found nothing to free".
+        free = self._free_bytes()
         output = tempfile.TemporaryFile(mode="w+")
         try:
             process = subprocess.Popen(command, stdout=output,
@@ -1062,7 +1096,7 @@ class Link:
         except OSError as e:
             output.close()
             return f"could not start the maintenance run: {e}"
-        self.maintenance = (process, output, row_id, now, size)
+        self.maintenance = (process, output, row_id, now, size, free)
         return None
 
     def _repeat_summary(self, repeat) -> str:
@@ -1143,7 +1177,8 @@ class Link:
         """Collect a finished run and tell the server how it ended. Called
         every tick; does nothing while a run is still going."""
         if self.maintenance is not None:
-            process, output, row_id, started, size_before = self.maintenance
+            (process, output, row_id, started, size_before,
+             free_before) = self.maintenance
             code = process.poll()
             if code is None and clock() - started > MAINTAIN_KILL_AFTER_S:
                 process.kill()
@@ -1174,19 +1209,56 @@ class Link:
                 if (outcome == "done" and repeat is not None
                         and repeat["row_id"] == row_id):
                     gave = max(0, size_before - self._db_bytes())
+                    free_after = self._free_bytes()
                     repeat["runs"].append(gave)
                     log(f"maintenance run {len(repeat['runs'])}: "
-                        f"{gave / 1e6:.1f} MB returned | {summary}")
-                    if (gave >= repeat["below"]
+                        f"{gave / 1e6:.1f} MB returned, "
+                        f"{free_after / 1e6:.1f} MB still reclaimable "
+                        f"| {summary}")
+                    # STOP ON WHAT IS LEFT, NOT ON THE LAST RUN'S PROGRESS.
+                    #
+                    # This read `gave >= repeat["below"]` alone, which ends
+                    # the series precisely when there is most to do: a run
+                    # that spends its whole --max-seconds budget pruning
+                    # returns 0 MB and leaves every page it released sitting
+                    # in the freelist. Measured on the operator's gateway,
+                    # 2026-11-26: one run pruned 522,500 rows, returned
+                    # 0.0 MB, left 27,194 free pages, and stopped. By
+                    # 2026-11-28 the file was 318.3 MB with 186.9 MB
+                    # reclaimable -- 59% of it -- and growing, because the
+                    # server-driven path declined to reclaim it twice a day.
+                    #
+                    # examples/db_maintain.py has had the right rule since
+                    # HANDOVER §15n and this loop kept the one §15n
+                    # replaced. Operator, 2026-11-28, describing what he
+                    # wanted: "deferred machine will be retried until 5MB is
+                    # left" -- the threshold is a TARGET for what remains,
+                    # not a gradient on progress.
+                    #
+                    # The progress test is what stops a database with
+                    # auto_vacuum NONE, where no page can ever be returned,
+                    # from running the full ten every cycle for nothing.
+                    progress = gave > 0 or free_after > free_before
+                    worth_another = (gave >= repeat["below"]
+                                     or (free_after >= repeat["below"]
+                                         and progress))
+                    if (worth_another
                             and len(repeat["runs"]) < MAINTAIN_REPEAT_MAX_RUNS):
                         repeat["pending"] = True
                         repeat["next_start"] = clock() + MAINTAIN_REPEAT_PAUSE_S
                         outcome = None
                     else:
-                        why = ("the run limit was reached"
-                               if gave >= repeat["below"] else
-                               f"the last run returned under "
-                               f"{repeat['below'] / 1e6:.1f} MB")
+                        if not worth_another and free_after < repeat["below"]:
+                            why = (f"only {free_after / 1e6:.1f} MB is "
+                                   f"reclaimable, under the "
+                                   f"{repeat['below'] / 1e6:.1f} MB target")
+                        elif not worth_another:
+                            why = (f"the last run returned "
+                                   f"{gave / 1e6:.1f} MB and freed nothing "
+                                   f"inside the file, so another would do "
+                                   f"the same")
+                        else:
+                            why = "the run limit was reached"
                         summary = (f"{self._repeat_summary(repeat)}; stopped "
                                    f"because {why} | last run: {summary}")[-1400:]
                 elif (outcome == "deferred" and repeat is not None
