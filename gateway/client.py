@@ -149,11 +149,19 @@ MAINTAIN_KILL_AFTER_S = 300.0
 # minutes of work at the tool's own 120 s limit; the pause lets the poller
 # and the drain have the database to themselves in between.
 MAINTAIN_REPEAT_MAX_RUNS = 10
-MAINTAIN_REPEAT_PAUSE_S = 5.0
+# 23 s between runs, and it MUST equal examples/db_maintain.py's
+# REPEAT_PAUSE_S so a server-driven series and a timer-driven series pace
+# identically. A test asserts that. Operator's spec, 2026-11-28.
+MAINTAIN_REPEAT_PAUSE_S = 23.0
 MAINTAIN_REPEAT_MAX_BYTES = 1 << 40
 MAINTAIN_WAIT_MAX_S = 12 * 3600
 MAINTAIN_WAIT_LOOK_S = 2.0
-MAINTAIN_WAIT_RETRY_S = 30.0
+# TEN MINUTES between attempts on a deferred machine, per the operator's
+# spec: "check deferred machine every 10 minutes to get 0 zero credit or out
+# of service". Thirty seconds was a lab cadence -- it re-read the credit
+# meter 120 times an hour to be told the same thing, and the activity rule
+# now defers for ten minutes anyway, so anything shorter cannot succeed.
+MAINTAIN_WAIT_RETRY_S = 600.0
 MAINTAIN_SCRIPT = Path(__file__).resolve().parent.parent / "examples" / "db_maintain.py"
 
 UNSUPPORTED = {
@@ -736,6 +744,12 @@ class Link:
         #  "waited_from", "why"}. In memory only -- a client restart drops
         # it, and the server is told nothing further about that request.
         self.maintenance_wait: dict | None = None
+        # How long to leave a deferred machine before asking again. Ten
+        # minutes on a real gateway, per the operator's 2026-11-28 spec.
+        # Overridable ONLY so the end-to-end test can outwait it, exactly
+        # like --busy-timeout-ms: that test drives real processes and a real
+        # clock, so a ten-minute cadence would make it a ten-minute test.
+        self.wait_retry_s: float = MAINTAIN_WAIT_RETRY_S
         # A request that asked to be repeated: {"command", "row_id",
         # "below", "runs": [bytes each run gave back], "pending",
         # "next_start"}. In memory only, like the wait.
@@ -1024,7 +1038,7 @@ class Link:
                 "command": command, "row_id": row_id, "why": "",
                 "waited_from": clock(), "deadline": clock() + wait_s,
                 "next_look": 0.0, "announced": False, "holding": False,
-                "next_start": clock() + MAINTAIN_WAIT_RETRY_S}
+                "next_start": clock() + self.wait_retry_s}
         if below:
             self.maintenance_repeat = {
                 "command": command, "row_id": row_id, "below": below,
@@ -1114,7 +1128,7 @@ class Link:
             return
         why = self._start_again(repeat["command"], repeat["row_id"], now)
         if why is not None:
-            repeat["next_start"] = now + MAINTAIN_WAIT_RETRY_S
+            repeat["next_start"] = now + self.wait_retry_s
             return
         repeat["pending"] = False
         log(f"maintenance run {len(repeat['runs']) + 1} starting (repeat)")
@@ -1165,7 +1179,7 @@ class Link:
             return                          # the poller has the lock; look again
         if not zero:
             return
-        wait["next_start"] = now + MAINTAIN_WAIT_RETRY_S
+        wait["next_start"] = now + self.wait_retry_s
         why = self._start_again(wait["command"], wait["row_id"], now)
         if why is not None:
             wait["why"] = why
@@ -1571,6 +1585,8 @@ def run(args) -> int:
     link = Link(conn, cfg, args.db, only,
                 maintenance_timer=getattr(args, "maintenance_timer",
                                           DEFAULT_MAINTENANCE_TIMER))
+    link.wait_retry_s = float(getattr(args, "wait_retry_s",
+                                      MAINTAIN_WAIT_RETRY_S))
     log(f"gateway client for {cfg['client_id']}, database {args.db} "
         f"(instance {link.instance}), server "
         f"{cfg['server_host']}:{cfg['server_port']}")
@@ -1723,6 +1739,13 @@ def build_parser() -> argparse.ArgumentParser:
     # For tests, which cannot wait out thirty real seconds to see what a
     # lock timeout does. Not a tuning knob: §6.1 fixes it at 30 s.
     r.add_argument("--busy-timeout-ms", type=int, default=30_000,
+                   help=argparse.SUPPRESS)
+    # Same reasoning as --busy-timeout-ms above: for the end-to-end test,
+    # which drives real processes against a real clock and cannot wait out
+    # ten real minutes. Not a tuning knob -- the operator's spec fixes it at
+    # ten minutes, and the activity rule defers for ten minutes anyway, so
+    # anything shorter on a real gateway cannot succeed.
+    r.add_argument("--wait-retry-s", type=float, default=MAINTAIN_WAIT_RETRY_S,
                    help=argparse.SUPPRESS)
     r.add_argument("--once", action="store_true",
                    help="exit when the connection drops instead of retrying")

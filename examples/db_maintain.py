@@ -89,6 +89,22 @@ RETENTION_OVERDUE_GRACE_HOURS = 13.0
 # holds the write lock the poller needs, and the poller is on a clock.
 PRUNE_BATCH_ROWS = 500
 VACUUM_STEP_PAGES = 200
+# HOW MUCH ONE RUN RECLAIMS, and the gap before the next. Operator's spec,
+# 2026-11-28: "I want maintenance reclaims <=25 MB per run, 23 s gap, repeat
+# until under 5 MB."
+#
+# WHY A SIZE BUDGET AND NOT ONLY --max-seconds. The time budget makes a run's
+# work unpredictable: the 2026-11-26 run spent its whole 120 s pruning
+# 522,500 rows and reclaimed 0.0 MB, while others returned 7.9. A size cap
+# makes each run a known quantity of I/O, so the gap between runs is a known
+# share of the poller's time rather than whatever is left over.
+#
+# THE NUMBERS, against the operator's own 186.9 MB of reclaimable pages:
+# 25 MB a run clears it in about 7.5 runs, so roughly 7.5 x 23 s = under
+# three minutes of gaps -- one maintenance window instead of the 3.7 MB a
+# day it had been managing. 23 is prime, like every other interval on this
+# gateway, so the gaps do not beat against the sweeps.
+VACUUM_MAX_BYTES_PER_RUN = 25 * 1_000_000
 PAUSE_S = 0.05
 # A scheduled run stops here even with work left. Tomorrow's run continues;
 # a job that runs until it is finished is a job that can run for an hour.
@@ -264,6 +280,38 @@ def _when_column(conn: sqlite3.Connection, table: str) -> str | None:
 # writing and the gate cannot be evaluated.
 CREDIT_MAX_AGE_S = 120.0
 
+# OPERATOR'S MAINTENANCE SPEC, 2026-11-28, in his words:
+#
+#   "maintenance will be automatically triggered every 12 hours. First check
+#   if there's credit on the machine or not. If there's credit, then check if
+#   the machine is out of service or not. if zero credit or out of service: do
+#   the maintenance. otherwise defer. check deferred machine every 10 minutes
+#   to get 0 zero credit or out of service. threshold for deferred run is 5MB
+#   space to be recovered. if less, we can wait until the next scheduled
+#   maintenance (12 hours). even the machine was out of service or had 0
+#   credits; any rte event such as attendant menu entered, ticket inserted,
+#   bill accepted, etc will defer the maintenance for 10 minutes"
+#
+# Any machine event within this window defers the run, EVEN WHEN THE GATE IS
+# OPEN. Ten minutes, per the spec.
+#
+# THIS IS SAFE TO CHECK AS "ANY EVENT AT ALL", measured rather than assumed.
+# The concern was exception 0x01 -- the machine echoing its own address under
+# RTE framing (HANDOVER §3.7), 217,595 rows in the lab database, more than
+# game starts and ends combined. If that arrived on every idle poll, "any
+# event" would be permanently true and nothing would ever be maintained.
+#
+# It does not. Over the 15.5 hours of 2026-11-26T23:30 to 2026-11-27T15:00,
+# with the cabinet parked on 500.00 restricted and nobody touching it, the
+# event table recorded **nothing at all**. Not one row. So 0x01 tracks play
+# (about 2.9 per game start), the background set is empty, and the spec's
+# "any rte event" is exactly implementable as written.
+ACTIVITY_QUIET_S = 600.0
+# The attendant-menu bracket that reports reserve. A54: 0x86 is not an edge
+# but a STATE REPORT issued at menu exit, so the state is whatever the last
+# bracket said -- 130 then 134 then 131 is reserved, 130 then 131 is not.
+MENU_ENTERED, MENU_EXITED, OUT_OF_SERVICE = 130, 131, 134
+
 
 def current_credits(conn: sqlite3.Connection, *,
                     now: str | None = None) -> tuple[int | None, float | None]:
@@ -293,6 +341,80 @@ def current_credits(conn: sqlite3.Connection, *,
             (now, row[1])).fetchone()[0]
         return int(row[0]), (None if age is None else float(age))
     return None, None
+
+
+def out_of_service(conn: sqlite3.Connection) -> bool:
+    """Is the cabinet in reserve (out of service by attendant)? A54.
+
+    SAS 6.02 has no "back in service" exception, so this cannot be done by
+    watching for an edge. What it does have, measured on hardware
+    2026-11-27, is that exception 0x86 is re-issued on EVERY attendant-menu
+    exit while the machine is out of service -- the operator entered the
+    menu, changed nothing, came out, and 0x86 arrived again. So 0x86 is a
+    STATE REPORT and the state is whatever the last menu bracket said:
+
+        130 ... 134 ... 131   ->  reserved
+        130 ......... 131     ->  enabled for play
+
+    Corroborated in the same run: the one bracket with no 0x86 is the one
+    followed seventeen seconds later by exception 140, a game being
+    selected. The reading agrees with the machine becoming playable and not
+    merely with somebody's recollection of which button they pressed.
+
+    FALSE when it cannot be established. No bracket at all means a cabinet
+    nobody has ever taken out of service through the menu, and an unproven
+    "it is reserved" is the one answer that could let a vacuum run while a
+    player is sitting there.
+    """
+    exited = conn.execute(
+        "SELECT id FROM machine_events WHERE exception_code = ? "
+        "ORDER BY id DESC LIMIT 1", (MENU_EXITED,)).fetchone()
+    if exited is None:
+        return False
+    entered = conn.execute(
+        "SELECT id FROM machine_events WHERE exception_code = ? AND id < ? "
+        "ORDER BY id DESC LIMIT 1", (MENU_ENTERED, exited[0])).fetchone()
+    if entered is None:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM machine_events WHERE exception_code = ? "
+        "  AND id > ? AND id < ? LIMIT 1",
+        (OUT_OF_SERVICE, entered[0], exited[0])).fetchone() is not None
+
+
+def recent_activity(conn: sqlite3.Connection, *,
+                    quiet_s: float = ACTIVITY_QUIET_S,
+                    now: str | None = None) -> tuple[bool, str]:
+    """(is the machine in use, what was seen). ACTIVITY_QUIET_S explains
+    why "any event" is the right test on this cabinet.
+
+    The spec applies this EVEN WHEN the credit or reserve gate is open: a
+    machine at zero credits that somebody just put a ticket into is about
+    to have credits, and a reserved machine whose attendant is still at the
+    menu is about to be released.
+    """
+    now = now or utc_now()
+    # BOUNDED AT BOTH ENDS, and the upper bound is not decoration.
+    #
+    # `occurred_at` is compared as TEXT, so anything that sorts above a
+    # real ISO timestamp reads as "just now" -- and this check defers on
+    # any hit, so a single malformed row would defer maintenance for ever.
+    # Found by tests/test_gateway_link_e2e.py, whose fixture stores the
+    # literal 't': 't' > '2026-...' because 0x74 > 0x32. Same family as the
+    # `datetime('now')` space-versus-T trap on the agent board.
+    #
+    # A minute of slack above `now` absorbs clock skew between the poller
+    # writing a row and this reading it; anything further ahead is not a
+    # timestamp this cabinet produced.
+    row = conn.execute(
+        "SELECT occurred_at, exception_code, description FROM machine_events "
+        "WHERE occurred_at > strftime('%Y-%m-%dT%H:%M:%S', ?, ?) "
+        "  AND occurred_at <= strftime('%Y-%m-%dT%H:%M:%S', ?, '+60 seconds') "
+        "ORDER BY id DESC LIMIT 1",
+        (now, f"-{int(quiet_s)} seconds", now)).fetchone()
+    if row is None:
+        return False, ""
+    return True, (f"exception 0x{int(row[1]):02X} ({row[2]}) at {row[0]}")
 
 
 def may_vacuum_now(conn: sqlite3.Connection, *, max_age_s: float = CREDIT_MAX_AGE_S,
@@ -462,18 +584,39 @@ def prune_acked(conn: sqlite3.Connection, hours: float | None = None, *,
 
 def incremental_vacuum(conn: sqlite3.Connection, *, deadline: float | None = None,
                        step_pages: int = VACUUM_STEP_PAGES, pause: float = PAUSE_S,
+                       max_bytes: int | None = VACUUM_MAX_BYTES_PER_RUN,
                        clock=time.monotonic, sleep=time.sleep) -> int:
     """Return free pages to the filesystem a step at a time. Returns how
     many pages went back. Does nothing, and says nothing, unless the
-    database is in INCREMENTAL mode -- the caller reports that."""
+    database is in INCREMENTAL mode -- the caller reports that.
+
+    BOUNDED BY SIZE AS WELL AS TIME (operator's spec, 2026-11-28: "<=25 MB
+    per run, 23 s gap, repeat until under 5 MB"). `deadline` alone makes a
+    run's work unpredictable -- the 2026-11-26 run spent its whole 120 s
+    pruning and reclaimed 0.0 MB -- so a run that reaches `max_bytes`
+    stops and leaves the rest to the next one, which starts after
+    REPEAT_GAP_S. `max_bytes=None` lifts the cap.
+    """
     if conn.execute("PRAGMA auto_vacuum").fetchone()[0] != 2:
         return 0
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 0)
+    cap_pages = (int(max_bytes // page_size)
+                 if max_bytes and page_size > 0 else None)
     freed = 0
     while deadline is None or clock() < deadline:
+        if cap_pages is not None and freed >= cap_pages:
+            break
         before = conn.execute("PRAGMA freelist_count").fetchone()[0]
         if before == 0:
             break
-        conn.execute(f"PRAGMA incremental_vacuum({int(step_pages)})").fetchall()
+        step = int(step_pages)
+        if cap_pages is not None:
+            # Never overshoot the cap by a whole step: the last step of a
+            # capped run is trimmed to what is left of the budget.
+            step = min(step, cap_pages - freed)
+            if step <= 0:
+                break
+        conn.execute(f"PRAGMA incremental_vacuum({step})").fetchall()
         conn.commit()
         after = conn.execute("PRAGMA freelist_count").fetchone()[0]
         if after >= before:
@@ -664,6 +807,40 @@ def cmd_run(args) -> int:
     if getattr(args, "require_zero_credits", False):
         ok, why = may_vacuum_now(
             conn, max_age_s=getattr(args, "credit_max_age_s", CREDIT_MAX_AGE_S))
+        # OR OUT OF SERVICE. Operator's spec, 2026-11-28: "First check if
+        # there's credit on the machine or not. If there's credit, then
+        # check if the machine is out of service or not. if zero credit or
+        # out of service: do the maintenance."
+        #
+        # A reserved cabinet cannot be cashed out by anyone, which is the
+        # whole reason the credit gate exists -- so reserve removes the
+        # same risk zero credits removes. Parking a machine for an hour is
+        # routine on this floor and it was costing a maintenance window
+        # every time: observed 26.4 h with nothing pruned because 500.00
+        # restricted sat on a cabinet overnight.
+        if not ok and out_of_service(conn):
+            log(f"the credit gate says no ({why}) -- but the machine is OUT "
+                f"OF SERVICE (A54: the last attendant-menu bracket carried "
+                f"0x86), so nobody can cash out and the run proceeds.")
+            ok, why = True, ""
+        # AND THEN ACTIVITY, WHICHEVER WAY THE GATE WENT. Same spec: "even
+        # the machine was out of service or had 0 credits; any rte event
+        # such as attendant menu entered, ticket inserted, bill accepted,
+        # etc will defer the maintenance for 10 minutes".
+        #
+        # This is the stronger of the two tests and it is deliberately not
+        # replacing them. A machine at zero credits that somebody just fed
+        # a ticket is about to have credits; a reserved machine whose
+        # attendant is still at the menu is about to be released. Neither
+        # is visible to a credit meter read seconds earlier.
+        if ok:
+            busy, seen = recent_activity(conn)
+            if busy:
+                ok = False
+                why = (f"the machine was in use {ACTIVITY_QUIET_S / 60:.0f} "
+                       f"min ago or less -- {seen}. Credits and reserve both "
+                       f"said go ahead; activity overrides them, because a "
+                       f"cashout can arrive before either changes.")
         if not ok:
             # Exit 0, not a failure: a deferral is this working correctly.
             # A non-zero status here would fill the journal with red for a
@@ -753,7 +930,16 @@ def cmd_run(args) -> int:
 # Ten runs is twenty minutes; the pause gives the poller the database to
 # itself between them.
 REPEAT_MAX_RUNS = 10
-REPEAT_PAUSE_S = 5.0
+# 23 SECONDS BETWEEN RUNS, not 5. Operator's spec, 2026-11-28: "25 MB per
+# run, 23 s gap, repeat until under 5 MB." Kept as this one constant rather
+# than adding a second beside it -- gateway/client.py's
+# MAINTAIN_REPEAT_PAUSE_S must equal it, and a test asserts that, because two
+# names for one interval is how the two repeat loops drifted in the first
+# place (HANDOVER §15w).
+#
+# 23 is prime, like --interval 2.0's companions 593, 293 and 43, so the gaps
+# do not beat against the sweeps.
+REPEAT_PAUSE_S = 23.0
 
 
 def cmd_run_repeating(args, *, sleep=time.sleep) -> int:
